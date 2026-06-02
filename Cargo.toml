@@ -1,0 +1,22 @@
+[package]
+name = "ssik-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-allocation, no_std analytical inverse kinematics translated from the Python ssik artifacts."
+license = "BSD-3-Clause"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]
+
+[features]
+default = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
