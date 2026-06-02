@@ -94,7 +94,7 @@ _REPS = 10    # number of timed passes
 
 
 def _time_solver(label: str, fn, poses) -> tuple:
-    """Time *fn(poses)*, return (mean_ms, min_ms, max_ms, last_results)."""
+    """Time *fn(poses)*, return (mean_ms, min_ms, max_ms, stdev_ms, last_results)."""
     results = None
     for _ in range(_WARMUP):
         results = fn(poses)
@@ -109,13 +109,15 @@ def _time_solver(label: str, fn, poses) -> tuple:
     mean_ms = sum(times_ms) / len(times_ms)
     min_ms = min(times_ms)
     max_ms = max(times_ms)
+    variance = sum((t - mean_ms) ** 2 for t in times_ms) / len(times_ms)
+    stdev_ms = variance ** 0.5
 
     per_pose_us = mean_ms * 1000.0 / len(poses)
     print(
-        f"  {label:<8s}  mean={mean_ms:8.2f} ms  min={min_ms:8.2f} ms"
-        f"  max={max_ms:8.2f} ms  ({per_pose_us:.2f} µs/pose)"
+        f"  {label:<8s}  mean={mean_ms:8.2f} ms  stdev={stdev_ms:6.2f} ms"
+        f"  min={min_ms:8.2f} ms  max={max_ms:8.2f} ms  ({per_pose_us:.2f} µs/pose)"
     )
-    return mean_ms, min_ms, max_ms, results
+    return mean_ms, min_ms, max_ms, stdev_ms, results
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +148,8 @@ def main():
     # Run both solvers
     # ------------------------------------------------------------------
     print("=== IK benchmark: Python ssik vs Rust ssik-py ===")
-    py_mean, py_min, _, py_results = _time_solver("Python", _solve_python, poses)
-    rs_mean, rs_min, _, rs_results = _time_solver("Rust  ", _solve_rust, poses)
+    py_mean, py_min, _, _py_stdev, py_results = _time_solver("Python", _solve_python, poses)
+    rs_mean, rs_min, _, _rs_stdev, rs_results = _time_solver("Rust  ", _solve_rust, poses)
 
     # ------------------------------------------------------------------
     # Speedup
