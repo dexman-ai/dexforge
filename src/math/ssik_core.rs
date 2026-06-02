@@ -248,7 +248,11 @@ fn householder3(x: f64, y: f64, z: f64) -> (f64, f64, f64, f64) {
 pub fn quartic_roots(coeffs: &[f64; 5]) -> ([Complex; 4], usize) {
     let mut roots = [Complex::new(0.0, 0.0); 4];
 
-    // Strip leading (near-)zero coefficients to find the true leading term.
+    // Strip leading zero coefficients to find the true leading term. The
+    // exact `== 0.0` test (rather than an epsilon) is deliberate: it mirrors
+    // `numpy.roots`, which trims only exactly-zero leading/trailing entries so
+    // this port stays bit-compatible with the Python reference's degree
+    // reduction. Near-zero (but non-zero) leading terms are intentionally kept.
     let mut start = 0usize;
     while start < 5 && coeffs[start] == 0.0 {
         start += 1;
@@ -260,7 +264,8 @@ pub fn quartic_roots(coeffs: &[f64; 5]) -> ([Complex; 4], usize) {
         return (roots, 0);
     }
 
-    // Strip trailing zeros: each contributes a root at 0.
+    // Strip trailing zeros: each contributes a root at 0 (numpy-equivalent,
+    // exact-zero test as above).
     let mut end = len;
     let mut zero_roots = 0usize;
     while end > 1 && active[end - 1] == 0.0 {

@@ -232,6 +232,13 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8]) -> usize {
     for si in 0..n15 {
         let (q1, q5) = theta15[si];
 
+        // NOTE: the literal constants in the theta14 / q6 / d_inner blocks
+        // below (e.g. `6.12323399573677e-17`, `7.49879891330929e-33`) are the
+        // machine-generated symbolic coefficients emitted by `ssik build` and
+        // are copied verbatim from `ur5_ik.py`. Most are rounding residue of
+        // exact zeros (cos(pi/2)) preserved here so the floating-point
+        // accumulation order matches the Python reference bit-for-bit.
+
         // SP1 for theta14 = q1+q2+q3+q4.
         let th14_x0 = libm::sin(q5);
         let th14_x1 = 1.0 * r_22;
@@ -618,6 +625,10 @@ fn qr_complete_4x2(m: &[[f64; 2]; 4]) -> ([[f64; 4]; 4], [[f64; 2]; 4]) {
             norm += a[i][col] * a[i][col];
         }
         let norm = libm::sqrt(norm);
+        // Exact-zero guard: skip the reflector only for a genuinely zero
+        // column (it is already the identity there). A near-zero-but-nonzero
+        // column still yields a valid Householder reflector; rank deficiency
+        // is caught downstream by the `r00`/`r11` DEG_TOL check.
         if norm == 0.0 {
             continue;
         }
