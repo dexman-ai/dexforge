@@ -28,7 +28,8 @@ use pyo3::prelude::*;
 ///     Orientation of the end-effector.  Any Python object that exposes an
 ///     ``as_matrix()`` method returning a 3×3 array-like is accepted.
 /// arm : str
-///     Name of the robot arm.  Currently supported: ``"ur5"``.
+///     Name of the robot arm.  Currently supported: ``"ur5"``, ``"z1"``,
+///     ``"puma560"``.
 ///
 /// Returns
 /// -------
@@ -76,9 +77,11 @@ fn compute_ik(
 
     let raw = match arm {
         "ur5" => ssik_rust::drivers::ur5::ik_solver::compute_ik(&tf),
+        "z1" => ssik_rust::drivers::z1::ik_solver::compute_ik(&tf),
+        "puma560" => ssik_rust::drivers::puma560::ik_solver::compute_ik(&tf),
         _ => {
             return Err(PyValueError::new_err(format!(
-                "unsupported arm '{arm}'; supported arms: ur5"
+                "unsupported arm '{arm}'; supported arms: ur5, z1, puma560"
             )));
         }
     };
