@@ -1,10 +1,10 @@
-"""Benchmark: Python ssik vs Rust ssik-py IK solver on the UR5.
+"""Benchmark: Python ssik vs Rust ssik-py IK solver.
 
-Reads the saved input poses from ``src/drivers/ur5/test_data.rs`` (the same
+Reads the saved input poses from ``src/drivers/<arm>/test_data.rs`` (the same
 dataset used in ``cargo test``) and times both:
 
-  * **Python** – ``ssik.prebuilt.ur5_ik.solve(T, respect_limits=False)``
-  * **Rust**   – ``ssik_py.compute_ik(x, y, z, rotation, "ur5")``
+  * **Python** – ``ssik.prebuilt.<arm>_ik.solve(T, respect_limits=False)``
+  * **Rust**   – ``ssik_py.compute_ik(x, y, z, rotation, arm)``
 
 Usage::
 
@@ -14,11 +14,14 @@ Usage::
     maturin build --release && pip install target/wheels/ssik_py-*.whl
 
     # Run the benchmark from the repo root:
-    python scripts/bench_ik.py
+    python scripts/bench_ik.py           # defaults to --arm ur5
+    python scripts/bench_ik.py --arm ur5
 
 The script prints per-solver wall-clock statistics and the Rust speedup factor.
 """
 
+import argparse
+import importlib
 import os
 import re
 import sys
@@ -32,7 +35,11 @@ from scipy.spatial.transform import Rotation
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-_TEST_DATA_RS = os.path.join(_REPO_ROOT, "src", "drivers", "ur5", "test_data.rs")
+
+
+def _test_data_path(arm: str) -> str:
+    """Return the path to the Rust test-data file for the given arm."""
+    return os.path.join(_REPO_ROOT, "src", "drivers", arm, "test_data.rs")
 
 
 def _load_poses(path: str) -> list:
@@ -61,18 +68,18 @@ def _load_poses(path: str) -> list:
 # Solver wrappers
 # ---------------------------------------------------------------------------
 
-def _solve_python(poses):
-    """Run ssik.prebuilt.ur5_ik.solve on every pose; return list of solution lists."""
-    from ssik.prebuilt import ur5_ik  # imported lazily so import time is excluded
+def _solve_python(poses, arm: str):
+    """Run ssik.prebuilt.<arm>_ik.solve on every pose; return list of solution lists."""
+    mod = importlib.import_module(f"ssik.prebuilt.{arm}_ik")
 
     results = []
     for T in poses:
-        sols = ur5_ik.solve(T, respect_limits=False)
+        sols = mod.solve(T, respect_limits=False)
         results.append([list(map(float, s.q)) for s in sols])
     return results
 
 
-def _solve_rust(poses):
+def _solve_rust(poses, arm: str):
     """Run ssik_py.compute_ik on every pose; return list of solution lists."""
     import ssik_py  # imported lazily so import time is excluded
 
@@ -80,7 +87,7 @@ def _solve_rust(poses):
     for T in poses:
         x, y, z = float(T[0, 3]), float(T[1, 3]), float(T[2, 3])
         rot = Rotation.from_matrix(T[:3, :3])
-        sols = ssik_py.compute_ik(x, y, z, rot, "ur5")
+        sols = ssik_py.compute_ik(x, y, z, rot, arm)
         results.append(sols)
     return results
 
@@ -125,20 +132,34 @@ def _time_solver(label: str, fn, poses) -> tuple:
 # ---------------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Benchmark Python ssik vs Rust ssik-py IK solver."
+    )
+    parser.add_argument(
+        "--arm",
+        default="ur5",
+        help="Robot arm identifier (default: ur5). Must match a ssik.prebuilt.<arm>_ik "
+             "module and a src/drivers/<arm>/test_data.rs file.",
+    )
+    args = parser.parse_args()
+    arm = args.arm
+
     # ------------------------------------------------------------------
     # Load test data
     # ------------------------------------------------------------------
-    if not os.path.exists(_TEST_DATA_RS):
+    test_data_rs = _test_data_path(arm)
+    if not os.path.exists(test_data_rs):
         sys.exit(
-            f"ERROR: test-data file not found: {_TEST_DATA_RS}\n"
+            f"ERROR: test-data file not found: {test_data_rs}\n"
             "Run scripts/generate_test_data.py first."
         )
 
-    poses = _load_poses(_TEST_DATA_RS)
+    poses = _load_poses(test_data_rs)
     if not poses:
         sys.exit("ERROR: no poses parsed from test_data.rs")
 
-    print(f"Loaded {len(poses)} poses from {os.path.relpath(_TEST_DATA_RS)}")
+    print(f"Arm: {arm}")
+    print(f"Loaded {len(poses)} poses from {os.path.relpath(test_data_rs)}")
     print(
         f"Timing {_WARMUP} warm-up + {_REPS} timed passes "
         f"({len(poses) * _REPS:,} total IK calls per solver)\n"
@@ -147,9 +168,13 @@ def main():
     # ------------------------------------------------------------------
     # Run both solvers
     # ------------------------------------------------------------------
-    print("=== IK benchmark: Python ssik vs Rust ssik-py ===")
-    py_mean, py_min, _, _py_stdev, py_results = _time_solver("Python", _solve_python, poses)
-    rs_mean, rs_min, _, _rs_stdev, rs_results = _time_solver("Rust  ", _solve_rust, poses)
+    print(f"=== IK benchmark: Python ssik vs Rust ssik-py  [{arm}] ===")
+    py_mean, py_min, _, _py_stdev, py_results = _time_solver(
+        "Python", lambda p: _solve_python(p, arm), poses
+    )
+    rs_mean, rs_min, _, _rs_stdev, rs_results = _time_solver(
+        "Rust  ", lambda p: _solve_rust(p, arm), poses
+    )
 
     # ------------------------------------------------------------------
     # Speedup
