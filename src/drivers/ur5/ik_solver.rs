@@ -76,9 +76,6 @@ const T_RIGHTS: [[[f64; 4]; 4]; 6] = [
     ],
 ];
 
-/// 4x4 homogeneous identity with the given translation column.
-// `eye_with` is provided by `crate::math::kinematics`.
-
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
