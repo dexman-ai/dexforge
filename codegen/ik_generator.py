@@ -48,7 +48,8 @@ from typing import Optional, Tuple
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 
-# Maximum number of LLM retry attempts when scripts, build, or tests fail.
+# Default for the --max-retries CLI flag (number of *retry* attempts after the
+# initial attempt, so total LLM calls = max_retries + 1).
 _MAX_RETRIES = 3
 
 # ---------------------------------------------------------------------------
@@ -891,12 +892,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         {"role": "user", "content": context},
     ]
 
-    max_retries = args.max_retries
+    # max_attempts includes the initial attempt plus all retries:
+    #   total calls = args.max_retries (retries) + 1 (initial)
+    max_attempts = args.max_retries + 1
     last_raw_response: Optional[str] = None
 
-    for attempt in range(max_retries + 1):
+    for attempt in range(max_attempts):
         if attempt > 0:
-            print(f"[ik_generator]   Retry {attempt}/{max_retries} …")
+            print(f"[ik_generator]   Retry {attempt}/{args.max_retries} …")
 
         try:
             raw_response = llm.generate(messages)
@@ -915,7 +918,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             files = parse_llm_output(raw_response)
         except ValueError as exc:
             print(f"[ik_generator]   Parse error: {exc}", file=sys.stderr)
-            if attempt < max_retries:
+            if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({
                     "role": "user",
@@ -954,7 +957,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "Please fix the errors and regenerate all files."
             )
             print(f"[ik_generator]   Script failures detected.")
-            if attempt < max_retries:
+            if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
@@ -970,7 +973,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "Please fix the Rust code and regenerate all files."
             )
             print(f"[ik_generator]   Build failed.")
-            if attempt < max_retries:
+            if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
@@ -988,7 +991,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "Please fix the Rust code and regenerate all files."
             )
             print(f"[ik_generator]   Tests failed.")
-            if attempt < max_retries:
+            if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
