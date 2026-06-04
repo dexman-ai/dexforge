@@ -15,7 +15,12 @@ hardcoded iteration ceiling so worst-case execution time is bounded.
 | `src/math/ssik_core.rs` | Generic bounded-iteration numeric kernels: companion-matrix eigenvalues via a Francis double-shift QR (real Schur) and the `numpy.roots`-equivalent `quartic_roots`. |
 | `src/drivers/ur5/ik_solver.rs` | Universal Robots **UR5** closed-form solver (`compute_ik`), ported from `ssik/prebuilt/ur5_ik.py` (solver `ikgeo.three_parallel`). Includes the SP6 subproblem, the SP1+SP3+SP1 chain, FK verification, and the `#[cfg(test)]` reference test. |
 | `src/drivers/ur5/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution). |
+| `src/drivers/franka_panda/ik_solver.rs` | Franka Emika **Panda** (7-DOF) closed-form solver (`compute_ik`), ported from `ssik/prebuilt/franka_panda_ik.py` (solver `jointlock.seven_r`). Locks joint 4 across 16 samples, solves the residual 6R sub-chain (SP1/3/4/5 subproblems), FK-verifies, and refines each root with bounded Levenberg-Marquardt. |
+| `src/drivers/franka_panda/consts.rs` | Auto-generated baked spatial constants (lock samples, screw axes, link transforms). |
+| `src/drivers/franka_panda/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution). |
 | `scripts/generate_test_data.py` | Regenerates `test_data.rs` from the reference Python solver. |
+| `scripts/generate_franka_consts.py` | Regenerates the Franka `consts.rs` from the Python artifact. |
+| `scripts/generate_franka_test_data.py` | Regenerates the Franka `test_data.rs` from the reference Python solver. |
 | `ssik-py/` | Secondary crate: Python bindings (pyo3) wrapping `ssik-rust`. |
 
 ## Rust interface
@@ -34,6 +39,24 @@ for q in solutions.iter().flatten() {
 `compute_ik` reproduces `ur5_ik.solve(T, respect_limits=False)`: the raw
 geometric solution set, FK-verified to `1e-5` and de-duplicated modulo `2*pi`.
 The UR5 yields at most 8 solutions; unused slots are `None`.
+
+### Franka Emika Panda (7-DOF)
+
+```rust
+use nalgebra::SMatrix;
+use ssik_rust::drivers::franka_panda::ik_solver::compute_ik;
+
+let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of panda_hand in panda_link0 */;
+let solutions: [Option<[f64; 7]>; 128] = compute_ik(&target_tf);
+for q in solutions.iter().flatten() {
+    // q = [q1, q2, q3, q4, q5, q6, q7]
+}
+```
+
+The Panda is kinematically redundant, so `franka_panda_ik.solve` locks joint 4
+across a fixed set of samples and solves the resulting 6R sub-problem. The full
+discrete solution set is therefore much larger than a 6-DOF arm's: the output is
+a `[Option<[f64; 7]>; 128]` stack array (unused slots are `None`).
 
 ## Python interface
 
