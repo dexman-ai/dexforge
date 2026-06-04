@@ -11,8 +11,8 @@
 //! * **Pose residual norm**: [`norm12`]
 //! * **Rigid-transform type**: [`Transform`], [`IDENTITY`], [`compose`],
 //!   [`se3_inv`], [`frob_diff`]
-//! * **Shared LM tuning constants** and **generic 6-DOF refinement loop**:
-//!   [`lm_refine6`]
+//! * **Shared LM tuning constants** and **generic const-DOF refinement loop**:
+//!   [`lm_refine`], [`lm_refine6`]
 //!
 //! # What stays in each driver
 //!
@@ -193,33 +193,49 @@ pub const LM_LAMBDA_MAX: f64 = 1e8;
 pub const LM_BACKTRACK_MAX: usize = 12;
 
 // ---------------------------------------------------------------------------
-// Generic 6-DOF Levenberg-Marquardt refinement
+// Generic const-DOF Levenberg-Marquardt refinement
 // ---------------------------------------------------------------------------
 
-/// Bounded Levenberg-Marquardt polish for a **6-DOF** joint vector.
+/// Bounded Levenberg-Marquardt polish for a joint vector of **any** DOF.
 ///
-/// This is the common LM loop shared by the UR5 and Piper drivers.  The
+/// This is the universal LM loop shared across all arm drivers.  The
 /// arm-specific part — computing the 12-vector pose residual from the arm's
-/// own FK — is supplied as a closure so the function remains free of
-/// per-arm types and constants.
+/// own FK — is supplied as a closure so the function remains free of per-arm
+/// types and constants.  The joint-space dimension is a const generic
+/// parameter `DOF`, so all matrix allocations (Jacobian `J : 12×DOF`,
+/// normal-equations `JᵀJ : DOF×DOF`, step `dq : DOF×1`) live entirely on
+/// the stack: no heap, no `Vec`, compatible with `#![no_std]`.
 ///
-/// `residual_fn(q)` must return `[vec(R(q) − R_t); t(q) − t_t]`.  The
-/// closure typically captures the target pose and delegates to the driver's
-/// local `pose_residual12`.
+/// `residual_fn(q)` must return `[vec(R(q) − R_t); t(q) − t_t]` — the
+/// standard 12-vector pose residual.  The closure typically captures the
+/// target pose and delegates to the driver's local `pose_residual12`.
 ///
-/// The generic type parameter is monomorphised at each call site, so the
+/// The const generic parameter is monomorphised at each call site, so the
 /// compiled cost is identical to having the loop inlined in each driver.
 ///
 /// Returns `Some(q_refined)` when the FK residual falls within `fk_atol`,
 /// or `None` if the iteration budget is exhausted without convergence.
-pub fn lm_refine6<F>(
-    q_in: &[f64; 6],
+///
+/// # Examples
+///
+/// ```ignore
+/// // 6-DOF arm (same as calling lm_refine6 directly)
+/// lm_refine::<6, _>(&q6, |q| residual12(q, &target), max_iters, 1e-10);
+///
+/// // 7-DOF arm — all seven joints are refined simultaneously
+/// lm_refine::<7, _>(&q7, |q| residual12_7dof(q, &target), max_iters, 1e-10);
+///
+/// // 8+ DOF gantry
+/// lm_refine::<8, _>(&q8, |q| residual12_8dof(q, &target), max_iters, 1e-10);
+/// ```
+pub fn lm_refine<const DOF: usize, F>(
+    q_in: &[f64; DOF],
     residual_fn: F,
     max_iters: usize,
     fk_atol: f64,
-) -> Option<[f64; 6]>
+) -> Option<[f64; DOF]>
 where
-    F: Fn(&[f64; 6]) -> [f64; 12],
+    F: Fn(&[f64; DOF]) -> [f64; 12],
 {
     let mut q = *q_in;
     let mut lambda = LM_INITIAL_LAMBDA;
@@ -230,9 +246,9 @@ where
         if rn < LM_CONVERGENCE_THRESHOLD {
             break;
         }
-        // Finite-difference Jacobian J (12×6) over all 6 joints.
-        let mut jac = SMatrix::<f64, 12, 6>::zeros();
-        for col in 0..6 {
+        // Finite-difference Jacobian J (12×DOF) over all DOF joints.
+        let mut jac = SMatrix::<f64, 12, DOF>::zeros();
+        for col in 0..DOF {
             let mut qp = q;
             qp[col] += REFINE_EPS;
             let rp = residual_fn(&qp);
@@ -242,14 +258,14 @@ where
         }
         let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
         let jt = jac.transpose();
-        let jtj = jt * jac; // 6×6
-        let jtr = jt * rv; // 6×1
+        let jtj = jt * jac; // DOF×DOF
+        let jtr = jt * rv; // DOF×1
 
         // Adaptive LM damping with accept/reject backtrack.
         let mut accepted = false;
         for _ in 0..LM_BACKTRACK_MAX {
             let mut damped = jtj;
-            for d in 0..6 {
+            for d in 0..DOF {
                 damped[(d, d)] += lambda;
             }
             let inv = match damped.try_inverse() {
@@ -261,7 +277,7 @@ where
             };
             let dq = inv * jtr;
             let mut q_trial = q;
-            for col in 0..6 {
+            for col in 0..DOF {
                 q_trial[col] -= dq[(col, 0)];
             }
             let r_trial = residual_fn(&q_trial);
@@ -289,4 +305,26 @@ where
     } else {
         None
     }
+}
+
+/// Bounded Levenberg-Marquardt polish for a **6-DOF** joint vector.
+///
+/// This is a convenience wrapper around [`lm_refine::<6, _>`] preserved for
+/// backward compatibility with the UR5 and Piper drivers.
+///
+/// `residual_fn(q)` must return `[vec(R(q) − R_t); t(q) − t_t]`.
+///
+/// Returns `Some(q_refined)` when the FK residual falls within `fk_atol`,
+/// or `None` if the iteration budget is exhausted without convergence.
+#[inline]
+pub fn lm_refine6<F>(
+    q_in: &[f64; 6],
+    residual_fn: F,
+    max_iters: usize,
+    fk_atol: f64,
+) -> Option<[f64; 6]>
+where
+    F: Fn(&[f64; 6]) -> [f64; 12],
+{
+    lm_refine::<6, F>(q_in, residual_fn, max_iters, fk_atol)
 }
