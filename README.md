@@ -28,7 +28,7 @@ hardcoded iteration ceiling so worst-case execution time is bounded.
 | `scripts/generate_piper_pq.py` | Regenerates the Piper `pq.rs` matrix builder from the Python artifact. |
 | `scripts/generate_piper_test_data.py` | Regenerates the Piper `test_data.rs` from the reference Python solver. |
 | `examples/piper_solve.rs` | Host harness that runs the Piper solver on stdin poses (used by the Piper data generator). |
-| `ssik-py/` | Secondary crate: Python bindings (pyo3) wrapping `ssik-rust`. |
+| `dexforge-py/` | Secondary crate: Python bindings (pyo3) wrapping `ssik-rust`. |
 
 ## Rust interface
 
@@ -89,11 +89,11 @@ poses is intentionally omitted; equilibration covers the reachable workspace.
 ## Python interface
 
 ```python
-from scipy.spatial.transform import Rotation
-import ssik_py
+import numpy as np
+import dexforge_py
 
-rot = Rotation.from_euler("xyz", [0.1, 0.2, 0.3])
-solutions = ssik_py.compute_ik(x=0.3, y=0.1, z=0.5, rotation=rot, arm="ur5")
+T = np.eye(4)  # 4x4 SE(3) target pose
+solutions = dexforge_py.solve("ur5", T, respect_limits=False)
 for q in solutions:
     # q = [q1, q2, q3, q4, q5, q6]  (radians)
     pass
@@ -102,17 +102,17 @@ for q in solutions:
 ### Building the Python extension
 
 ```sh
-cd ssik-py
+cd dexforge-py
 pip install maturin
 maturin build --release          # produces a wheel in ../target/wheels/
-pip install ../target/wheels/ssik_py-*.whl
+pip install ../target/wheels/dexforge_py-*.whl
 ```
 
 ### Running the Python tests
 
 ```sh
 pip install pytest scipy numpy
-pytest ssik-py/tests/
+pytest dexforge-py/tests/
 ```
 
 ## Dependencies
@@ -122,7 +122,7 @@ Only [`nalgebra`](https://nalgebra.org) (with `serde` and `macros` disabled, in
 transcendentals.
 
 The Python bindings add [`pyo3`](https://pyo3.rs) as a dependency, isolated to
-the `ssik-py` crate.
+the `dexforge-py` crate.
 
 ## Building and testing
 

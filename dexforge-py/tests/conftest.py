@@ -1,4 +1,4 @@
-"""Shared pytest fixtures and CLI options for ssik-py tests."""
+"""Shared pytest fixtures and CLI options for dexforge-py tests."""
 
 
 def pytest_addoption(parser):

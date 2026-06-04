@@ -1,12 +1,12 @@
 [package]
-name = "ssik-py"
+name = "dexforge-py"
 version = "0.1.0"
 edition = "2021"
 description = "Python bindings for ssik-rust analytical inverse kinematics."
 license = "BSD-3-Clause"
 
 [lib]
-name = "ssik_py"
+name = "dexforge_py"
 crate-type = ["cdylib"]
 
 [dependencies]
