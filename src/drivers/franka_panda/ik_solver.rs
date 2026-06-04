@@ -458,9 +458,10 @@ fn q_close7(a: &[f64; 7], b: &[f64; 7], tol: f64) -> bool {
 // Shared Newton refinement
 // ---------------------------------------------------------------------------
 
-const REFINE_EPS: f64 = 1e-7;
+/// Iteration ceiling for the Levenberg-Marquardt pose-refinement polish.
 #[cfg(test)]
 const REFINE_ITERS: usize = 60;
+const REFINE_EPS: f64 = 1e-7;
 
 /// 12-vector pose residual `[vec(R(q) - R_t); t(q) - t_t]` of the full 7R FK.
 #[inline]
