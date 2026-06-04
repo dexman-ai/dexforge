@@ -66,12 +66,97 @@ pub const DOF: usize = 7;
 /// 8 inner solutions each). The Franka's exhaustive sweep can saturate this.
 pub const MAX_SOLUTIONS: usize = 128;
 
+/// Solver identifier — mirrors `SOLVER_NAME` in the Python artifact.
+pub const SOLVER_NAME: &str = "jointlock.seven_r";
+
+/// Solver tier — mirrors `SOLVER_TIER` in the Python artifact.
+pub const SOLVER_TIER: u32 = 1;
+
+/// Median solve time in milliseconds on commodity single-thread hardware —
+/// mirrors `EXPECTED_MS_MEDIAN` in the Python artifact.
+pub const EXPECTED_MS_MEDIAN: f64 = 50.0;
+
+/// Approximate floating-point operation budget per solve —
+/// mirrors `FLOP_BUDGET` in the Python artifact.
+pub const FLOP_BUDGET: u32 = 30274;
+
+/// Human-readable explanation of why this solver was chosen —
+/// mirrors `DISPATCH_REASON` in the Python artifact.
+pub const DISPATCH_REASON: &str = "7R revolute chain (non-SRS). Locking one joint\n\
+    (auto-selected by topology rank of the resulting 6R\n\
+    sub-chain) reduces this to a series of 6R IK problems.\n\
+    Covers Franka Panda, FR3, uFactory xArm7, and any other\n\
+    non-SRS 7R revolute arm.";
+
+/// Name of the base (world) link — mirrors `BASE_LINK` in the Python artifact.
+pub const BASE_LINK: &str = "base_link";
+
+/// Name of the end-effector link — mirrors `EE_LINK` in the Python artifact.
+pub const EE_LINK: &str = "ee_link";
+
+/// Home pose: 4×4 SE(3) of `ee_link` in `base_link` at `q = [0; 7]`.
+/// Mirrors `T_HOME` in the Python artifact; use as a sanity-check that the
+/// baked geometry matches your URDF.
+pub const T_HOME: [[f64; 4]; 4] = [
+    [-0.7071068058785943, -0.7071067564945002, 0.0, 0.088],
+    [
+        -0.7071067564944993,
+        0.7071068058785934,
+        -4.440892098500621e-16,
+        -3.241851231905455e-17,
+    ],
+    [
+        3.1401848077128287e-16,
+        -3.140185027022262e-16,
+        -0.9999999999999987,
+        0.9259999999999998,
+    ],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
+///
+/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
+/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
+/// `subproblem_dedup = 1e-3`).
+#[derive(Clone, Copy, Debug)]
+pub struct TolerancePolicy {
+    /// FK closure tolerance (== `subproblem_numerical`). Candidates whose
+    /// Frobenius-norm FK residual exceeds this value are rejected (or polished
+    /// when `allow_refinement = true`).
+    pub fk_atol: f64,
+    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`). Two
+    /// configurations that agree to within this value per joint (mod `2*pi`)
+    /// are treated as the same root.
+    pub dedup_atol: f64,
+}
+
+impl TolerancePolicy {
+    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
+    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
+        fk_atol: 1e-5,
+        dedup_atol: 1e-3,
+    };
+}
+
 // --- tolerances (ssik DEFAULT_TOLERANCE_POLICY) ---
 const NUM_TOL: f64 = 1e-5; // subproblem_numerical
 const DEG_TOL: f64 = 1e-12; // subproblem_degeneracy
 const FEAS_TOL: f64 = 1e-9; // subproblem_feasibility
 const DEDUP_TOL: f64 = 1e-3; // subproblem_dedup
 const FK_ATOL: f64 = 1e-5; // FK closure tolerance (== subproblem_numerical)
+
+/// Joint angle limits `(lo, hi)` in radians — baked from `_JOINT_LIMITS` in
+/// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
+const JOINT_LIMITS: [(f64, f64); 7] = [
+    (-2.8973, 2.8973),
+    (-1.7628, 1.7628),
+    (-2.8973, 2.8973),
+    (-3.0718, -0.0698),
+    (-2.8973, 2.8973),
+    (-0.0175, 3.7525),
+    (-2.8973, 2.8973),
+];
 
 /// Maximum inner-solver candidates per lock sample. The `spherical` solver can
 /// return up to [`crate::math::ssik_core`]'s 16 SP5 shoulder triples (4 quartic
@@ -411,15 +496,15 @@ fn norm12(r: &[f64; 12]) -> f64 {
 /// joint values are ill-conditioned), so this routine and the Python data
 /// generator (`scripts/generate_franka_test_data.py`) — which applies the
 /// identical step — converge to the same configuration well within the `1e-5`
-/// test tolerance. The iteration count is hard-bounded for the real-time loop.
-fn refine7(q_in: &[f64; 7], target: &Transform) -> [f64; 7] {
+/// test tolerance. The iteration count is hard-bounded by `max_iters`.
+fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
     const FREE: [usize; 6] = [0, 1, 2, 3, 5, 6];
     let mut q = *q_in;
     let mut lambda = 1e-6_f64;
     let mut r = residual12(&q, target);
     let mut rn = norm12(&r);
 
-    for _ in 0..REFINE_ITERS {
+    for _ in 0..max_iters {
         if rn < 1e-13 {
             break;
         }
@@ -484,13 +569,60 @@ fn refine7(q_in: &[f64; 7], target: &Transform) -> [f64; 7] {
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Computes the complete analytical inverse kinematics for the Franka Panda.
+/// Product-of-exponentials forward kinematics — mirrors `franka_panda_ik.fk`.
 ///
-/// `target_tf` is the SE(3) pose of `ee_link` in `base_link`. The returned
-/// fixed-size array holds every distinct solution (up to [`MAX_SOLUTIONS`]);
-/// unused slots are `None`. This reproduces
-/// `franka_panda_ik.solve(T, respect_limits=False)`.
-pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
+/// `q` is a 7-element joint-angle vector in radians. Returns the 4×4 SE(3)
+/// pose of `ee_link` in `base_link`.
+pub fn fk(q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
+    let tf = fk7(q);
+    let mut out = SMatrix::<f64, 4, 4>::zeros();
+    for i in 0..3 {
+        for j in 0..3 {
+            out[(i, j)] = tf.r[i][j];
+        }
+        out[(i, 3)] = tf.t[i];
+    }
+    out[(3, 3)] = 1.0;
+    out
+}
+
+/// Inverse kinematics — mirrors `franka_panda_ik.solve`.
+///
+/// # Arguments
+///
+/// * `target_tf` — 4×4 SE(3) target pose of `ee_link` in `base_link`.
+/// * `max_solutions` — cap on returned solutions (post-dedup, post-limits).
+///   `None` returns the full algebraic set (at most [`MAX_SOLUTIONS`]).
+/// * `q_seed` — when `Some`, lock-joint samples are visited nearest-first
+///   (closest to `q_seed[4]`), and the output solutions are sorted by
+///   wrap-to-pi distance from the seed (closest first). Combined with
+///   `max_solutions = Some(1)` this gives the trajectory-tracking fast path.
+/// * `respect_limits` — when `true`, solutions outside the baked URDF joint
+///   limits are dropped (after a `±2π` wrap-into-limits attempt). Pass
+///   `false` for the raw geometric set.
+/// * `allow_refinement` — when `true`, each accepted algebraic candidate is
+///   polished with a bounded Levenberg-Marquardt step (the same `refine7`
+///   used by `scripts/generate_franka_test_data.py`). Pass `true` to match
+///   the reference dataset; `false` for raw algebraic roots.
+/// * `policy` — FK closure and dedup tolerances; use
+///   [`TolerancePolicy::DEFAULT`] for the Python defaults.
+/// * `refinement_max_iters` — maximum LM iterations per candidate when
+///   `allow_refinement = true`.
+///
+/// Returns up to [`MAX_SOLUTIONS`] candidate joint vectors `[q1, .., q7]`
+/// in radians; unused slots are [`None`].
+pub fn solve(
+    target_tf: &SMatrix<f64, 4, 4>,
+    max_solutions: Option<usize>,
+    q_seed: Option<&[f64; 7]>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    policy: TolerancePolicy,
+    refinement_max_iters: usize,
+) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
+    let fk_atol = policy.fk_atol;
+    let dedup_atol = policy.dedup_atol;
+
     let mut solutions: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
 
     // Extract the target as a rigid transform and its SE(3) inverse (the inner
@@ -505,6 +637,31 @@ pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLU
     };
     let target_rev = se3_inv(&target);
 
+    // Determine lock-sample traversal order.  When a seed is given, sort by
+    // distance from seed[4] to each lock-sample value (nearest first).  This
+    // mirrors the Python `_solve_algebraic` behaviour that passes `q_seed` to
+    // `seven_r.solve`, enabling early-exit efficiency with `max_solutions=1`.
+    let mut sample_order: [usize; 16] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    ];
+    if let Some(seed) = q_seed {
+        let s4 = seed[4];
+        // Insertion sort by |LOCK_SAMPLES[i] - s4|.
+        for i in 1..16 {
+            let mut j = i;
+            while j > 0 {
+                let da = libm::fabs(consts::LOCK_SAMPLES[sample_order[j - 1]] - s4);
+                let db = libm::fabs(consts::LOCK_SAMPLES[sample_order[j]] - s4);
+                if da > db {
+                    sample_order.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     // Joint-lock sweep: collect 7R candidates with their inner FK residual.
     let mut cand_q = [[0.0f64; 7]; CAND_CAP];
     let mut cand_res = [0.0f64; CAND_CAP];
@@ -514,7 +671,7 @@ pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLU
     let mut inner = [[0.0f64; 6]; INNER_MAX];
     let mut inner_res = [0.0f64; INNER_MAX];
 
-    for sample in 0..16 {
+    for &sample in sample_order.iter() {
         let n_raw = if consts::SOLVER_KIND[sample] == 0 {
             spherical_candidates(sample, &target_rev, &mut raw)
         } else {
@@ -552,7 +709,7 @@ pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLU
     // First dedup (mirrors `seven_r.solve`'s `dedup_by_wrap_close`).
     let mut d1_q = [[0.0f64; 7]; CAND_CAP];
     let mut d1_res = [0.0f64; CAND_CAP];
-    let n_d1 = dedup7(&cand_q, &cand_res, n_cand, &mut d1_q, &mut d1_res);
+    let n_d1 = dedup7(&cand_q, &cand_res, n_cand, &mut d1_q, &mut d1_res, dedup_atol);
 
     // Outer 7R FK verification, then final dedup (mirrors the prebuilt
     // `solve` body).
@@ -565,7 +722,7 @@ pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLU
             continue;
         }
         let residual = frob_diff(&fk7(&q), &target);
-        if residual <= FK_ATOL {
+        if residual <= fk_atol {
             v_q[n_v] = q;
             v_res[n_v] = residual;
             n_v += 1;
@@ -574,31 +731,148 @@ pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLU
 
     let mut f_q = [[0.0f64; 7]; CAND_CAP];
     let mut f_res = [0.0f64; CAND_CAP];
-    let n_final = dedup7(&v_q, &v_res, n_v, &mut f_q, &mut f_res);
+    let n_final = dedup7(&v_q, &v_res, n_v, &mut f_q, &mut f_res, dedup_atol);
 
+    let mut sol_count = 0usize;
     for i in 0..n_final {
-        if i >= MAX_SOLUTIONS {
+        if sol_count >= MAX_SOLUTIONS {
             break;
         }
-        solutions[i] = Some(refine7(&f_q[i], &target));
+        let q = if allow_refinement {
+            refine7(&f_q[i], &target, refinement_max_iters)
+        } else {
+            f_q[i]
+        };
+        solutions[sol_count] = Some(q);
+        sol_count += 1;
     }
+
+    // Post-processing (mirrors Python's _ps_wrap_to_limits + _ps_respect_limits).
+    if respect_limits {
+        let mut filtered: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
+        let mut count = 0usize;
+        for sol in solutions.iter().take(sol_count).flatten() {
+            let q = wrap_to_limits7(sol);
+            if in_limits7(&q) && count < MAX_SOLUTIONS {
+                filtered[count] = Some(q);
+                count += 1;
+            }
+        }
+        solutions = filtered;
+        sol_count = count;
+    }
+
+    // Sort by seed distance (mirrors Python's _ps_nearest_to_seed).
+    if let Some(seed) = q_seed {
+        // Insertion sort on the first `sol_count` slots.
+        for i in 1..sol_count {
+            let mut j = i;
+            while j > 0 {
+                let prev = solutions[j - 1].unwrap();
+                let curr = solutions[j].unwrap();
+                if seed_dist7(&prev, seed) > seed_dist7(&curr, seed) {
+                    solutions.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Truncate to max_solutions (mirrors Python's `solutions[:max_solutions]`).
+    if let Some(max) = max_solutions {
+        let cap = max.min(sol_count);
+        for i in cap..sol_count {
+            solutions[i] = None;
+        }
+    }
+
     solutions
 }
 
-/// Dedup 7-vectors by wrap-to-pi closeness, keeping the lower-residual
-/// representative on collision (first-match-wins ordering).
+/// Computes the complete analytical inverse kinematics for the Franka Panda.
+///
+/// Convenience wrapper around [`solve`] that reproduces
+/// `franka_panda_ik.solve(T, respect_limits=False)` with refinement enabled
+/// (60 LM iterations, matching the reference test dataset).
+///
+/// The returned fixed-size array holds every distinct solution (up to
+/// [`MAX_SOLUTIONS`]); unused slots are `None`.
+pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
+    solve(
+        target_tf,
+        None,
+        None,
+        false,
+        true,
+        TolerancePolicy::DEFAULT,
+        REFINE_ITERS,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Post-processing helpers
+// ---------------------------------------------------------------------------
+
+/// Try `q[i] ± 2π` per joint to bring the vector into [`JOINT_LIMITS`].
+/// Mirrors Python's `_ps_wrap_to_limits`.
+fn wrap_to_limits7(q: &[f64; 7]) -> [f64; 7] {
+    use core::f64::consts::TAU;
+    let mut out = *q;
+    for i in 0..7 {
+        let (lo, hi) = JOINT_LIMITS[i];
+        if out[i] < lo {
+            let wrapped = out[i] + TAU;
+            if wrapped <= hi {
+                out[i] = wrapped;
+            }
+        } else if out[i] > hi {
+            let wrapped = out[i] - TAU;
+            if wrapped >= lo {
+                out[i] = wrapped;
+            }
+        }
+    }
+    out
+}
+
+/// `true` if every joint is within its URDF limit.
+fn in_limits7(q: &[f64; 7]) -> bool {
+    for i in 0..7 {
+        let (lo, hi) = JOINT_LIMITS[i];
+        if q[i] < lo || q[i] > hi {
+            return false;
+        }
+    }
+    true
+}
+
+/// Squared wrap-to-π distance between `q` and `seed`. Used for seed sorting.
+fn seed_dist7(q: &[f64; 7], seed: &[f64; 7]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..7 {
+        let d = wrap_to_pi(q[i] - seed[i]);
+        s += d * d;
+    }
+    s
+}
+
+/// Dedup 7-vectors by wrap-to-pi closeness within `tol`, keeping the
+/// lower-residual representative on collision (first-match-wins ordering).
 fn dedup7(
     q: &[[f64; 7]; CAND_CAP],
     res: &[f64; CAND_CAP],
     n: usize,
     out_q: &mut [[f64; 7]; CAND_CAP],
     out_res: &mut [f64; CAND_CAP],
+    tol: f64,
 ) -> usize {
     let mut m = 0usize;
     for i in 0..n {
         let mut dup = usize::MAX;
         for j in 0..m {
-            if q_close7(&q[i], &out_q[j], DEDUP_TOL) {
+            if q_close7(&q[i], &out_q[j], tol) {
                 dup = j;
                 break;
             }
@@ -646,16 +920,33 @@ mod tests {
     }
 
     #[test]
+    fn fk_home_pose() {
+        let zero = [0.0f64; 7];
+        let t = fk(&zero);
+        // T_HOME from the Python artifact (FK at q = zeros(7)).
+        for i in 0..4 {
+            for j in 0..4 {
+                let expected = T_HOME[i][j];
+                let got = t[(i, j)];
+                assert!(
+                    (got - expected).abs() < 1e-10,
+                    "fk home pose mismatch at ({i},{j}): got {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn home_pose_round_trips() {
         // T_HOME from the artifact (FK at q = 0).
-        let t_home = [
-            -0.7071068058785943, -0.7071067564945002, 0.0, 0.088,
-            -0.7071067564944993, 0.7071068058785934, -4.440892098500621e-16, -3.241851231905455e-17,
-            3.1401848077128287e-16, -3.140185027022262e-16, -0.9999999999999987, 0.9259999999999998,
-            0.0, 0.0, 0.0, 1.0,
+        let t_home: [f64; 16] = [
+            T_HOME[0][0], T_HOME[0][1], T_HOME[0][2], T_HOME[0][3],
+            T_HOME[1][0], T_HOME[1][1], T_HOME[1][2], T_HOME[1][3],
+            T_HOME[2][0], T_HOME[2][1], T_HOME[2][2], T_HOME[2][3],
+            T_HOME[3][0], T_HOME[3][1], T_HOME[3][2], T_HOME[3][3],
         ];
         let tf = tf_from_row_major(&t_home);
-        let sols = compute_ik(&tf);
+        let sols = solve(&tf, None, None, false, true, TolerancePolicy::DEFAULT, REFINE_ITERS);
         let zero = [0.0; 7];
         let found = sols.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-5));
         assert!(found, "home configuration q=0 not recovered");
@@ -668,7 +959,9 @@ mod tests {
         let mut case_idx = 0usize;
         for (tf_arr, expected) in test_data::CASES {
             let tf = tf_from_row_major(tf_arr);
-            let sols = compute_ik(&tf);
+            // Use allow_refinement=true with REFINE_ITERS=60 to match the
+            // test data generated by scripts/generate_franka_test_data.py.
+            let sols = solve(&tf, None, None, false, true, TolerancePolicy::DEFAULT, REFINE_ITERS);
             let got: Vec<[f64; 7]> = sols.iter().flatten().copied().collect();
 
             assert_eq!(
@@ -691,5 +984,86 @@ mod tests {
             case_idx += 1;
         }
         assert!(total_expected > 0, "no expected solutions in dataset");
+    }
+
+    #[test]
+    fn respect_limits_drops_out_of_range() {
+        // q=0 is the home pose; all joints are at 0 which is within limits
+        // for joints 0,1,2,4,6.  Joint 3 limit is (-3.0718, -0.0698) which
+        // does NOT include 0 — so q=0 should be dropped by respect_limits.
+        let t_home: [f64; 16] = [
+            T_HOME[0][0], T_HOME[0][1], T_HOME[0][2], T_HOME[0][3],
+            T_HOME[1][0], T_HOME[1][1], T_HOME[1][2], T_HOME[1][3],
+            T_HOME[2][0], T_HOME[2][1], T_HOME[2][2], T_HOME[2][3],
+            T_HOME[3][0], T_HOME[3][1], T_HOME[3][2], T_HOME[3][3],
+        ];
+        let tf = tf_from_row_major(&t_home);
+        // Without limits the raw geometric set should include q=0.
+        let sols_raw =
+            solve(&tf, None, None, false, true, TolerancePolicy::DEFAULT, REFINE_ITERS);
+        let zero = [0.0f64; 7];
+        let found_raw = sols_raw.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-5));
+        assert!(found_raw, "q=0 should be present in the raw solution set");
+
+        // With limits on, q=0 violates joint-3 limits, so it should be absent.
+        let sols_lim =
+            solve(&tf, None, None, true, true, TolerancePolicy::DEFAULT, REFINE_ITERS);
+        let found_lim = sols_lim.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-5));
+        assert!(
+            !found_lim,
+            "q=0 (joint 3 = 0, outside (-3.0718, -0.0698)) should be absent with respect_limits=true"
+        );
+    }
+
+    #[test]
+    fn max_solutions_cap() {
+        let t_home: [f64; 16] = [
+            T_HOME[0][0], T_HOME[0][1], T_HOME[0][2], T_HOME[0][3],
+            T_HOME[1][0], T_HOME[1][1], T_HOME[1][2], T_HOME[1][3],
+            T_HOME[2][0], T_HOME[2][1], T_HOME[2][2], T_HOME[2][3],
+            T_HOME[3][0], T_HOME[3][1], T_HOME[3][2], T_HOME[3][3],
+        ];
+        let tf = tf_from_row_major(&t_home);
+        let all_sols =
+            solve(&tf, None, None, false, true, TolerancePolicy::DEFAULT, REFINE_ITERS);
+        let n_all: usize = all_sols.iter().flatten().count();
+        if n_all > 1 {
+            let capped =
+                solve(&tf, Some(1), None, false, true, TolerancePolicy::DEFAULT, REFINE_ITERS);
+            let n_capped: usize = capped.iter().flatten().count();
+            assert_eq!(n_capped, 1, "max_solutions=1 should return exactly 1 solution");
+        }
+    }
+
+    #[test]
+    fn q_seed_sorts_nearest_first() {
+        let t_home: [f64; 16] = [
+            T_HOME[0][0], T_HOME[0][1], T_HOME[0][2], T_HOME[0][3],
+            T_HOME[1][0], T_HOME[1][1], T_HOME[1][2], T_HOME[1][3],
+            T_HOME[2][0], T_HOME[2][1], T_HOME[2][2], T_HOME[2][3],
+            T_HOME[3][0], T_HOME[3][1], T_HOME[3][2], T_HOME[3][3],
+        ];
+        let tf = tf_from_row_major(&t_home);
+        let zero = [0.0f64; 7];
+        let sols = solve(
+            &tf,
+            None,
+            Some(&zero),
+            false,
+            true,
+            TolerancePolicy::DEFAULT,
+            REFINE_ITERS,
+        );
+        let solutions: Vec<[f64; 7]> = sols.iter().flatten().copied().collect();
+        if solutions.len() > 1 {
+            // First solution must be the closest to seed.
+            let d0 = seed_dist7(&solutions[0], &zero);
+            for s in &solutions[1..] {
+                assert!(
+                    d0 <= seed_dist7(s, &zero) + 1e-12,
+                    "q_seed sort: first solution is not the nearest to seed"
+                );
+            }
+        }
     }
 }
