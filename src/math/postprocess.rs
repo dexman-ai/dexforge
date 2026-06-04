@@ -61,8 +61,9 @@ pub fn respect_limits<const N: usize>(
 
 /// Try wrapping each joint by `±2π` integer multiples to bring it into range.
 ///
-/// Searches `k ∈ {-2, -1, 0, +1, +2}` (smallest `|k|` first). Joints with
-/// `limits[i] = None` are left unchanged.
+/// For each joint, if already in range it is left unchanged (implicit k=0).
+/// Otherwise searches `k ∈ {+1, -1, +2, -2}` (smallest `|k|` first). Joints
+/// with `limits[i] = None` are left unchanged.
 ///
 /// Mirrors `ssik.postprocess.wrap_to_limits`.
 pub fn wrap_to_limits<const N: usize>(

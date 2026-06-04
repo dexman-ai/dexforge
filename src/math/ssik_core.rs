@@ -824,10 +824,10 @@ pub fn qr_complete_4x2(m: &[[f64; 2]; 4]) -> ([[f64; 4]; 4], [[f64; 2]; 4]) {
         for i in col..4 {
             norm_sq += a[i][col] * a[i][col];
         }
-        let norm = sqrt(norm_sq);
-        if norm == 0.0 {
+        if norm_sq == 0.0 {
             continue;
         }
+        let norm = sqrt(norm_sq);
         let alpha = if a[col][col] > 0.0 { -norm } else { norm };
         let mut v = [0.0f64; 4];
         for i in col..4 {
