@@ -70,7 +70,8 @@ const TWO_PI: f64 = 2.0 * PI;
 const ILL_CONDITIONED_COND: f64 = 1e10;
 
 /// 10 µm — magnitude of the deterministic Cartesian micro-perturbations used to
-/// bump an ill-conditioned target off a mathematical singularity.
+/// bump an ill-conditioned target off a mathematical singularity. Expressed in
+/// the driver's base length unit (metres), so `1e-5` == 10 µm.
 const PERTURBATION_DELTA: f64 = 1e-5;
 
 /// Deterministic spatial micro-perturbations: +10 µm translations along the
