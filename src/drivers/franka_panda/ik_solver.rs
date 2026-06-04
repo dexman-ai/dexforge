@@ -26,7 +26,7 @@
 //!
 //! ## Equivalence to the Python reference
 //!
-//! [`compute_ik`] reproduces `franka_panda_ik.solve(T, respect_limits=False)`:
+//! [`solve`] reproduces `franka_panda_ik.solve(T, respect_limits=False)`:
 //! the raw geometric solution set, FK-verified to `1e-5` and de-duplicated to
 //! `1e-3` per joint. The exhaustive 16-sample sweep yields up to **128**
 //! candidates (`16 * 8`); after dedup the count is typically 16–128, so unlike
@@ -458,9 +458,9 @@ fn q_close7(a: &[f64; 7], b: &[f64; 7], tol: f64) -> bool {
 // Shared Newton refinement
 // ---------------------------------------------------------------------------
 
-/// Iteration ceiling for the Levenberg-Marquardt pose-refinement polish.
-const REFINE_ITERS: usize = 60;
 const REFINE_EPS: f64 = 1e-7;
+#[cfg(test)]
+const REFINE_ITERS: usize = 60;
 
 /// 12-vector pose residual `[vec(R(q) - R_t); t(q) - t_t]` of the full 7R FK.
 #[inline]
@@ -794,26 +794,6 @@ pub fn solve(
     }
 
     solutions
-}
-
-/// Computes the complete analytical inverse kinematics for the Franka Panda.
-///
-/// Convenience wrapper around [`solve`] that reproduces
-/// `franka_panda_ik.solve(T, respect_limits=False)` with refinement enabled
-/// (60 LM iterations, matching the reference test dataset).
-///
-/// The returned fixed-size array holds every distinct solution (up to
-/// [`MAX_SOLUTIONS`]); unused slots are `None`.
-pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    solve(
-        target_tf,
-        None,
-        None,
-        false,
-        true,
-        TolerancePolicy::DEFAULT,
-        REFINE_ITERS,
-    )
 }
 
 // ---------------------------------------------------------------------------
