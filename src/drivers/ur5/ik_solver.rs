@@ -12,11 +12,14 @@
 //!
 //! ## Equivalence to the Python reference
 //!
-//! [`compute_ik`] reproduces `ur5_ik.solve(T, respect_limits=False)`: the raw
+//! [`solve`] reproduces `ur5_ik.solve(T, respect_limits=False)`: the raw
 //! geometric solution set, FK-verified against the target pose and de-duplicated
 //! modulo `2*pi`. Joint-limit clamping (`respect_limits=True`) is intentionally
 //! *not* applied so the output is the pure algebraic set; callers can filter to
 //! limits afterwards if desired.
+//!
+//! [`fk`] mirrors `ur5_ik.fk` (alias of `_fk`): product-of-exponentials forward
+//! kinematics using the baked chain constants.
 
 use nalgebra::SMatrix;
 
@@ -130,14 +133,16 @@ fn wrap_to_pi(a: f64) -> f64 {
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Computes the complete analytical inverse kinematics for the UR5.
+/// Inverse kinematics — mirrors `ur5_ik.solve(T_target, respect_limits=False)`.
 ///
-/// `target_tf` is the 4x4 SE(3) pose of `ee_link` expressed in `base_link`.
+/// `t` is the 4x4 SE(3) pose of `ee_link` expressed in `base_link`.
 /// Returns up to 16 candidate joint vectors `[q1, .., q6]` (the UR5 yields at
 /// most 8); empty slots are [`None`]. The set is FK-verified to within
-/// [`FK_ATOL`] and de-duplicated modulo `2*pi`, matching
-/// `ur5_ik.solve(T, respect_limits=False)`.
-pub fn compute_ik(target_tf: &SMatrix<f64, 4, 4>) -> [Option<[f64; 6]>; 16] {
+/// [`FK_ATOL`] and de-duplicated modulo `2*pi`. Joint-limit filtering
+/// (`respect_limits=True` in Python) is not applied; callers may filter
+/// afterwards if desired.
+pub fn solve(t: &SMatrix<f64, 4, 4>) -> [Option<[f64; 6]>; 16] {
+    let target_tf = t;
     let mut solutions: [Option<[f64; 6]>; 16] = [None; 16];
     let mut solution_count = 0usize;
 
@@ -911,8 +916,11 @@ fn rot_homogeneous(axis: &[f64; 3], angle: f64) -> [[f64; 4]; 4] {
     ]
 }
 
-/// Product-of-exponentials forward kinematics using the baked chain constants.
-fn fk(q: &[f64; 6]) -> [[f64; 4]; 4] {
+/// Product-of-exponentials forward kinematics — mirrors `ur5_ik.fk`.
+///
+/// `q` is a 6-element joint-angle vector in radians. Returns the 4x4 SE(3)
+/// pose of `ee_link` in `base_link`.
+pub fn fk(q: &[f64; 6]) -> SMatrix<f64, 4, 4> {
     let mut acc = [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -925,7 +933,13 @@ fn fk(q: &[f64; 6]) -> [[f64; 4]; 4] {
         let n = mat4_mul(&m, &T_RIGHTS[i]);
         acc = mat4_mul(&acc, &n);
     }
-    acc
+    let mut out = SMatrix::<f64, 4, 4>::zeros();
+    for i in 0..4 {
+        for j in 0..4 {
+            out[(i, j)] = acc[i][j];
+        }
+    }
+    out
 }
 
 /// Frobenius-norm residual between FK(q) and the target pose.
@@ -934,7 +948,7 @@ fn fk_residual(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> f64 {
     let mut s = 0.0;
     for i in 0..4 {
         for j in 0..4 {
-            let d = t[i][j] - target[(i, j)];
+            let d = t[(i, j)] - target[(i, j)];
             s += d * d;
         }
     }
@@ -973,6 +987,29 @@ mod tests {
     }
 
     #[test]
+    fn fk_home_pose() {
+        let zero = [0.0f64; 6];
+        let t = fk(&zero);
+        // Python T_HOME at q = zeros(6)
+        let t_home = [
+            1.0, 0.0, 0.0, -0.81725,
+            0.0, 6.123233995736766e-17, -1.0, -0.19145,
+            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        for i in 0..4 {
+            for j in 0..4 {
+                let expected = t_home[i * 4 + j];
+                let got = t[(i, j)];
+                assert!(
+                    (got - expected).abs() < 1e-10,
+                    "fk home pose mismatch at ({i},{j}): got {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn home_pose_round_trips() {
         let t_home = [
             1.0, 0.0, 0.0, -0.81725,
@@ -981,7 +1018,7 @@ mod tests {
             0.0, 0.0, 0.0, 1.0,
         ];
         let tf = tf_from_row_major(&t_home);
-        let sols = compute_ik(&tf);
+        let sols = solve(&tf);
         let zero = [0.0; 6];
         let found = sols.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-6));
         assert!(found, "home configuration q=0 not recovered");
@@ -994,7 +1031,7 @@ mod tests {
         let mut case_idx = 0usize;
         for (tf_arr, expected) in test_data::CASES {
             let tf = tf_from_row_major(tf_arr);
-            let sols = compute_ik(&tf);
+            let sols = solve(&tf);
             let got: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
 
             assert_eq!(

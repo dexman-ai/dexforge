@@ -75,7 +75,7 @@ fn compute_ik(
     let tf = SMatrix::<f64, 4, 4>::from_row_slice(&data);
 
     let raw = match arm {
-        "ur5" => ssik_rust::drivers::ur5::ik_solver::compute_ik(&tf),
+        "ur5" => ssik_rust::drivers::ur5::ik_solver::solve(&tf),
         _ => {
             return Err(PyValueError::new_err(format!(
                 "unsupported arm '{arm}'; supported arms: ur5"
