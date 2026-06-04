@@ -85,14 +85,16 @@ for k,v in arrays.items():
     print("//", k, len(v), "x", len(v[0]))
 
 import os
-    dest = os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "piper", "pq.rs")
-    with open(os.path.normpath(dest), "w") as f:
-    f.write("//! Per-arm Raghavan-Roth (P_sin, P_cos, P_one, Q) matrix builder for the\n")
+
+dest = os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "piper", "pq.rs")
+with open(os.path.normpath(dest), "w") as f:
+    f.write("//! Per-arm Raghavan-Roth `(P_sin, P_cos, P_one, Q)` matrix builder for the\n")
     f.write("//! AgileX Piper, translated verbatim from\n")
-    f.write("//! ssik.prebuilt.piper_ik._build_pq_matrices.\n")
+    f.write("//! `ssik.prebuilt.piper_ik._build_pq_matrices`.\n")
     f.write("//!\n")
-    f.write("//! The body is machine-generated (sympy cse) and reproduced here without\n")
-    f.write("//! manual edits. Regenerate with scripts/generate_piper_pq.py.\n\n")
+    f.write("//! The body is machine-generated (sympy `cse`) and is reproduced here without\n")
+    f.write("//! manual edits so the floating-point accumulation order matches the Python\n")
+    f.write("//! reference bit-for-bit. Regenerate with `scripts/generate_piper_pq.py`.\n\n")
     f.write("// Do not edit by hand. See scripts/generate_piper_pq.py.\n")
     f.write("#[allow(clippy::all)]\n")
     f.write("#[allow(unused_parens)]\n")
@@ -115,4 +117,4 @@ import os
     emit_array("q", arrays['q'], 8)
     f.write("    (p_sin, p_cos, p_one, q)\n")
     f.write("}\n")
-print("wrote pq_generated.rs")
+print("wrote src/drivers/piper/pq.rs")
