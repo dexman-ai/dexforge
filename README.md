@@ -21,7 +21,7 @@ hardcoded iteration ceiling so worst-case execution time is bounded.
 | `src/drivers/piper/ik_solver.rs` | AgileX **Piper** (6-DOF) solver (`solve`, `fk`), ported from `ssik/prebuilt/piper_ik.py` (solver `ikgeo.general_6r`, tier 2). Numeric Raghavan-Roth elimination + Manocha-Canny `24x24` companion-eigenvalue route, back-substitution, FK verification, and the `#[cfg(test)]` reference test. |
 | `src/drivers/piper/consts.rs` | Auto-generated baked geometry (joint axes/transforms, DH parameters, frame offsets, joint limits). |
 | `src/drivers/piper/pq.rs` | Machine-generated `(P_sin, P_cos, P_one, Q)` Raghavan-Roth matrix builder. |
-| `src/drivers/piper/test_data.rs` | Auto-generated reference dataset (poses with >1 solution the Rust solver reproduces). |
+| `src/drivers/piper/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution; singular poses flagged for FK-residual comparison). |
 | `scripts/generate_test_data.py` | Regenerates `test_data.rs` from the reference Python solver. |
 | `scripts/generate_franka_consts.py` | Regenerates the Franka `consts.rs` from the Python artifact. |
 | `scripts/generate_franka_test_data.py` | Regenerates the Franka `test_data.rs` from the reference Python solver. |
