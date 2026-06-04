@@ -22,7 +22,10 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::ssik_core::quartic_roots;
+use crate::math::kinematics::{
+    eye_with, lm_refine6, mat2_ata, mat4_mul, rot_homogeneous, vec2_mat2,
+};
+use crate::math::ssik_core::{cross3, dot3, quartic_roots, rotate, wrap_to_pi};
 
 use core::f64::consts::PI;
 
@@ -113,54 +116,6 @@ const JOINT_LIMITS: [(f64, f64); 6] = [
     (-6.28318530717959, 6.28318530717959),
     (-6.28318530717959, 6.28318530717959),
 ];
-
-/// 4x4 homogeneous identity with the given translation column.
-const fn eye_with(x: f64, y: f64, z: f64) -> [[f64; 4]; 4] {
-    [
-        [1.0, 0.0, 0.0, x],
-        [0.0, 1.0, 0.0, y],
-        [0.0, 0.0, 1.0, z],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-// ---------------------------------------------------------------------------
-// 3-vector primitives
-// ---------------------------------------------------------------------------
-
-#[inline]
-fn dot3(a: &[f64; 3], b: &[f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn cross3(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-/// Rodrigues rotation of `v` about unit axis `k` by `theta`.
-#[inline]
-fn rotate(k: &[f64; 3], theta: f64, v: &[f64; 3]) -> [f64; 3] {
-    let c = libm::cos(theta);
-    let s = libm::sin(theta);
-    let kv = dot3(k, v);
-    let omc = 1.0 - c;
-    let kxv = cross3(k, v);
-    [
-        v[0] * c + kxv[0] * s + k[0] * (kv * omc),
-        v[1] * c + kxv[1] * s + k[1] * (kv * omc),
-        v[2] * c + kxv[2] * s + k[2] * (kv * omc),
-    ]
-}
-
-#[inline]
-fn wrap_to_pi(a: f64) -> f64 {
-    libm::remainder(a, TWO_PI)
-}
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -351,23 +306,6 @@ fn seed_dist(q: &[f64; 6], seed: &[f64; 6]) -> f64 {
 // Levenberg-Marquardt refinement (for `allow_refinement = true`)
 // ---------------------------------------------------------------------------
 
-/// Finite-difference step size for Jacobian computation in LM refinement.
-const REFINE_EPS: f64 = 1e-7;
-/// Residual below which the LM refiner considers the solution converged.
-const LM_CONVERGENCE_THRESHOLD: f64 = 1e-13;
-/// Initial Levenberg-Marquardt damping parameter.
-const LM_INITIAL_LAMBDA: f64 = 1e-6;
-/// Factor by which lambda grows when a step is rejected.
-const LM_LAMBDA_GROWTH: f64 = 8.0;
-/// Factor by which lambda shrinks when a step is accepted.
-const LM_LAMBDA_DECAY: f64 = 0.5;
-/// Minimum allowed lambda (prevents numerical underflow).
-const LM_LAMBDA_MIN: f64 = 1e-12;
-/// Maximum allowed lambda; when exceeded, the backtrack loop aborts.
-const LM_LAMBDA_MAX: f64 = 1e8;
-/// Maximum backtrack attempts per LM iteration.
-const LM_BACKTRACK_MAX_ATTEMPTS: usize = 12;
-
 /// 12-vector pose residual `[vec(R(q) − R_t); t(q) − t_t]` for the UR5.
 fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
     let tf = fk(q);
@@ -385,15 +323,6 @@ fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
     r
 }
 
-#[inline]
-fn norm_pose12(r: &[f64; 12]) -> f64 {
-    let mut s = 0.0;
-    for v in r.iter() {
-        s += v * v;
-    }
-    libm::sqrt(s)
-}
-
 /// Levenberg-Marquardt polish of a 6-DOF UR5 configuration onto the exact
 /// pose root. Mirrors the Python `_lm_refine` path used when
 /// `allow_refinement = True`. Returns `Some(q_refined)` if the FK residual
@@ -404,74 +333,7 @@ fn refine6(
     max_iters: usize,
     fk_atol: f64,
 ) -> Option<[f64; 6]> {
-    let mut q = *q_in;
-    let mut lambda = LM_INITIAL_LAMBDA;
-    let mut r = pose_residual12(&q, target);
-    let mut rn = norm_pose12(&r);
-
-    for _ in 0..max_iters {
-        if rn < LM_CONVERGENCE_THRESHOLD {
-            break;
-        }
-        // Finite-difference Jacobian J (12×6) over all 6 joints.
-        let mut jac = SMatrix::<f64, 12, 6>::zeros();
-        for col in 0..6 {
-            let mut qp = q;
-            qp[col] += REFINE_EPS;
-            let rp = pose_residual12(&qp, target);
-            for row in 0..12 {
-                jac[(row, col)] = (rp[row] - r[row]) / REFINE_EPS;
-            }
-        }
-        let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
-        let jt = jac.transpose();
-        let jtj = jt * jac; // 6×6
-        let jtr = jt * rv; // 6×1
-
-        // Adaptive LM damping with accept/reject backtrack.
-        let mut accepted = false;
-        for _ in 0..LM_BACKTRACK_MAX_ATTEMPTS {
-            let mut damped = jtj;
-            for d in 0..6 {
-                damped[(d, d)] += lambda;
-            }
-            let inv = match damped.try_inverse() {
-                Some(m) => m,
-                None => {
-                    lambda *= LM_LAMBDA_GROWTH;
-                    continue;
-                }
-            };
-            let dq = inv * jtr;
-            let mut q_trial = q;
-            for col in 0..6 {
-                q_trial[col] -= dq[(col, 0)];
-            }
-            let r_trial = pose_residual12(&q_trial, target);
-            let rn_trial = norm_pose12(&r_trial);
-            if rn_trial < rn {
-                q = q_trial;
-                r = r_trial;
-                rn = rn_trial;
-                lambda = (lambda * LM_LAMBDA_DECAY).max(LM_LAMBDA_MIN);
-                accepted = true;
-                break;
-            }
-            lambda *= LM_LAMBDA_GROWTH;
-            if lambda > LM_LAMBDA_MAX {
-                break;
-            }
-        }
-        if !accepted {
-            break;
-        }
-    }
-
-    if rn <= fk_atol {
-        Some(q)
-    } else {
-        None
-    }
+    lm_refine6(q_in, |q| pose_residual12(q, target), max_iters, fk_atol)
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,54 +1010,9 @@ fn solve_two_ellipse_numeric(
     count
 }
 
-/// `M^T M` for a 2x2 matrix stored row-major.
-#[inline]
-fn mat2_ata(m: &[[f64; 2]; 2]) -> [[f64; 2]; 2] {
-    let c00 = m[0][0] * m[0][0] + m[1][0] * m[1][0];
-    let c01 = m[0][0] * m[0][1] + m[1][0] * m[1][1];
-    let c11 = m[0][1] * m[0][1] + m[1][1] * m[1][1];
-    [[c00, c01], [c01, c11]]
-}
-
-/// `v^T M` (1x2) for 2-vector `v` and 2x2 matrix `M`.
-#[inline]
-fn vec2_mat2(v: &[f64; 2], m: &[[f64; 2]; 2]) -> [f64; 2] {
-    [
-        v[0] * m[0][0] + v[1] * m[1][0],
-        v[0] * m[0][1] + v[1] * m[1][1],
-    ]
-}
-
 // ---------------------------------------------------------------------------
 // Forward kinematics (for FK closure verification)
 // ---------------------------------------------------------------------------
-
-fn mat4_mul(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
-    let mut out = [[0.0f64; 4]; 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            let mut s = 0.0;
-            for kk in 0..4 {
-                s += a[i][kk] * b[kk][j];
-            }
-            out[i][j] = s;
-        }
-    }
-    out
-}
-
-fn rot_homogeneous(axis: &[f64; 3], angle: f64) -> [[f64; 4]; 4] {
-    let c = libm::cos(angle);
-    let s = libm::sin(angle);
-    let (x, y, z) = (axis[0], axis[1], axis[2]);
-    let oc = 1.0 - c;
-    [
-        [c + x * x * oc, x * y * oc - z * s, x * z * oc + y * s, 0.0],
-        [y * x * oc + z * s, c + y * y * oc, y * z * oc - x * s, 0.0],
-        [z * x * oc - y * s, z * y * oc + x * s, c + z * z * oc, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
 
 /// Product-of-exponentials forward kinematics — mirrors `ur5_ik.fk`.
 ///
