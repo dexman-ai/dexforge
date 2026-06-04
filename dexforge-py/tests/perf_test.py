@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Standalone performance benchmark: Python ssik artifact vs Rust ssik_py.
+"""Standalone performance benchmark: Python ssik artifact vs Rust dexforge_py.
 
 Usage::
 
     # Run with defaults (ur5, 100 iterations):
-    python ssik-py/tests/perf_test.py
+    python dexforge-py/tests/perf_test.py
 
     # Specify arm and iteration count:
-    python ssik-py/tests/perf_test.py --arm franka_panda --n 200
+    python dexforge-py/tests/perf_test.py --arm franka_panda --n 200
 
     # Run all known arms:
-    python ssik-py/tests/perf_test.py --arm all
+    python dexforge-py/tests/perf_test.py --arm all
 
 The script prints total and per-IK wall-clock time for both the Python
-ssik prebuilt artifact and the Rust ssik_py bindings.
+ssik prebuilt artifact and the Rust dexforge_py bindings.
 
 To add a new arm to the benchmark, add an entry to ARMS below (once the
-corresponding Rust driver and ssik_py dispatch arm are implemented).
+corresponding Rust driver and dexforge_py dispatch arm are implemented).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from typing import List
 
 import numpy as np
 
-import ssik_py
+import dexforge_py
 
 # ---------------------------------------------------------------------------
 # Arm registry: canonical name -> ssik.prebuilt module name.
@@ -65,7 +65,7 @@ def bench(arm: str, n: int) -> None:
 
     # Warm up JIT / module import overhead with one call each.
     artifact.solve(poses[0], respect_limits=False, allow_refinement=False)
-    ssik_py.solve(arm, poses[0], respect_limits=False, allow_refinement=False)
+    dexforge_py.solve(arm, poses[0], respect_limits=False, allow_refinement=False)
 
     # ── Python artifact ───────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -73,10 +73,10 @@ def bench(arm: str, n: int) -> None:
         artifact.solve(T, respect_limits=False, allow_refinement=False)
     t_py = time.perf_counter() - t0
 
-    # ── Rust via ssik_py ──────────────────────────────────────────────────
+    # ── Rust via dexforge_py ──────────────────────────────────────────────────
     t0 = time.perf_counter()
     for T in poses:
-        ssik_py.solve(arm, T, respect_limits=False, allow_refinement=False)
+        dexforge_py.solve(arm, T, respect_limits=False, allow_refinement=False)
     t_rust = time.perf_counter() - t0
 
     sep = "-" * 50
@@ -95,7 +95,7 @@ def bench(arm: str, n: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark Python ssik artifact vs Rust ssik_py bindings."
+        description="Benchmark Python ssik artifact vs Rust dexforge_py bindings."
     )
     parser.add_argument(
         "--arm",

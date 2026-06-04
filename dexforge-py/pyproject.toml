@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "ssik-py"
+name = "dexforge-py"
 version = "0.1.0"
 description = "Python bindings for ssik-rust analytical inverse kinematics."
 requires-python = ">=3.8"
@@ -11,5 +11,5 @@ license = { text = "BSD-3-Clause" }
 dependencies = ["scipy", "numpy"]
 
 [tool.maturin]
-module-name = "ssik_py"
+module-name = "dexforge_py"
 manifest-path = "Cargo.toml"

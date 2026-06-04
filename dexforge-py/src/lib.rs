@@ -6,13 +6,13 @@
 //!
 //! ```python
 //! import numpy as np
-//! import ssik_py
+//! import dexforge_py
 //!
 //! T = np.eye(4)           # 4x4 SE(3) target pose
 //! q = [0.0] * 6          # joint angles in radians
 //!
-//! solutions = ssik_py.solve("ur5", T, respect_limits=False)
-//! T_fk      = ssik_py.fk("ur5", q)
+//! solutions = dexforge_py.solve("ur5", T, respect_limits=False)
+//! T_fk      = dexforge_py.fk("ur5", q)
 //! ```
 //!
 //! # Adding a new arm driver
@@ -323,7 +323,7 @@ fn solve(
 /// fk(arm, q)
 ///     Forward kinematics — mirrors ``ssik.prebuilt.<arm>_ik.fk``.
 #[pymodule]
-fn ssik_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn dexforge_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve, m)?)?;
     m.add_function(wrap_pyfunction!(fk, m)?)?;
     Ok(())
