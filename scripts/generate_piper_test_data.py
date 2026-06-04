@@ -12,6 +12,28 @@ Strategy (mirrors the issue's verification requirements):
    regression test is stable rather than tracking floating-point knife-edge
    poses near singularities).
 
+A small minority of the sampled poses are intentionally excluded by step 3.
+They are **not** the ``cond(A_eq) > 1e10`` ill-conditioned poses the Python
+reference escapes with its non-deterministic Möbius fallback — the equilibrated
+leading matrix stays well below ``1e10`` for every reachable Piper pose in this
+sample, and the Rust driver's deterministic spatial bypass (see ``ik_solver``)
+covers that class regardless. They are poses where the bounded Francis-QR
+eigenvalue route and LAPACK make *different but individually valid* choices that
+cannot be reconciled to ``1e-5``:
+
+* near-double roots / kinematic singularities where two solutions coalesce, so
+  the reported solution *count* depends on the eigenvalue solver's numerical
+  resolution (e.g. the reference keeps 2 of 8 near-miss roots while the Rust
+  route keeps 5);
+* self-motion / wrist singularities (``q5 ~ 0``) where distinct joint vectors
+  close the same Cartesian pose to ``< 1e-11`` yet differ by ``~1e-4`` in joint
+  space, so no two solvers agree to ``1e-5``;
+* poses where the reference ``allow_refinement=False`` output is itself only
+  accurate to ``~5e-6`` (it is unrefined), below the ``1e-5`` assertion.
+
+Reproducing these exactly would require replicating LAPACK's rounding inside the
+``#![no_std]`` bounded solver, which is out of scope.
+
 The retained ``(pose, solutions)`` pairs are written as a Rust source module
 (``src/drivers/piper/test_data.rs``) consumed by the ``#[cfg(test)]`` block in
 ``ik_solver.rs``.

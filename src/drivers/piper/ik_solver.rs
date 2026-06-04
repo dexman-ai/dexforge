@@ -34,9 +34,12 @@
 //! The Python reference falls back to a randomised Möbius reparameterisation +
 //! generalised eigenvalue solve when the equilibrated leading matrix is
 //! ill-conditioned (`cond > 1e10`). That path is non-deterministic (RNG) and is
-//! intentionally **not** ported here so the real-time execution path stays
-//! bounded and reproducible; equilibration handles all well-conditioned
-//! (reachable) poses.
+//! intentionally **not** ported. Instead, ill-conditioned targets are handled
+//! by a *deterministic spatial bypass*: the target is nudged 10 µm off the
+//! singularity (see `PERTURBATIONS`), re-solved with the bounded algebraic
+//! route, and the roots are snapped back onto the original pose with the
+//! bounded Levenberg-Marquardt [`refine6`]. This keeps the real-time execution
+//! path bounded and reproducible while still resolving the singular poses.
 
 use nalgebra::{SMatrix, SVector};
 
@@ -58,6 +61,60 @@ mod test_data;
 pub const DOF: usize = 6;
 
 const TWO_PI: f64 = 2.0 * PI;
+
+/// 2-norm condition number of the equilibrated leading matrix `A_eq` above
+/// which the analytic Raghavan-Roth route is considered ill-conditioned. This
+/// matches the Python reference's `cond_threshold` (`ikgeo._raghavan_roth`),
+/// which there triggers the non-deterministic Möbius/random-eigenvalue
+/// fallback. Here it instead triggers the deterministic spatial bypass.
+const ILL_CONDITIONED_COND: f64 = 1e10;
+
+/// 10 µm — magnitude of the deterministic Cartesian micro-perturbations used to
+/// bump an ill-conditioned target off a mathematical singularity.
+const PERTURBATION_DELTA: f64 = 1e-5;
+
+/// Deterministic spatial micro-perturbations: +10 µm translations along the
+/// tool-frame X, Y and Z axes (row-major homogeneous translation matrices).
+///
+/// When the analytic route reports `cond(A_eq) > ILL_CONDITIONED_COND`, the
+/// target pose sits on (or extremely close to) a singularity of the polynomial
+/// system. Physically nudging the target by 10 µm collapses the condition
+/// number so the purely algebraic extraction succeeds; the resulting roots are
+/// then snapped back onto the *original* target with [`refine6`]. The whole
+/// loop is stack-allocated (fixed-size arrays + nalgebra `SMatrix`).
+const PERTURBATIONS: [[[f64; 4]; 4]; 3] = [
+    // +10 µm along X.
+    [
+        [1.0, 0.0, 0.0, PERTURBATION_DELTA],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    // +10 µm along Y.
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, PERTURBATION_DELTA],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    // +10 µm along Z.
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, PERTURBATION_DELTA],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+];
+
+/// Bounded LM iterations used to close the 10 µm gap after the spatial bypass.
+/// The gap is tiny, so a single deterministic pass typically converges; the cap
+/// keeps execution time bounded for the real-time loop.
+const BYPASS_REFINE_MAX_ITERS: usize = 64;
+
+/// Bounded LM iterations used to sharpen an already-accepted root onto exact FK
+/// closure. Seeded from a near-true configuration, so it converges in a couple
+/// of deterministic iterations.
+const POLISH_MAX_ITERS: usize = 16;
 
 // Back-substitution metadata baked from `piper_ik._RR_META`.
 const LINEARITY_JOINT: usize = 1;
@@ -131,8 +188,10 @@ pub fn solve(
     let mut solution_count = 0usize;
 
     // Raw algebraic candidates (stack array, at most 16 for a generic 6R arm).
+    // Ill-conditioned targets are routed through the deterministic spatial
+    // bypass inside `solve_candidates`.
     let mut cands = [[0.0f64; 6]; 16];
-    let cand_count = solve_algebraic(t, &mut cands);
+    let cand_count = solve_candidates(t, policy, &mut cands);
 
     for cand in cands.iter().take(cand_count) {
         let q = *cand;
@@ -144,7 +203,14 @@ pub fn solve(
         let residual = fk_residual(&q, t);
         let accepted_q: [f64; 6];
         if residual <= fk_atol {
-            accepted_q = q;
+            // The candidate already closes the pose, but the bounded Francis-QR
+            // eigenvalues are slightly less precise than the reference LAPACK
+            // route, leaving the joint values up to ~1e-5 off the true root.
+            // Tighten onto exact FK closure with a bounded, deterministic LM
+            // pass so the configuration matches the reference to full precision.
+            // This never changes which roots are accepted (the gate above is
+            // unchanged) — it only sharpens an already-accepted solution.
+            accepted_q = refine6(&q, t, POLISH_MAX_ITERS, fk_atol).unwrap_or(q);
         } else if allow_refinement {
             match refine6(&q, t, refinement_max_iters, fk_atol) {
                 Some(refined) => accepted_q = refined,
@@ -274,9 +340,73 @@ fn wrap_to_pi(a: f64) -> f64 {
 // Algebraic candidate generation (port of `_solve_algebraic`)
 // ---------------------------------------------------------------------------
 
+/// Candidate generation with the deterministic spatial bypass.
+///
+/// Runs the analytic Raghavan-Roth route on `t`. If the equilibrated leading
+/// matrix is well-conditioned (`cond <= ILL_CONDITIONED_COND`), its candidates
+/// are returned directly. Otherwise the target sits on a polynomial-system
+/// singularity and the analytic route is unreliable, so we fall back to
+/// [`spatial_bypass`], which perturbs the target, re-solves, and snaps the roots
+/// back onto the original pose.
+fn solve_candidates(
+    t: &SMatrix<f64, 4, 4>,
+    policy: TolerancePolicy,
+    out: &mut [[f64; 6]; 16],
+) -> usize {
+    let mut cond = 0.0f64;
+    let n = solve_algebraic(t, out, &mut cond);
+    if cond <= ILL_CONDITIONED_COND {
+        return n;
+    }
+    spatial_bypass(t, policy, out)
+}
+
+/// Deterministic Spatial Bypass for ill-conditioned targets.
+///
+/// Iterates over [`PERTURBATIONS`] (at most 3 stack-allocated 10 µm Cartesian
+/// bumps). For each, the target is nudged off the singularity, the purely
+/// algebraic extraction is re-run on the perturbed pose, and — on the first
+/// well-conditioned bump that yields roots — every root is refined back onto the
+/// **original, unperturbed** target with [`refine6`]. The 10 µm gap closes in a
+/// bounded LM pass. Returns the number of refined candidates written to `out`
+/// (0 if no perturbation de-conditions the system).
+fn spatial_bypass(
+    t: &SMatrix<f64, 4, 4>,
+    policy: TolerancePolicy,
+    out: &mut [[f64; 6]; 16],
+) -> usize {
+    let mut tmp = [[0.0f64; 6]; 16];
+    for pert in PERTURBATIONS.iter() {
+        let t_pert = t * mat4(pert);
+        let mut cond = 0.0f64;
+        let n = solve_algebraic(&t_pert, &mut tmp, &mut cond);
+        if n == 0 || cond > ILL_CONDITIONED_COND {
+            // Still singular along this axis; try the next bump.
+            continue;
+        }
+        let mut count = 0usize;
+        for cand in tmp.iter().take(n) {
+            if count >= 16 {
+                break;
+            }
+            // Snap the 10 µm-offset root back onto the true target pose.
+            if let Some(refined) = refine6(cand, t, BYPASS_REFINE_MAX_ITERS, policy.fk_atol) {
+                out[count] = refined;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            return count;
+        }
+    }
+    0
+}
+
 /// Generic 6R Raghavan-Roth candidate generation. Fills `out` with the
-/// DH→POE-mapped joint vectors and returns the number of candidates.
-fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 16]) -> usize {
+/// DH→POE-mapped joint vectors and returns the number of candidates. `cond_out`
+/// receives the 2-norm condition number of the equilibrated leading matrix so
+/// callers can route ill-conditioned poses through [`spatial_bypass`].
+fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 16], cond_out: &mut f64) -> usize {
     let t_pre_inv = mat4(&consts::T_PRE_INV);
     let t_post_inv = mat4(&consts::T_POST_INV);
     let t_dh = t_pre_inv * t * t_post_inv;
@@ -321,7 +451,7 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 16]) -> usize {
     // Real tan(q_2/2) roots + kernels via the 24x24 companion eigenvalue route.
     let mut roots = [0.0f64; 24];
     let mut vecs = [[0.0f64; 12]; 24];
-    let n_roots = rr_real_roots(&m_quad, &m_lin, &m_const, &mut roots, &mut vecs);
+    let n_roots = rr_real_roots(&m_quad, &m_lin, &m_const, &mut roots, &mut vecs, cond_out);
 
     let q_pinv = rr_pseudo_inverse(&q_mat);
 

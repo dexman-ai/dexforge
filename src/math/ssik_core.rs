@@ -1038,6 +1038,31 @@ fn rr_equilibrate(
     (a_r, b_r, c_r, d_r)
 }
 
+/// 2-norm condition number of a 12×12 matrix (`sigma_max / sigma_min`).
+///
+/// Mirrors `numpy.linalg.cond(a, 2)` used by the Python Raghavan-Roth pipeline
+/// to flag the ill-conditioned `A_eq` poses. Returns [`f64::INFINITY`] when the
+/// smallest singular value underflows to zero so callers treat the matrix as
+/// singular/ill-conditioned.
+fn rr_condition_number(m: &SMatrix<f64, 12, 12>) -> f64 {
+    let sv = m.singular_values();
+    let mut smax = 0.0_f64;
+    let mut smin = f64::INFINITY;
+    for k in 0..12 {
+        let s = sv[k];
+        if s > smax {
+            smax = s;
+        }
+        if s < smin {
+            smin = s;
+        }
+    }
+    if smin <= 0.0 || !smin.is_finite() {
+        return f64::INFINITY;
+    }
+    smax / smin
+}
+
 /// Right singular vector of `m` (12x12) for its smallest singular value, i.e.
 /// an approximate null vector. Returns the canonical basis vector `e_11` if the
 /// SVD does not converge so callers degrade gracefully.
@@ -1069,14 +1094,22 @@ fn rr_null_vector(m: &SMatrix<f64, 12, 12>) -> [f64; 12] {
 ///
 /// Fills `roots`/`vecs` and returns the number of accepted roots (`<= 16`). If
 /// the equilibrated leading matrix is singular, returns `0`.
+///
+/// `cond_out` receives the 2-norm condition number of the equilibrated leading
+/// matrix `A_eq` (== Python's `np.linalg.cond(a_eq)`). Callers compare it to the
+/// `1e10` threshold to detect the ill-conditioned poses that the Python
+/// reference handles with its Möbius/random-eigenvalue fallback.
 pub fn rr_real_roots(
     m_quad: &SMatrix<f64, 12, 12>,
     m_lin: &SMatrix<f64, 12, 12>,
     m_const: &SMatrix<f64, 12, 12>,
     roots: &mut [f64; 24],
     vecs: &mut [[f64; 12]; 24],
+    cond_out: &mut f64,
 ) -> usize {
     let (a_eq, b_eq, c_eq, d_r) = rr_equilibrate(m_quad, m_lin, m_const);
+
+    *cond_out = rr_condition_number(&a_eq);
 
     // Solve A [X_b | X_c] = [B | C] with a single LU factorisation.
     let mut bc = SMatrix::<f64, 12, 24>::zeros();
