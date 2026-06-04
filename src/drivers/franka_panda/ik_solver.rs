@@ -148,14 +148,18 @@ const FK_ATOL: f64 = 1e-5; // FK closure tolerance (== subproblem_numerical)
 
 /// Joint angle limits `(lo, hi)` in radians — baked from `_JOINT_LIMITS` in
 /// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
+///
+/// Index-to-joint mapping: 0→q1, 1→q2, 2→q3, 3→q4, 4→q5, 5→q6, 6→q7.
+/// Note that joint 4 (q4) is asymmetric and strictly negative: (-3.0718, -0.0698).
+/// Joint 6 (q6) is also asymmetric: (-0.0175, 3.7525).
 const JOINT_LIMITS: [(f64, f64); 7] = [
-    (-2.8973, 2.8973),
-    (-1.7628, 1.7628),
-    (-2.8973, 2.8973),
-    (-3.0718, -0.0698),
-    (-2.8973, 2.8973),
-    (-0.0175, 3.7525),
-    (-2.8973, 2.8973),
+    (-2.8973, 2.8973),  // q1
+    (-1.7628, 1.7628),  // q2
+    (-2.8973, 2.8973),  // q3
+    (-3.0718, -0.0698), // q4 — strictly negative
+    (-2.8973, 2.8973),  // q5
+    (-0.0175, 3.7525),  // q6 — mostly positive
+    (-2.8973, 2.8973),  // q7
 ];
 
 /// Maximum inner-solver candidates per lock sample. The `spherical` solver can
@@ -765,14 +769,17 @@ pub fn solve(
     // Sort by seed distance (mirrors Python's _ps_nearest_to_seed).
     if let Some(seed) = q_seed {
         // Insertion sort on the first `sol_count` slots.
+        // All entries in 0..sol_count are Some by construction.
         for i in 1..sol_count {
             let mut j = i;
             while j > 0 {
-                let prev = solutions[j - 1].unwrap();
-                let curr = solutions[j].unwrap();
-                if seed_dist7(&prev, seed) > seed_dist7(&curr, seed) {
-                    solutions.swap(j - 1, j);
-                    j -= 1;
+                if let (Some(prev), Some(curr)) = (solutions[j - 1], solutions[j]) {
+                    if seed_dist7(&prev, seed) > seed_dist7(&curr, seed) {
+                        solutions.swap(j - 1, j);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -783,9 +790,7 @@ pub fn solve(
     // Truncate to max_solutions (mirrors Python's `solutions[:max_solutions]`).
     if let Some(max) = max_solutions {
         let cap = max.min(sol_count);
-        for i in cap..sol_count {
-            solutions[i] = None;
-        }
+        solutions[cap..sol_count].fill(None);
     }
 
     solutions
