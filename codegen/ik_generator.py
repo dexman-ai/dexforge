@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""ssik_translator.py — Translate ssik Python IK artifacts to ``#![no_std]`` Rust.
+"""ik_generator.py — Generate ``#![no_std]`` Rust IK drivers from ssik Python artifacts.
 
 This script generates (or loads) a per-arm ssik Inverse Kinematics Python
-artifact and translates it into deterministic, zero-allocation Rust code
-suitable for a real-time ``#![no_std]`` control loop, using an LLM API.
+artifact, translates it into deterministic, zero-allocation Rust code via an
+LLM API, runs the companion Python helper scripts to produce auxiliary Rust
+files (``consts.rs``, ``pq.rs``, ``test_data.rs``), then builds and tests the
+Rust crate.  Any build or test failure is fed back to the LLM so it can correct
+the generated code automatically.
 
 Usage examples::
 
     # From a ssik prebuilt artifact name (looks up ssik.prebuilt):
-    python ssik_translator.py --artifact ur5_ik --output-dir out/
+    python codegen/ik_generator.py --artifact ur5_ik --output-dir out/
 
     # From a local artifact .py file:
-    python ssik_translator.py --artifact /path/to/my_arm_ik.py --output-dir out/
+    python codegen/ik_generator.py --artifact /path/to/my_arm_ik.py --output-dir out/
 
     # Generate a fresh artifact from a URDF, then translate:
-    python ssik_translator.py --urdf robot.urdf --base base_link --ee ee_link \\
+    python codegen/ik_generator.py --urdf robot.urdf --base base_link --ee ee_link \\
         --output-dir out/
 
-    # Dump the full context to disk without invoking an LLM
-    # (use with an interactive model or for debugging):
-    python ssik_translator.py --artifact ur5_ik --dump-context --output-dir out/
+    # Dump the full context to disk without invoking an LLM:
+    python codegen/ik_generator.py --artifact ur5_ik --dump-context --output-dir out/
 
 Environment variables for offline / air-gapped LLM support::
 
@@ -34,8 +36,8 @@ import argparse
 import importlib
 import os
 import re
+import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -43,7 +45,12 @@ from typing import Optional, Tuple
 # Repository root — all relative paths are anchored here.
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = Path(__file__).resolve().parent
+_CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
+_REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
+
+# Default for the --max-retries CLI flag (number of *retry* attempts after the
+# initial attempt, so total LLM calls = max_retries + 1).
+_MAX_RETRIES = 3
 
 # ---------------------------------------------------------------------------
 # Step 0: Obtain source Python artifact
@@ -279,6 +286,23 @@ def _load_example_rust_source(example_arm: str) -> str:
     )
 
 
+def _load_example_scripts(example_arm: str) -> str:
+    """Load the Python helper scripts for *example_arm* from scripts/, if present."""
+    scripts_dir = _REPO_ROOT / "scripts"
+    arm_scripts: list[str] = []
+    for pattern in (
+        f"generate_{example_arm}_consts.py",
+        f"generate_{example_arm}_pq.py",
+        f"generate_{example_arm}_test_data.py",
+    ):
+        path = scripts_dir / pattern
+        if path.exists():
+            arm_scripts.append(f"--- {pattern} ---\n" + path.read_text(encoding="utf-8"))
+    if not arm_scripts:
+        return f"# No Python helper scripts found for '{example_arm}' in scripts/ — skipped.\n"
+    return "\n\n".join(arm_scripts)
+
+
 def assemble_context(
     target_py_code: str,
     target_arm_stem: str,
@@ -289,7 +313,7 @@ def assemble_context(
 
     Loads all required files at runtime: the prompt template, the target
     Python artifact, the Rust API headers for ``ssik_core`` and ``kinematics``,
-    and the one-shot example (Python + Rust pair).
+    and the one-shot example (Python + Rust pair plus Python helper scripts).
 
     :param target_py_code: Source text of the target ``*_ik.py`` artifact.
     :param target_arm_stem: Base name of the target arm (e.g. ``"ur5"``).
@@ -300,11 +324,11 @@ def assemble_context(
     :raises FileNotFoundError: If the prompt template is missing.
     """
     # --- Prompt template ---
-    prompt_path = _REPO_ROOT / "prompts" / "translate_ssik_artifact.md"
+    prompt_path = _CODEGEN_DIR / "translate_ssik_artifact.md"
     if not prompt_path.exists():
         raise FileNotFoundError(
             f"Prompt template not found at '{prompt_path}'. "
-            "Ensure the repository is checked out with the prompts/ directory."
+            "Ensure the repository is checked out with the codegen/ directory."
         )
     prompt_template = prompt_path.read_text(encoding="utf-8")
 
@@ -316,14 +340,15 @@ def assemble_context(
         _REPO_ROOT / "src" / "math" / "kinematics.rs"
     )
 
-    # --- One-shot example (Python source + Rust translation) ---
+    # --- One-shot example (Python source + Rust translation + helper scripts) ---
     example_py = _load_example_py_source(example_arm)
     example_rs = _load_example_rust_source(example_arm)
+    example_scripts = _load_example_scripts(example_arm)
 
     # --- Assemble ---
     sections = [
         "=" * 72,
-        "DEXFORGE SSIK TRANSLATOR — FULL CONTEXT",
+        "DEXFORGE IK GENERATOR — FULL CONTEXT",
         "=" * 72,
         "",
         prompt_template,
@@ -348,12 +373,16 @@ def assemble_context(
         "",
         example_rs,
         "",
-        f"--- [SECTION 5] TARGET: Python artifact to translate ('{target_arm_stem}') ---",
+        f"--- [SECTION 5] ONE-SHOT EXAMPLE: Python helper scripts for '{example_arm}' ---",
+        "",
+        example_scripts,
+        "",
+        f"--- [SECTION 6] TARGET: Python artifact to translate ('{target_arm_stem}') ---",
         "",
         target_py_code,
         "",
         "=" * 72,
-        "END OF CONTEXT — PRODUCE ONLY RAW RUST CODE BELOW",
+        "END OF CONTEXT — PRODUCE ALL FILES USING THE === FILE: <name> === FORMAT",
         "=" * 72,
     ]
     return "\n".join(sections)
@@ -364,8 +393,8 @@ def assemble_context(
 # ---------------------------------------------------------------------------
 
 
-class IKTranslatorLLM:
-    """Thin wrapper around the OpenAI-compatible chat API for IK translation.
+class IKGeneratorLLM:
+    """Thin wrapper around the OpenAI-compatible chat API for IK generation.
 
     Supports local, air-gapped models (vLLM, Ollama, LM Studio, …) via
     environment variables::
@@ -382,6 +411,15 @@ class IKTranslatorLLM:
     DEFAULT_MODEL = "gpt-4o"
     DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
+    SYSTEM_PROMPT = (
+        "You are an expert Rust systems programmer and robotics engineer. "
+        "Translate the provided ssik Python IK artifact to #![no_std] Rust "
+        "exactly as instructed. "
+        "Also generate the required Python helper scripts. "
+        "Output ALL files using the exact '=== FILE: <filename> ===' separator "
+        "format described in the prompt. Do not include any conversational text."
+    )
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -392,7 +430,7 @@ class IKTranslatorLLM:
             from openai import OpenAI
         except ImportError as exc:
             raise ImportError(
-                "The 'openai' package is required for LLM translation. "
+                "The 'openai' package is required for LLM generation. "
                 "Install it with: pip install openai"
             ) from exc
 
@@ -404,31 +442,20 @@ class IKTranslatorLLM:
 
         self._client = OpenAI(api_key=self._api_key, base_url=self._base_url)
 
-    def translate(self, context: str) -> str:
-        """Send *context* to the LLM and return the raw response text.
+    def generate(self, messages: list[dict]) -> str:
+        """Send a conversation *messages* list to the LLM and return the raw response.
 
         Temperature is fixed at ``0.0`` (greedy decoding) to ensure
         deterministic output across identical inputs.
 
-        :param context: The assembled prompt + context string.
-        :returns: The LLM's response as a raw string (may contain markdown
-            fences; call :func:`sanitize_rust_output` on the result).
+        :param messages: OpenAI-style chat messages list (system + user turns).
+        :returns: The LLM's response as a raw string.
         :raises RuntimeError: If the API call fails or returns an empty choice.
         """
         response = self._client.chat.completions.create(
             model=self._model,
             temperature=0.0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert Rust systems programmer and robotics engineer. "
-                        "Translate the provided ssik Python IK artifact to #![no_std] Rust "
-                        "exactly as instructed. Output only raw, compilable Rust code."
-                    ),
-                },
-                {"role": "user", "content": context},
-            ],
+            messages=messages,
         )
         choices = response.choices
         if not choices:
@@ -440,65 +467,241 @@ class IKTranslatorLLM:
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Output Sanitization
+# Step 5: Parse Multi-File LLM Output
 # ---------------------------------------------------------------------------
 
 
-def sanitize_rust_output(llm_response: str) -> str:
-    """Strip Markdown code fences and surrounding prose, returning only code.
+def _sanitize_file_content(content: str) -> str:
+    """Strip Markdown code fences from a single file's content block.
 
-    If the response contains one or more ``rust`` (or generic) code fences,
-    extracts and concatenates only their contents.  If no fences are present,
-    returns the full response stripped of leading/trailing whitespace.
-
-    :param llm_response: Raw string returned by the LLM.
-    :returns: Clean Rust source code with no Markdown artefacts.
+    :param content: Raw content string that may be wrapped in ``` fences.
+    :returns: Clean code with no Markdown artefacts.
     """
-    # Collect all ```rust ... ``` or ``` ... ``` code block bodies
-    blocks = re.findall(r"```(?:rust)?[ \t]*\n?(.*?)```", llm_response, flags=re.DOTALL)
+    # Extract content from ``` or ```rust / ```python fences if present
+    blocks = re.findall(r"```(?:\w+)?[ \t]*\n?(.*?)```", content, flags=re.DOTALL)
     if blocks:
         return "\n".join(block.strip() for block in blocks).strip()
-    # No fences: strip stray backtick-fence lines and return the remainder
-    cleaned = re.sub(r"^```[^\n]*\n?", "", llm_response, flags=re.MULTILINE)
+    # No fences: strip any stray fence opener lines
+    cleaned = re.sub(r"^```[^\n]*\n?", "", content, flags=re.MULTILINE)
     return cleaned.strip()
 
 
+def parse_llm_output(llm_response: str) -> dict[str, str]:
+    """Parse a multi-file LLM response into a ``{filename: content}`` mapping.
+
+    The LLM is instructed to use ``=== FILE: <name> ===`` separator lines.
+    This function splits on those markers and returns all contained files.
+
+    Any Markdown code fences inside individual file blocks are stripped.
+
+    :param llm_response: Raw LLM response text.
+    :returns: Ordered mapping of filename → file content strings.
+    :raises ValueError: If no ``=== FILE: ... ===`` markers are found.
+    """
+    pattern = re.compile(r"^=== FILE:\s*(.+?)\s*===$", re.MULTILINE)
+    parts = pattern.split(llm_response)
+    # parts[0] is any preamble text before the first marker (discard).
+    # Remaining parts alternate: [filename, content, filename, content, ...]
+    if len(parts) < 3:
+        raise ValueError(
+            "LLM output does not contain any '=== FILE: <name> ===' markers. "
+            "The model may not have followed the output format instructions.\n"
+            f"Response preview (first 500 chars):\n{llm_response[:500]}"
+        )
+
+    files: dict[str, str] = {}
+    for i in range(1, len(parts), 2):
+        filename = parts[i].strip()
+        raw_content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        files[filename] = _sanitize_file_content(raw_content)
+
+    return files
+
+
 # ---------------------------------------------------------------------------
-# Output helpers
+# Step 6: Write Output Files
 # ---------------------------------------------------------------------------
 
 
-def _write_outputs(
+def _update_drivers_mod(arm_name: str) -> None:
+    """Add the new arm module declaration to ``src/drivers/mod.rs`` if absent.
+
+    :param arm_name: Clean arm name (e.g. ``"ur5"``, ``"my_arm"``).
+    """
+    mod_path = _REPO_ROOT / "src" / "drivers" / "mod.rs"
+    if not mod_path.exists():
+        return
+    content = mod_path.read_text(encoding="utf-8")
+    declaration = f"pub mod {arm_name};"
+    if declaration not in content:
+        content = content.rstrip() + "\n" + declaration + "\n"
+        mod_path.write_text(content, encoding="utf-8")
+        print(f"[ik_generator]   Added '{declaration}' to {mod_path.relative_to(_REPO_ROOT)}")
+
+
+def _ensure_arm_mod_rs(arm_name: str, rust_files: list[str]) -> None:
+    """Create ``src/drivers/{arm_name}/mod.rs`` if missing.
+
+    Declares ``ik_solver`` as public and any other ``.rs`` files (except
+    ``mod.rs`` and ``test_data.rs``) as private modules.
+
+    :param arm_name: Clean arm name.
+    :param rust_files: List of Rust filenames written to the driver directory.
+    """
+    mod_path = _REPO_ROOT / "src" / "drivers" / arm_name / "mod.rs"
+    if mod_path.exists():
+        return  # Don't overwrite an existing mod.rs
+
+    lines: list[str] = [f"//! {arm_name} IK driver.\n"]
+    lines.append("")
+    lines.append("pub mod ik_solver;")
+    for fname in sorted(rust_files):
+        stem = Path(fname).stem
+        if stem in ("ik_solver", "mod", "test_data"):
+            continue
+        lines.append(f"mod {stem};")
+    mod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(
+        f"[ik_generator]   Created {mod_path.relative_to(_REPO_ROOT)}"
+    )
+
+
+def write_generated_files(
     output_dir: Path,
-    arm_stem: str,
+    arm_name: str,
+    files: dict[str, str],
     target_py_code: str,
-    rust_code: Optional[str],
     context: str,
 ) -> dict[str, Path]:
-    """Write the three output artefacts to *output_dir*.
+    """Write all LLM-generated files to the appropriate locations.
 
-    :param output_dir: Destination directory (created if absent).
-    :param arm_stem: Base name of the arm (e.g. ``"ur5"``).
-    :param target_py_code: Source Python artifact text.
-    :param rust_code: Translated Rust code, or ``None`` when only dumping context.
-    :param context: The assembled prompt + context string.
-    :returns: Mapping of ``{"py": path, "rs": path, "ctx": path}``.
+    * ``*.rs`` files → ``src/drivers/{arm_name}/``
+    * ``generate_*.py`` files → ``scripts/``
+    * The original Python artifact and context dump → *output_dir*
+
+    :param output_dir: Working output directory for the artifact and context.
+    :param arm_name: Clean arm name (e.g. ``"my_arm"``).
+    :param files: Parsed ``{filename: content}`` from :func:`parse_llm_output`.
+    :param target_py_code: Source of the target Python artifact.
+    :param context: Assembled prompt context string.
+    :returns: Mapping of logical name → written :class:`Path`.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Derive a clean module name (strip trailing _ik suffix for naming, then re-add)
-    name = arm_stem[:-3] if arm_stem.endswith("_ik") else arm_stem
+    driver_dir = _REPO_ROOT / "src" / "drivers" / arm_name
+    driver_dir.mkdir(parents=True, exist_ok=True)
 
-    py_path = output_dir / f"{name}_ik.py"
-    rs_path = output_dir / f"{name}_ik_solver.rs"
-    ctx_path = output_dir / f"{name}_context.txt"
+    written: dict[str, Path] = {}
 
+    # Write artifact and context to output_dir
+    py_path = output_dir / f"{arm_name}_ik.py"
+    ctx_path = output_dir / f"{arm_name}_context.txt"
     py_path.write_text(target_py_code, encoding="utf-8")
     ctx_path.write_text(context, encoding="utf-8")
-    if rust_code is not None:
-        rs_path.write_text(rust_code, encoding="utf-8")
+    written["py"] = py_path
+    written["ctx"] = ctx_path
 
-    return {"py": py_path, "rs": rs_path if rust_code is not None else None, "ctx": ctx_path}
+    rust_files_written: list[str] = []
+    for filename, content in files.items():
+        if filename.endswith(".rs"):
+            dest = driver_dir / filename
+            dest.write_text(content, encoding="utf-8")
+            written[filename] = dest
+            rust_files_written.append(filename)
+            print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
+        elif filename.endswith(".py"):
+            dest = _REPO_ROOT / "scripts" / filename
+            dest.write_text(content, encoding="utf-8")
+            written[filename] = dest
+            print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
+        else:
+            # Fallback: write to output_dir
+            dest = output_dir / filename
+            dest.write_text(content, encoding="utf-8")
+            written[filename] = dest
+            print(f"[ik_generator]   Wrote {dest}")
+
+    # Ensure mod.rs exists for the new driver
+    _ensure_arm_mod_rs(arm_name, rust_files_written)
+
+    # Register the arm module in the top-level drivers mod.rs
+    _update_drivers_mod(arm_name)
+
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Run Python Helper Scripts
+# ---------------------------------------------------------------------------
+
+
+def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
+    """Run all ``generate_*.py`` files that were written to ``scripts/``.
+
+    Each script is executed with the current Python interpreter from the
+    repository root so that relative paths inside the scripts resolve correctly.
+
+    :param written_files: The ``{filename: path}`` dict returned by
+        :func:`write_generated_files`.
+    :returns: List of ``(script_name, error_output)`` pairs for failed scripts.
+        An empty list means all scripts succeeded.
+    """
+    failures: list[tuple[str, str]] = []
+
+    for filename, path in sorted(written_files.items()):
+        if not filename.startswith("generate_") or not filename.endswith(".py"):
+            continue
+
+        print(f"[ik_generator]   Running {path.relative_to(_REPO_ROOT)} …")
+        result = subprocess.run(
+            [sys.executable, str(path)],
+            capture_output=True,
+            text=True,
+            cwd=str(_REPO_ROOT),
+        )
+        if result.returncode != 0:
+            error = (result.stderr + result.stdout).strip()
+            print(f"[ik_generator]   ✗ {filename} failed:\n{error}")
+            failures.append((filename, error))
+        else:
+            print(f"[ik_generator]   ✓ {filename} succeeded.")
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Build and Test the Rust Crate
+# ---------------------------------------------------------------------------
+
+
+def build_rust_crate() -> Tuple[bool, str]:
+    """Run ``cargo build`` from the repository root.
+
+    :returns: ``(success, output)`` where *output* is combined stdout+stderr.
+    """
+    result = subprocess.run(
+        ["cargo", "build"],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+    )
+    output = (result.stderr + result.stdout).strip()
+    return result.returncode == 0, output
+
+
+def test_rust_crate() -> Tuple[bool, str]:
+    """Run ``cargo test`` from the repository root.
+
+    :returns: ``(success, output)`` where *output* is combined stdout+stderr.
+    """
+    result = subprocess.run(
+        ["cargo", "test"],
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+    )
+    output = (result.stderr + result.stdout).strip()
+    return result.returncode == 0, output
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +711,11 @@ def _write_outputs(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ssik_translator",
+        prog="ik_generator",
         description=(
-            "Translate a ssik Python IK artifact to #![no_std] Rust using an LLM. "
-            "Provide either --artifact (prebuilt name or file path) or --urdf (with "
-            "--base and --ee)."
+            "Generate a #![no_std] Rust IK driver from a ssik Python artifact using "
+            "an LLM.  Provide either --artifact (prebuilt name or file path) or "
+            "--urdf (with --base and --ee)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -550,7 +753,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         type=Path,
         default=Path("out"),
-        help="Output directory for the three generated files (default: out/).",
+        help="Output directory for the Python artifact and context dump (default: out/).",
     )
     parser.add_argument(
         "--dump-context",
@@ -558,6 +761,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Assemble and write the full prompt + context to disk without invoking "
             "the LLM.  Use this to feed the context to an interactive model manually."
+        ),
+    )
+    parser.add_argument(
+        "--max-retries",
+        metavar="N",
+        type=int,
+        default=_MAX_RETRIES,
+        help=(
+            f"Maximum number of LLM retry attempts when scripts, build, or tests "
+            f"fail (default: {_MAX_RETRIES})."
         ),
     )
     parser.add_argument(
@@ -579,7 +792,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Entry point for the ssik translator CLI.
+    """Entry point for the IK generator CLI.
 
     :param argv: Command-line arguments (defaults to ``sys.argv[1:]``).
     :returns: Exit code (0 = success, non-zero = error).
@@ -595,97 +808,207 @@ def main(argv: Optional[list[str]] = None) -> int:
             parser.error(f"URDF file not found: {args.urdf}")
 
     # --- Step 0: Obtain source Python artifact ---
-    print("[ssik_translator] Step 0: Loading Python artifact …")
+    print("[ik_generator] Step 0: Loading Python artifact …")
     try:
         if args.urdf is not None:
             target_py_code, artifact_stem = generate_artifact_from_urdf(
                 args.urdf, args.base, args.ee, args.output_dir
             )
-            print(f"[ssik_translator]   Generated artifact from URDF: {artifact_stem}")
+            print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
         else:
             target_py_code, artifact_stem = load_prebuilt_artifact(args.artifact)
-            print(f"[ssik_translator]   Loaded artifact: {artifact_stem}")
+            print(f"[ik_generator]   Loaded artifact: {artifact_stem}")
     except (ImportError, FileNotFoundError, RuntimeError) as exc:
-        print(f"[ssik_translator] ERROR: {exc}", file=sys.stderr)
+        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
         return 1
 
+    arm_name = artifact_stem.removesuffix("_ik")
+
     # --- Step 1: Detect kinematic family ---
-    print("[ssik_translator] Step 1: Detecting kinematic family …")
+    print("[ik_generator] Step 1: Detecting kinematic family …")
     try:
         example_arm, max_solutions = find_best_example(target_py_code)
     except ValueError as exc:
-        print(f"[ssik_translator] ERROR: {exc}", file=sys.stderr)
+        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
         return 1
     print(
-        f"[ssik_translator]   → example arm: '{example_arm}', "
+        f"[ik_generator]   → example arm: '{example_arm}', "
         f"MAX_SOLUTIONS = {max_solutions}"
     )
 
     # Fall back gracefully when the chosen example arm has no Rust driver yet
     rs_example = _REPO_ROOT / "src" / "drivers" / example_arm / "ik_solver.rs"
     if not rs_example.exists():
-        # Try falling back to franka_panda as a structural template for 7-DOF
         fallback = "franka_panda"
         fallback_path = _REPO_ROOT / "src" / "drivers" / fallback / "ik_solver.rs"
         if fallback_path.exists():
             print(
-                f"[ssik_translator]   WARNING: No Rust driver for '{example_arm}'; "
+                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
                 f"falling back to '{fallback}' as structural template."
             )
             example_arm = fallback
         else:
             print(
-                f"[ssik_translator]   WARNING: No Rust driver found for '{example_arm}' "
+                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
                 "or fallback 'franka_panda'. The one-shot example will be empty.",
                 file=sys.stderr,
             )
 
-    # --- Step 3: Assemble context ---
-    print("[ssik_translator] Step 3: Assembling context …")
-    arm_name = artifact_stem.removesuffix("_ik")
-    context = assemble_context(target_py_code, arm_name, example_arm, max_solutions)
-    print(f"[ssik_translator]   Context assembled ({len(context):,} chars).")
+    # --- Step 2 (internal) + Step 3: Assemble context ---
+    print("[ik_generator] Step 3: Assembling context …")
+    try:
+        context = assemble_context(target_py_code, arm_name, example_arm, max_solutions)
+    except FileNotFoundError as exc:
+        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"[ik_generator]   Context assembled ({len(context):,} chars).")
 
-    # --- Dump context and/or invoke LLM ---
-    rust_code: Optional[str] = None
-
+    # --- Dump context and exit if requested ---
     if args.dump_context:
-        print("[ssik_translator] --dump-context: skipping LLM invocation.")
-    else:
-        print("[ssik_translator] Step 4: Invoking LLM …")
+        print("[ik_generator] --dump-context: skipping LLM invocation.")
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        ctx_path = args.output_dir / f"{arm_name}_context.txt"
+        ctx_path.write_text(context, encoding="utf-8")
+        py_path = args.output_dir / f"{arm_name}_ik.py"
+        py_path.write_text(target_py_code, encoding="utf-8")
+        print(f"[ik_generator] ✓ Context dump : {ctx_path}")
+        print(f"[ik_generator] ✓ Python artifact : {py_path}")
+        return 0
+
+    # --- Step 4: Invoke LLM with retry loop ---
+    print("[ik_generator] Step 4: Invoking LLM …")
+    try:
+        llm = IKGeneratorLLM(
+            api_key=args.llm_key,
+            base_url=args.llm_url,
+            model=args.llm_model,
+        )
+    except ImportError as exc:
+        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    messages: list[dict] = [
+        {"role": "system", "content": IKGeneratorLLM.SYSTEM_PROMPT},
+        {"role": "user", "content": context},
+    ]
+
+    # max_attempts includes the initial attempt plus all retries:
+    #   total calls = args.max_retries (retries) + 1 (initial)
+    max_attempts = args.max_retries + 1
+    last_raw_response: Optional[str] = None
+
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            print(f"[ik_generator]   Retry {attempt}/{args.max_retries} …")
+
         try:
-            llm = IKTranslatorLLM(
-                api_key=args.llm_key,
-                base_url=args.llm_url,
-                model=args.llm_model,
-            )
-            raw_response = llm.translate(context)
-        except ImportError as exc:
-            print(f"[ssik_translator] ERROR: {exc}", file=sys.stderr)
-            return 1
+            raw_response = llm.generate(messages)
         except Exception as exc:  # noqa: BLE001 — surface all API errors
-            print(f"[ssik_translator] LLM error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            print(
+                f"[ik_generator] LLM error ({type(exc).__name__}): {exc}",
+                file=sys.stderr,
+            )
             return 1
 
-        # --- Step 5: Sanitize output ---
-        print("[ssik_translator] Step 5: Sanitizing LLM output …")
-        rust_code = sanitize_rust_output(raw_response)
-        print(f"[ssik_translator]   Rust code: {len(rust_code):,} chars.")
+        last_raw_response = raw_response
+        print(f"[ik_generator]   LLM response: {len(raw_response):,} chars.")
 
-    # --- Write output files ---
-    print("[ssik_translator] Writing output files …")
-    paths = _write_outputs(
-        args.output_dir,
-        artifact_stem,
-        target_py_code,
-        rust_code,
-        context,
-    )
+        # --- Step 5: Parse multi-file output ---
+        try:
+            files = parse_llm_output(raw_response)
+        except ValueError as exc:
+            print(f"[ik_generator]   Parse error: {exc}", file=sys.stderr)
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your output did not follow the required '=== FILE: <name> ===' "
+                        "separator format. Please regenerate all files using the exact "
+                        "output format specified in the prompt."
+                    ),
+                })
+                continue
+            return 1
 
-    print(f"[ssik_translator] ✓ Python artifact : {paths['py']}")
-    if paths.get("rs"):
-        print(f"[ssik_translator] ✓ Rust artifact   : {paths['rs']}")
-    print(f"[ssik_translator] ✓ Context dump    : {paths['ctx']}")
+        print(
+            f"[ik_generator]   Parsed {len(files)} file(s): "
+            + ", ".join(files.keys())
+        )
+
+        # --- Step 6: Write generated files ---
+        print("[ik_generator] Step 6: Writing generated files …")
+        written = write_generated_files(
+            args.output_dir, arm_name, files, target_py_code, context
+        )
+
+        # --- Step 7: Run Python helper scripts ---
+        print("[ik_generator] Step 7: Running Python helper scripts …")
+        script_failures = run_py_scripts(written)
+
+        if script_failures:
+            failure_details = "\n\n".join(
+                f"Script '{name}' failed with:\n{err}"
+                for name, err in script_failures
+            )
+            error_msg = (
+                f"The following Python helper script(s) failed to run:\n\n"
+                f"{failure_details}\n\n"
+                "Please fix the errors and regenerate all files."
+            )
+            print(f"[ik_generator]   Script failures detected.")
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({"role": "user", "content": error_msg})
+                continue
+            print(f"[ik_generator] ERROR: Script failures after all retries.", file=sys.stderr)
+            return 1
+
+        # --- Step 8: Build the Rust crate ---
+        print("[ik_generator] Step 8: Building Rust crate …")
+        build_ok, build_output = build_rust_crate()
+        if not build_ok:
+            error_msg = (
+                f"cargo build failed with the following errors:\n\n{build_output}\n\n"
+                "Please fix the Rust code and regenerate all files."
+            )
+            print(f"[ik_generator]   Build failed.")
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({"role": "user", "content": error_msg})
+                continue
+            print(f"[ik_generator] ERROR: Build failed after all retries.", file=sys.stderr)
+            print(build_output, file=sys.stderr)
+            return 1
+        print("[ik_generator]   Build succeeded.")
+
+        # --- Step 9: Run Rust tests ---
+        print("[ik_generator] Step 9: Running Rust tests …")
+        test_ok, test_output = test_rust_crate()
+        if not test_ok:
+            error_msg = (
+                f"cargo test failed with the following output:\n\n{test_output}\n\n"
+                "Please fix the Rust code and regenerate all files."
+            )
+            print(f"[ik_generator]   Tests failed.")
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({"role": "user", "content": error_msg})
+                continue
+            print(f"[ik_generator] ERROR: Tests failed after all retries.", file=sys.stderr)
+            print(test_output, file=sys.stderr)
+            return 1
+        print("[ik_generator]   All tests passed.")
+
+        # --- All steps succeeded ---
+        break
+
+    print(f"\n[ik_generator] ✓ Python artifact : {written.get('py')}")
+    print(f"[ik_generator] ✓ Context dump    : {written.get('ctx')}")
+    for filename, path in sorted(written.items()):
+        if filename not in ("py", "ctx"):
+            print(f"[ik_generator] ✓ {filename:<40} → {path.relative_to(_REPO_ROOT)}")
+
     return 0
 
 
