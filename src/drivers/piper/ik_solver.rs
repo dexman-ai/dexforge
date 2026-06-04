@@ -43,7 +43,8 @@
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
+use crate::math::kinematics::{lm_refine6, mat4_mul, rot_homogeneous};
+use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
 
 use super::consts;
 use super::pq;
@@ -330,11 +331,6 @@ fn seed_dist(q: &[f64; 6], seed: &[f64; 6]) -> f64 {
         s += d * d;
     }
     s
-}
-
-#[inline]
-fn wrap_to_pi(a: f64) -> f64 {
-    libm::remainder(a, TWO_PI)
 }
 
 // ---------------------------------------------------------------------------
@@ -632,15 +628,6 @@ fn mat14x8(a: &[[f64; 8]; 14]) -> SMatrix<f64, 14, 8> {
 // Levenberg-Marquardt refinement (for `allow_refinement = true`)
 // ---------------------------------------------------------------------------
 
-const REFINE_EPS: f64 = 1e-7;
-const LM_CONVERGENCE_THRESHOLD: f64 = 1e-13;
-const LM_INITIAL_LAMBDA: f64 = 1e-6;
-const LM_LAMBDA_GROWTH: f64 = 8.0;
-const LM_LAMBDA_DECAY: f64 = 0.5;
-const LM_LAMBDA_MIN: f64 = 1e-12;
-const LM_LAMBDA_MAX: f64 = 1e8;
-const LM_BACKTRACK_MAX_ATTEMPTS: usize = 12;
-
 /// 12-vector pose residual `[vec(R(q) − R_t); t(q) − t_t]`.
 fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
     let tf = fk(q);
@@ -658,15 +645,6 @@ fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
     r
 }
 
-#[inline]
-fn norm_pose12(r: &[f64; 12]) -> f64 {
-    let mut s = 0.0;
-    for v in r.iter() {
-        s += v * v;
-    }
-    libm::sqrt(s)
-}
-
 /// Levenberg-Marquardt polish of a Piper configuration onto the exact pose
 /// root. Returns `Some(q_refined)` if the FK residual converges within
 /// `fk_atol`, otherwise `None`.
@@ -676,106 +654,12 @@ fn refine6(
     max_iters: usize,
     fk_atol: f64,
 ) -> Option<[f64; 6]> {
-    let mut q = *q_in;
-    let mut lambda = LM_INITIAL_LAMBDA;
-    let mut r = pose_residual12(&q, target);
-    let mut rn = norm_pose12(&r);
-
-    for _ in 0..max_iters {
-        if rn < LM_CONVERGENCE_THRESHOLD {
-            break;
-        }
-        let mut jac = SMatrix::<f64, 12, 6>::zeros();
-        for col in 0..6 {
-            let mut qp = q;
-            qp[col] += REFINE_EPS;
-            let rp = pose_residual12(&qp, target);
-            for row in 0..12 {
-                jac[(row, col)] = (rp[row] - r[row]) / REFINE_EPS;
-            }
-        }
-        let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
-        let jt = jac.transpose();
-        let jtj = jt * jac; // 6×6
-        let jtr = jt * rv; // 6×1
-
-        let mut accepted = false;
-        for _ in 0..LM_BACKTRACK_MAX_ATTEMPTS {
-            let mut damped = jtj;
-            for d in 0..6 {
-                damped[(d, d)] += lambda;
-            }
-            let inv = match damped.try_inverse() {
-                Some(m) => m,
-                None => {
-                    lambda *= LM_LAMBDA_GROWTH;
-                    continue;
-                }
-            };
-            let dq = inv * jtr;
-            let mut q_trial = q;
-            for col in 0..6 {
-                q_trial[col] -= dq[(col, 0)];
-            }
-            let r_trial = pose_residual12(&q_trial, target);
-            let rn_trial = norm_pose12(&r_trial);
-            if rn_trial < rn {
-                q = q_trial;
-                r = r_trial;
-                rn = rn_trial;
-                lambda = (lambda * LM_LAMBDA_DECAY).max(LM_LAMBDA_MIN);
-                accepted = true;
-                break;
-            }
-            lambda *= LM_LAMBDA_GROWTH;
-            if lambda > LM_LAMBDA_MAX {
-                break;
-            }
-        }
-        if !accepted {
-            break;
-        }
-    }
-
-    if rn <= fk_atol {
-        Some(q)
-    } else {
-        None
-    }
+    lm_refine6(q_in, |q| pose_residual12(q, target), max_iters, fk_atol)
 }
 
 // ---------------------------------------------------------------------------
 // Forward kinematics
 // ---------------------------------------------------------------------------
-
-/// Homogeneous Rodrigues rotation about `axis` by `theta`.
-fn rot_homogeneous(axis: &[f64; 3], theta: f64) -> [[f64; 4]; 4] {
-    let c = libm::cos(theta);
-    let s = libm::sin(theta);
-    let (x, y, z) = (axis[0], axis[1], axis[2]);
-    let oc = 1.0 - c;
-    [
-        [c + x * x * oc, x * y * oc - z * s, x * z * oc + y * s, 0.0],
-        [y * x * oc + z * s, c + y * y * oc, y * z * oc - x * s, 0.0],
-        [z * x * oc - y * s, z * y * oc + x * s, c + z * z * oc, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ]
-}
-
-/// 4x4 matrix product.
-fn mat4_mul(a: &[[f64; 4]; 4], b: &[[f64; 4]; 4]) -> [[f64; 4]; 4] {
-    let mut o = [[0.0f64; 4]; 4];
-    for i in 0..4 {
-        for j in 0..4 {
-            let mut s = 0.0;
-            for k in 0..4 {
-                s += a[i][k] * b[k][j];
-            }
-            o[i][j] = s;
-        }
-    }
-    o
-}
 
 /// Product-of-exponentials forward kinematics — mirrors `piper_ik.fk`.
 ///

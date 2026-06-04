@@ -45,6 +45,11 @@
 
 use nalgebra::SMatrix;
 
+use crate::math::kinematics::{
+    compose, frob_diff, norm12, se3_inv, Transform, IDENTITY, LM_CONVERGENCE_THRESHOLD,
+    LM_INITIAL_LAMBDA, LM_LAMBDA_DECAY, LM_LAMBDA_GROWTH, LM_LAMBDA_MAX, LM_LAMBDA_MIN,
+    LM_BACKTRACK_MAX, REFINE_EPS,
+};
 use crate::math::ssik_core::{
     add3, dot3, mat3_mul, mat3_transpose, mat3_vec, mat3t_vec, neg3, norm3, rotate,
     rotation_matrix, sp1_solve, sp3_solve, sp4_solve, sp5_solve, sub3, wrap_to_pi,
@@ -171,52 +176,6 @@ const INNER_MAX: usize = 32;
 /// Upper bound on raw 7R candidates collected across the 16-sample lock sweep
 /// (`16 * INNER_MAX`) before de-duplication.
 const CAND_CAP: usize = 16 * INNER_MAX;
-
-/// A rigid transform stored as a rotation block and translation.
-#[derive(Clone, Copy)]
-struct Transform {
-    r: [[f64; 3]; 3],
-    t: [f64; 3],
-}
-
-const IDENTITY: Transform = Transform {
-    r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-    t: [0.0, 0.0, 0.0],
-};
-
-#[inline]
-fn compose(a: &Transform, b: &Transform) -> Transform {
-    Transform {
-        r: mat3_mul(&a.r, &b.r),
-        t: add3(&mat3_vec(&a.r, &b.t), &a.t),
-    }
-}
-
-/// SE(3) inverse `[R^T | -R^T t]`.
-#[inline]
-fn se3_inv(tf: &Transform) -> Transform {
-    let rt = mat3_transpose(&tf.r);
-    Transform {
-        r: rt,
-        t: neg3(&mat3_vec(&rt, &tf.t)),
-    }
-}
-
-/// Frobenius norm of the 4x4 difference between two transforms (the bottom
-/// row `[0, 0, 0, 1]` is identical, so it contributes nothing).
-#[inline]
-fn frob_diff(a: &Transform, b: &Transform) -> f64 {
-    let mut s = 0.0;
-    for i in 0..3 {
-        for j in 0..3 {
-            let d = a.r[i][j] - b.r[i][j];
-            s += d * d;
-        }
-        let d = a.t[i] - b.t[i];
-        s += d * d;
-    }
-    libm::sqrt(s)
-}
 
 // ---------------------------------------------------------------------------
 // Forward kinematics
@@ -461,7 +420,6 @@ fn q_close7(a: &[f64; 7], b: &[f64; 7], tol: f64) -> bool {
 /// Iteration ceiling for the Levenberg-Marquardt pose-refinement polish.
 #[cfg(test)]
 const REFINE_ITERS: usize = 60;
-const REFINE_EPS: f64 = 1e-7;
 
 /// 12-vector pose residual `[vec(R(q) - R_t); t(q) - t_t]` of the full 7R FK.
 #[inline]
@@ -481,15 +439,6 @@ fn residual12(q: &[f64; 7], target: &Transform) -> [f64; 12] {
     r
 }
 
-#[inline]
-fn norm12(r: &[f64; 12]) -> f64 {
-    let mut s = 0.0;
-    for v in r.iter() {
-        s += v * v;
-    }
-    libm::sqrt(s)
-}
-
 /// Levenberg-Marquardt polish of a 7R configuration onto the exact pose root,
 /// **holding the locked joint 4 fixed**.
 ///
@@ -505,12 +454,12 @@ fn norm12(r: &[f64; 12]) -> f64 {
 fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
     const FREE: [usize; 6] = [0, 1, 2, 3, 5, 6];
     let mut q = *q_in;
-    let mut lambda = 1e-6_f64;
+    let mut lambda = LM_INITIAL_LAMBDA;
     let mut r = residual12(&q, target);
     let mut rn = norm12(&r);
 
     for _ in 0..max_iters {
-        if rn < 1e-13 {
+        if rn < LM_CONVERGENCE_THRESHOLD {
             break;
         }
         // Finite-difference Jacobian J (12x6) over the free joints.
@@ -531,7 +480,7 @@ fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
         // Levenberg-Marquardt damped step with one accept/reject backtrack
         // ladder; lambda grows until the step decreases the residual.
         let mut accepted = false;
-        for _ in 0..12 {
+        for _ in 0..LM_BACKTRACK_MAX {
             let mut damped = jtj;
             for d in 0..6 {
                 damped[(d, d)] += lambda;
@@ -539,7 +488,7 @@ fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
             let inv = match damped.try_inverse() {
                 Some(m) => m,
                 None => {
-                    lambda *= 8.0;
+                    lambda *= LM_LAMBDA_GROWTH;
                     continue;
                 }
             };
@@ -554,12 +503,12 @@ fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
                 q = q_trial;
                 r = r_trial;
                 rn = rn_trial;
-                lambda = (lambda * 0.5).max(1e-12);
+                lambda = (lambda * LM_LAMBDA_DECAY).max(LM_LAMBDA_MIN);
                 accepted = true;
                 break;
             }
-            lambda *= 8.0;
-            if lambda > 1e8 {
+            lambda *= LM_LAMBDA_GROWTH;
+            if lambda > LM_LAMBDA_MAX {
                 break;
             }
         }
