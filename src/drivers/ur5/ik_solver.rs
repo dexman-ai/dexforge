@@ -12,11 +12,10 @@
 //!
 //! ## Equivalence to the Python reference
 //!
-//! [`solve`] reproduces `ur5_ik.solve(T, respect_limits=False)`: the raw
-//! geometric solution set, FK-verified against the target pose and de-duplicated
-//! modulo `2*pi`. Joint-limit clamping (`respect_limits=True`) is intentionally
-//! *not* applied so the output is the pure algebraic set; callers can filter to
-//! limits afterwards if desired.
+//! [`solve`] mirrors `ur5_ik.solve` with the same argument list:
+//! `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`, `policy`,
+//! and `refinement_max_iters`. The algebraic solution set is FK-verified to
+//! [`TolerancePolicy::fk_atol`] and de-duplicated modulo `2*pi`.
 //!
 //! [`fk`] mirrors `ur5_ik.fk` (alias of `_fk`): product-of-exponentials forward
 //! kinematics using the baked chain constants.
@@ -37,11 +36,34 @@ mod test_data;
 /// Degrees of freedom of the UR5.
 pub const DOF: usize = 6;
 
+/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
+///
+/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
+/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
+/// `subproblem_dedup = 1e-3`).
+#[derive(Clone, Copy, Debug)]
+pub struct TolerancePolicy {
+    /// FK closure tolerance (== `subproblem_numerical`). Candidates whose
+    /// Frobenius-norm FK residual exceeds this value are rejected (or polished
+    /// when `allow_refinement = true`).
+    pub fk_atol: f64,
+    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`). Two
+    /// configurations that agree to within this value per joint (mod `2*pi`)
+    /// are treated as the same root.
+    pub dedup_atol: f64,
+}
+
+impl TolerancePolicy {
+    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
+    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
+        fk_atol: 1e-5,
+        dedup_atol: 1e-3,
+    };
+}
+
 // --- tolerances (ssik DEFAULT_TOLERANCE_POLICY) ---
-const NUM_TOL: f64 = 1e-5; // subproblem_numerical
-const DEG_TOL: f64 = 1e-12; // subproblem_degeneracy
-const DEDUP_TOL: f64 = 1e-3; // subproblem_dedup
-const FK_ATOL: f64 = 1e-5; // FK closure tolerance (== subproblem_numerical)
+const NUM_TOL: f64 = 1e-5; // subproblem_numerical (algebraic block)
+const DEG_TOL: f64 = 1e-12; // subproblem_degeneracy (algebraic block)
 
 // --- algebraic-block degeneracy constants from ur5_ik.py ---
 const DEG_SQ: f64 = 1e-16;
@@ -79,6 +101,17 @@ const T_RIGHTS: [[[f64; 4]; 4]; 6] = [
         [0.0, 1.0, 6.123233995736766e-17, 5.204170427930421e-18],
         [0.0, 0.0, 0.0, 1.0],
     ],
+];
+
+/// Joint angle limits (lo, hi) in radians — baked from `_JOINT_LIMITS` in
+/// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
+const JOINT_LIMITS: [(f64, f64); 6] = [
+    (-6.28318530717959, 6.28318530717959),
+    (-6.28318530717959, 6.28318530717959),
+    (-3.14159265358979, 3.14159265358979),
+    (-6.28318530717959, 6.28318530717959),
+    (-6.28318530717959, 6.28318530717959),
+    (-6.28318530717959, 6.28318530717959),
 ];
 
 /// 4x4 homogeneous identity with the given translation column.
@@ -133,22 +166,47 @@ fn wrap_to_pi(a: f64) -> f64 {
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Inverse kinematics — mirrors `ur5_ik.solve(T_target, respect_limits=False)`.
+/// Inverse kinematics — mirrors `ur5_ik.solve`.
 ///
-/// `t` is the 4x4 SE(3) pose of `ee_link` expressed in `base_link`.
-/// Returns up to 16 candidate joint vectors `[q1, .., q6]` (the UR5 yields at
-/// most 8); empty slots are [`None`]. The set is FK-verified to within
-/// [`FK_ATOL`] and de-duplicated modulo `2*pi`. Joint-limit filtering
-/// (`respect_limits=True` in Python) is not applied; callers may filter
-/// afterwards if desired.
-pub fn solve(t: &SMatrix<f64, 4, 4>) -> [Option<[f64; 6]>; 16] {
-    let target_tf = t;
+/// # Arguments
+///
+/// * `t` — 4×4 SE(3) target pose of `ee_link` in `base_link`.
+/// * `max_solutions` — cap on returned solutions (post-dedup, post-limits).
+///   `None` returns the full algebraic set (at most 8 for the UR5).
+/// * `q_seed` — when `Some`, solutions are sorted by wrap-to-pi distance
+///   from the seed (closest first). Has no effect on *which* solutions are
+///   returned.
+/// * `respect_limits` — when `true`, solutions outside the baked URDF joint
+///   limits are dropped (after a `±2π` wrap-into-limits attempt). Pass
+///   `false` for the raw geometric set.
+/// * `allow_refinement` — when `true`, algebraic candidates that exceed
+///   `policy.fk_atol` are polished with a bounded Levenberg-Marquardt step.
+///   For the UR5 (tier-0 arm) this is rarely needed; default `false`.
+/// * `policy` — FK closure and dedup tolerances; use
+///   [`TolerancePolicy::DEFAULT`] for the Python defaults.
+/// * `refinement_max_iters` — maximum LM iterations when
+///   `allow_refinement = true`.
+///
+/// Returns up to 16 candidate joint vectors `[q1, .., q6]` in radians;
+/// unused slots are [`None`].
+pub fn solve(
+    t: &SMatrix<f64, 4, 4>,
+    max_solutions: Option<usize>,
+    q_seed: Option<&[f64; 6]>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    policy: TolerancePolicy,
+    refinement_max_iters: usize,
+) -> [Option<[f64; 6]>; 16] {
+    let fk_atol = policy.fk_atol;
+    let dedup_atol = policy.dedup_atol;
+
     let mut solutions: [Option<[f64; 6]>; 16] = [None; 16];
     let mut solution_count = 0usize;
 
     // Raw algebraic candidates (stack array, at most 8 for the UR5).
     let mut cands = [[0.0f64; 6]; 8];
-    let cand_count = solve_algebraic(target_tf, &mut cands);
+    let cand_count = solve_algebraic(t, &mut cands);
 
     for ci in 0..cand_count {
         let q = cands[ci];
@@ -157,15 +215,28 @@ pub fn solve(t: &SMatrix<f64, 4, 4>) -> [Option<[f64; 6]>; 16] {
             continue;
         }
         // FK closure check.
-        let residual = fk_residual(&q, target_tf);
-        if residual > FK_ATOL {
+        let residual = fk_residual(&q, t);
+        let accepted_q: [f64; 6];
+        if residual <= fk_atol {
+            accepted_q = q;
+        } else if allow_refinement {
+            // Newton polish for near-miss candidates, mirroring Python's
+            // `allow_refinement` path (lm_refine via _spatial_jacobian).
+            match refine6(&q, t, refinement_max_iters, fk_atol) {
+                Some(refined) => {
+                    accepted_q = refined;
+                }
+                None => continue,
+            }
+        } else {
             continue;
         }
+
         // Wrap-to-pi de-duplication against accepted solutions.
         let mut dup = false;
         for s in solutions.iter().take(solution_count) {
             if let Some(existing) = s {
-                if q_close_wrap(&q, existing, DEDUP_TOL) {
+                if q_close_wrap(&accepted_q, existing, dedup_atol) {
                     dup = true;
                     break;
                 }
@@ -175,8 +246,49 @@ pub fn solve(t: &SMatrix<f64, 4, 4>) -> [Option<[f64; 6]>; 16] {
             continue;
         }
         if solution_count < 16 {
-            solutions[solution_count] = Some(q);
+            solutions[solution_count] = Some(accepted_q);
             solution_count += 1;
+        }
+    }
+
+    // Post-processing (mirrors Python's _ps_wrap_to_limits + _ps_respect_limits).
+    if respect_limits {
+        let mut filtered: [Option<[f64; 6]>; 16] = [None; 16];
+        let mut count = 0usize;
+        for sol in solutions.iter().take(solution_count).flatten() {
+            let q = wrap_to_limits(sol);
+            if in_limits(&q) && count < 16 {
+                filtered[count] = Some(q);
+                count += 1;
+            }
+        }
+        solutions = filtered;
+        solution_count = count;
+    }
+
+    // Sort by seed distance (mirrors Python's _ps_nearest_to_seed).
+    if let Some(seed) = q_seed {
+        // Insertion sort on the first `solution_count` slots.
+        for i in 1..solution_count {
+            let mut j = i;
+            while j > 0 {
+                let prev = solutions[j - 1].unwrap();
+                let curr = solutions[j].unwrap();
+                if seed_dist(&prev, seed) > seed_dist(&curr, seed) {
+                    solutions.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Truncate to max_solutions (mirrors Python's `solutions[:max_solutions]`).
+    if let Some(max) = max_solutions {
+        let cap = max.min(solution_count);
+        for i in cap..solution_count {
+            solutions[i] = None;
         }
     }
 
@@ -191,6 +303,175 @@ fn q_close_wrap(a: &[f64; 6], b: &[f64; 6], tol: f64) -> bool {
         }
     }
     true
+}
+
+/// Try `q[i] ± 2π` per joint to bring the vector into `JOINT_LIMITS`.
+/// Mirrors Python's `_ps_wrap_to_limits`.
+fn wrap_to_limits(q: &[f64; 6]) -> [f64; 6] {
+    let mut out = *q;
+    for i in 0..6 {
+        let (lo, hi) = JOINT_LIMITS[i];
+        if out[i] < lo {
+            let wrapped = out[i] + TWO_PI;
+            if wrapped <= hi {
+                out[i] = wrapped;
+            }
+        } else if out[i] > hi {
+            let wrapped = out[i] - TWO_PI;
+            if wrapped >= lo {
+                out[i] = wrapped;
+            }
+        }
+    }
+    out
+}
+
+/// `true` if every joint is within its URDF limit.
+fn in_limits(q: &[f64; 6]) -> bool {
+    for i in 0..6 {
+        let (lo, hi) = JOINT_LIMITS[i];
+        if q[i] < lo || q[i] > hi {
+            return false;
+        }
+    }
+    true
+}
+
+/// Squared wrap-to-π distance between `q` and `seed`. Used for seed sorting.
+fn seed_dist(q: &[f64; 6], seed: &[f64; 6]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..6 {
+        let d = wrap_to_pi(q[i] - seed[i]);
+        s += d * d;
+    }
+    s
+}
+
+// ---------------------------------------------------------------------------
+// Levenberg-Marquardt refinement (for `allow_refinement = true`)
+// ---------------------------------------------------------------------------
+
+/// Finite-difference step size for Jacobian computation in LM refinement.
+const REFINE_EPS: f64 = 1e-7;
+/// Residual below which the LM refiner considers the solution converged.
+const LM_CONVERGENCE_THRESHOLD: f64 = 1e-13;
+/// Initial Levenberg-Marquardt damping parameter.
+const LM_INITIAL_LAMBDA: f64 = 1e-6;
+/// Factor by which lambda grows when a step is rejected.
+const LM_LAMBDA_GROWTH: f64 = 8.0;
+/// Factor by which lambda shrinks when a step is accepted.
+const LM_LAMBDA_DECAY: f64 = 0.5;
+/// Minimum allowed lambda (prevents numerical underflow).
+const LM_LAMBDA_MIN: f64 = 1e-12;
+/// Maximum allowed lambda; when exceeded, the backtrack loop aborts.
+const LM_LAMBDA_MAX: f64 = 1e8;
+/// Maximum backtrack attempts per LM iteration.
+const LM_BACKTRACK_MAX_ATTEMPTS: usize = 12;
+
+/// 12-vector pose residual `[vec(R(q) − R_t); t(q) − t_t]` for the UR5.
+fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
+    let tf = fk(q);
+    let mut r = [0.0f64; 12];
+    let mut k = 0usize;
+    for i in 0..3 {
+        for j in 0..3 {
+            r[k] = tf[(i, j)] - target[(i, j)];
+            k += 1;
+        }
+    }
+    for i in 0..3 {
+        r[9 + i] = tf[(i, 3)] - target[(i, 3)];
+    }
+    r
+}
+
+#[inline]
+fn norm_pose12(r: &[f64; 12]) -> f64 {
+    let mut s = 0.0;
+    for v in r.iter() {
+        s += v * v;
+    }
+    libm::sqrt(s)
+}
+
+/// Levenberg-Marquardt polish of a 6-DOF UR5 configuration onto the exact
+/// pose root. Mirrors the Python `_lm_refine` path used when
+/// `allow_refinement = True`. Returns `Some(q_refined)` if the FK residual
+/// converges within `fk_atol`, otherwise `None`.
+fn refine6(
+    q_in: &[f64; 6],
+    target: &SMatrix<f64, 4, 4>,
+    max_iters: usize,
+    fk_atol: f64,
+) -> Option<[f64; 6]> {
+    let mut q = *q_in;
+    let mut lambda = LM_INITIAL_LAMBDA;
+    let mut r = pose_residual12(&q, target);
+    let mut rn = norm_pose12(&r);
+
+    for _ in 0..max_iters {
+        if rn < LM_CONVERGENCE_THRESHOLD {
+            break;
+        }
+        // Finite-difference Jacobian J (12×6) over all 6 joints.
+        let mut jac = SMatrix::<f64, 12, 6>::zeros();
+        for col in 0..6 {
+            let mut qp = q;
+            qp[col] += REFINE_EPS;
+            let rp = pose_residual12(&qp, target);
+            for row in 0..12 {
+                jac[(row, col)] = (rp[row] - r[row]) / REFINE_EPS;
+            }
+        }
+        let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
+        let jt = jac.transpose();
+        let jtj = jt * jac; // 6×6
+        let jtr = jt * rv; // 6×1
+
+        // Adaptive LM damping with accept/reject backtrack.
+        let mut accepted = false;
+        for _ in 0..LM_BACKTRACK_MAX_ATTEMPTS {
+            let mut damped = jtj;
+            for d in 0..6 {
+                damped[(d, d)] += lambda;
+            }
+            let inv = match damped.try_inverse() {
+                Some(m) => m,
+                None => {
+                    lambda *= LM_LAMBDA_GROWTH;
+                    continue;
+                }
+            };
+            let dq = inv * jtr;
+            let mut q_trial = q;
+            for col in 0..6 {
+                q_trial[col] -= dq[(col, 0)];
+            }
+            let r_trial = pose_residual12(&q_trial, target);
+            let rn_trial = norm_pose12(&r_trial);
+            if rn_trial < rn {
+                q = q_trial;
+                r = r_trial;
+                rn = rn_trial;
+                lambda = (lambda * LM_LAMBDA_DECAY).max(LM_LAMBDA_MIN);
+                accepted = true;
+                break;
+            }
+            lambda *= LM_LAMBDA_GROWTH;
+            if lambda > LM_LAMBDA_MAX {
+                break;
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+
+    if rn <= fk_atol {
+        Some(q)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,7 +1299,7 @@ mod tests {
             0.0, 0.0, 0.0, 1.0,
         ];
         let tf = tf_from_row_major(&t_home);
-        let sols = solve(&tf);
+        let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
         let zero = [0.0; 6];
         let found = sols.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-6));
         assert!(found, "home configuration q=0 not recovered");
@@ -1031,7 +1312,7 @@ mod tests {
         let mut case_idx = 0usize;
         for (tf_arr, expected) in test_data::CASES {
             let tf = tf_from_row_major(tf_arr);
-            let sols = solve(&tf);
+            let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
             let got: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
 
             assert_eq!(
@@ -1054,5 +1335,64 @@ mod tests {
             case_idx += 1;
         }
         assert!(total_expected > 0, "no expected solutions in dataset");
+    }
+
+    #[test]
+    fn respect_limits_drops_out_of_range() {
+        // q=0 is the home pose; all joints are at 0 which is within limits.
+        let t_home = [
+            1.0, 0.0, 0.0, -0.81725,
+            0.0, 6.123233995736766e-17, -1.0, -0.19145,
+            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let tf = tf_from_row_major(&t_home);
+        // With limits on, q=0 should still survive (it's within all limits).
+        let sols_lim = solve(&tf, None, None, true, false, TolerancePolicy::DEFAULT, 15);
+        let zero = [0.0; 6];
+        let found = sols_lim.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-6));
+        assert!(found, "q=0 should survive respect_limits=true");
+    }
+
+    #[test]
+    fn max_solutions_cap() {
+        let t_home = [
+            1.0, 0.0, 0.0, -0.81725,
+            0.0, 6.123233995736766e-17, -1.0, -0.19145,
+            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let tf = tf_from_row_major(&t_home);
+        let all_sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
+        let n_all: usize = all_sols.iter().flatten().count();
+        if n_all > 1 {
+            let capped = solve(&tf, Some(1), None, false, false, TolerancePolicy::DEFAULT, 15);
+            let n_capped: usize = capped.iter().flatten().count();
+            assert_eq!(n_capped, 1, "max_solutions=1 should return exactly 1 solution");
+        }
+    }
+
+    #[test]
+    fn q_seed_sorts_nearest_first() {
+        let t_home = [
+            1.0, 0.0, 0.0, -0.81725,
+            0.0, 6.123233995736766e-17, -1.0, -0.19145,
+            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let tf = tf_from_row_major(&t_home);
+        let zero = [0.0f64; 6];
+        let sols = solve(&tf, None, Some(&zero), false, false, TolerancePolicy::DEFAULT, 15);
+        let solutions: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
+        if solutions.len() > 1 {
+            // First solution must be the closest to seed.
+            let d0 = seed_dist(&solutions[0], &zero);
+            for s in &solutions[1..] {
+                assert!(
+                    d0 <= seed_dist(s, &zero) + 1e-12,
+                    "q_seed sort: first solution is not the nearest to seed"
+                );
+            }
+        }
     }
 }
