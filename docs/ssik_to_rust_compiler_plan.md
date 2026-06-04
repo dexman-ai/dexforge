@@ -206,7 +206,7 @@ real-time constraints. High effort, low correctness, unbounded scope.
    generator that targets the existing hand-written kernels), or insist on the
    literal Option B transpiler despite §3? *Recommendation: Option A.*
 2. **New arm or re-derive existing?** Should the generator first reproduce one
-   already-ported arm **byte-for-comparable** to its committed Rust (regression
+   already-ported arm **byte-for-byte comparable** to its committed Rust (regression
    anchor), or target a *new* arm (e.g. `z1_ik`, `puma560_ik`) to prove value?
    *Recommendation: reproduce UR5 first as a golden anchor, then a new arm.*
 3. **Determinism policy for tier-2 arms.** Confirm the generator must **omit the
