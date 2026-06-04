@@ -163,6 +163,8 @@ def find_best_example(target_py_code: str) -> Tuple[str, int]:
     # Use word-boundary patterns so bare numbers (e.g. "128", "16") are not
     # confused with the same digits appearing inside variable names such as
     # "_pq_x128" or floating-point coefficients.
+    # 128 = MAX_SOLUTIONS for 7-DOF jointlock arms (16 lock samples × 8 sub-solutions)
+    # 16  = MAX_SOLUTIONS for general 6R (Raghavan-Roth polynomial system)
     _has_128 = bool(re.search(r"\b128\b", target_py_code))
     _has_16 = bool(re.search(r"\b16\b", target_py_code))
 
@@ -207,7 +209,14 @@ def extract_rust_signatures(rust_file_path: Path) -> str:
     Parses the file with regex to pull out only the public API surface:
     docstring comment blocks immediately preceding each ``pub fn`` declaration,
     and the full signature from ``pub fn`` up to the opening ``{`` or ``;``.
-    Generics, ``where`` clauses, and multi-line signatures are all captured.
+    Generics and multi-line signatures are captured as long as the opening
+    brace or semicolon is on the same logical block.
+
+    .. note::
+        This is a best-effort regex approach.  It may miss signatures with
+        deeply nested generics, multi-line ``where`` clauses that themselves
+        contain ``{``/``;`` characters, or ``#[...]`` attribute lines that
+        span multiple lines.  For the ssik codebase these cases do not arise.
 
     :param rust_file_path: Absolute path to the Rust source file.
     :returns: A formatted string of ``(docstring, signature)`` pairs, suitable
@@ -446,7 +455,7 @@ def sanitize_rust_output(llm_response: str) -> str:
     :returns: Clean Rust source code with no Markdown artefacts.
     """
     # Collect all ```rust ... ``` or ``` ... ``` code block bodies
-    blocks = re.findall(r"```(?:rust)?[ \t]*\n(.*?)```", llm_response, flags=re.DOTALL)
+    blocks = re.findall(r"```(?:rust)?[ \t]*\n?(.*?)```", llm_response, flags=re.DOTALL)
     if blocks:
         return "\n".join(block.strip() for block in blocks).strip()
     # No fences: strip stray backtick-fence lines and return the remainder
@@ -478,7 +487,7 @@ def _write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Derive a clean module name (strip trailing _ik suffix for naming, then re-add)
-    name = arm_stem.removesuffix("_ik")
+    name = arm_stem[:-3] if arm_stem.endswith("_ik") else arm_stem
 
     py_path = output_dir / f"{name}_ik.py"
     rs_path = output_dir / f"{name}_ik_solver.rs"
@@ -655,7 +664,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"[ssik_translator] ERROR: {exc}", file=sys.stderr)
             return 1
         except Exception as exc:  # noqa: BLE001 — surface all API errors
-            print(f"[ssik_translator] LLM error: {exc}", file=sys.stderr)
+            print(f"[ssik_translator] LLM error ({type(exc).__name__}): {exc}", file=sys.stderr)
             return 1
 
         # --- Step 5: Sanitize output ---
