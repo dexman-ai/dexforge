@@ -28,6 +28,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use ssik_rust::drivers::franka_panda::ik_solver as franka;
+use ssik_rust::drivers::piper::ik_solver as piper;
 use ssik_rust::drivers::ur5::ik_solver as ur5;
 
 // ---------------------------------------------------------------------------
@@ -77,7 +78,7 @@ fn matrix_to_nested(tf: &SMatrix<f64, 4, 4>) -> Vec<Vec<f64>> {
 /// ----------
 /// arm : str
 ///     Name of the robot arm.  Supported values:
-///     ``"ur5"`` / ``"ur5_ik"`` and
+///     ``"ur5"`` / ``"ur5_ik"``, ``"piper"`` / ``"piper_ik"``, and
 ///     ``"franka_panda"`` / ``"franka_panda_ik"``.
 /// q : list[float]
 ///     Joint angles in radians.  Length must match the arm's DOF
@@ -108,6 +109,18 @@ fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
             let arr: [f64; 6] = q.try_into().unwrap();
             ur5::fk(&arr)
         }
+        // ── Piper ────────────────────────────────────────────────────────────
+        "piper" | "piper_ik" => {
+            if q.len() != piper::DOF {
+                return Err(PyValueError::new_err(format!(
+                    "piper requires {} joint angles, got {}",
+                    piper::DOF,
+                    q.len()
+                )));
+            }
+            let arr: [f64; 6] = q.try_into().unwrap();
+            piper::fk(&arr)
+        }
         // ── Franka Panda ─────────────────────────────────────────────────────
         // To add a new 7-DOF arm: copy this block and replace the driver alias.
         "franka_panda" | "franka_panda_ik" => {
@@ -124,7 +137,7 @@ fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
         // ── Unsupported ───────────────────────────────────────────────────────
         _ => {
             return Err(PyValueError::new_err(format!(
-                "unsupported arm '{arm}'; supported arms: ur5, franka_panda"
+                "unsupported arm '{arm}'; supported arms: ur5, piper, franka_panda"
             )));
         }
     };
@@ -142,7 +155,7 @@ fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
 /// ----------
 /// arm : str
 ///     Name of the robot arm.  Supported values:
-///     ``"ur5"`` / ``"ur5_ik"`` and
+///     ``"ur5"`` / ``"ur5_ik"``, ``"piper"`` / ``"piper_ik"``, and
 ///     ``"franka_panda"`` / ``"franka_panda_ik"``.
 /// T_target : array-like (4×4)
 ///     SE(3) target pose of ``ee_link`` in ``base_link``.  Accepts a numpy
@@ -236,6 +249,30 @@ fn solve(
                 .filter_map(|s| s.map(|q| q.to_vec()))
                 .collect()
         }
+        // ── Piper ────────────────────────────────────────────────────────────
+        "piper" | "piper_ik" => {
+            let seed: Option<[f64; 6]> = match q_seed {
+                None => None,
+                Some(v) => {
+                    if v.len() != piper::DOF {
+                        return Err(PyValueError::new_err(format!(
+                            "q_seed for piper must have {} elements, got {}",
+                            piper::DOF,
+                            v.len()
+                        )));
+                    }
+                    Some(v.try_into().unwrap())
+                }
+            };
+            let policy = piper::TolerancePolicy { fk_atol, dedup_atol };
+            piper::solve(
+                &tf, max_solutions, seed.as_ref(), respect_limits,
+                allow_refinement, policy, refinement_max_iters,
+            )
+                .iter()
+                .filter_map(|s| s.map(|q| q.to_vec()))
+                .collect()
+        }
         // ── Franka Panda ─────────────────────────────────────────────────────
         // To add a new arm: copy this block, replace the driver alias, and
         // adjust the q_seed array size to match the arm's DOF.
@@ -265,7 +302,7 @@ fn solve(
         // ── Unsupported ───────────────────────────────────────────────────────
         _ => {
             return Err(PyValueError::new_err(format!(
-                "unsupported arm '{arm}'; supported arms: ur5, franka_panda"
+                "unsupported arm '{arm}'; supported arms: ur5, piper, franka_panda"
             )));
         }
     };

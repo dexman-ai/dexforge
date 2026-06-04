@@ -7,8 +7,9 @@
 //! * [`math::ssik_core`] holds the generic, bounded-iteration numeric kernels
 //!   (companion-matrix eigenvalues / quartic roots, small dense linear algebra)
 //!   shared by every arm driver.
-//! * [`drivers`] holds the per-arm closed-form solvers. The Universal Robots
-//!   UR5 translation lives in [`drivers::ur5::ik_solver`].
+//! * [`drivers`] holds the per-arm closed-form solvers: the Universal Robots
+//!   UR5 ([`drivers::ur5`]), the Franka Emika Panda ([`drivers::franka_panda`]),
+//!   and the AgileX Piper ([`drivers::piper`]).
 //!
 //! Every numeric loop in this crate carries a hardcoded iteration ceiling and
 //! every data structure is a fixed-size, stack-allocated array, so the code

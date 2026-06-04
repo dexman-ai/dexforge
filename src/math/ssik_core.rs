@@ -16,6 +16,7 @@ extern crate std;
 
 use core::f64::consts::PI;
 use libm::{atan2, cos, fabs, sin, sqrt};
+use nalgebra::{SMatrix, SymmetricEigen};
 
 // ---------------------------------------------------------------------------
 // 3-vector primitives (deterministic, no BLAS) shared by the subproblem
@@ -916,6 +917,258 @@ pub fn quartic_roots(coeffs: &[f64; 5]) -> ([Complex; 4], usize) {
     }
 
     (roots, count)
+}
+
+// ---------------------------------------------------------------------------
+// Raghavan-Roth / Manocha-Canny kernels for tier-2 generic 6R IK.
+//
+// These operate on the fixed-size matrices produced by the per-arm
+// `(P_sin, P_cos, P_one, Q)` builders: `Q` is 14x8, the `P_*` are 14x9, and
+// the doubled matrix polynomial `M(x) = M_quad x^2 + M_lin x + M_const` is
+// 12x12. Every routine is stack-only and carries a bounded iteration count
+// (the eigenvalue solve reuses the bounded [`hessenberg_eigenvalues`] Francis
+// QR above), so the worst-case execution time stays inside the real-time
+// control budget.
+// ---------------------------------------------------------------------------
+
+/// Filter band (half-width) for the spurious `+/-i` companion roots that the
+/// Manocha-Canny linearisation introduces (a `(1 + x^2)^4` determinant
+/// factor). Matches `solve_x2_roots(spurious_tol=0.1)`.
+const RR_SPURIOUS_TOL: f64 = 0.1;
+/// Scale-aware tolerance for accepting a companion eigenvalue as real-valued.
+/// Matches `solve_x2_roots(imag_rel_tol=1e-3)`.
+const RR_IMAG_REL_TOL: f64 = 1e-3;
+
+/// Orthonormal basis (14x6) of the left null space of the 14x8 matrix `q`.
+///
+/// Computed from the six smallest-eigenvalue eigenvectors of the symmetric
+/// PSD Gram matrix `Q Qᵀ` (14x14). The particular orthonormal basis chosen
+/// does not affect the downstream IK roots: any `N' = N O` with orthogonal
+/// `O` yields the same `det M(x) = 0` roots and the same kernel `v_12`.
+pub fn rr_left_null_space(q: &SMatrix<f64, 14, 8>) -> SMatrix<f64, 14, 6> {
+    let g = q * q.transpose();
+    let se = SymmetricEigen::new(g);
+    // `SymmetricEigen` does not sort: explicitly pick the six smallest
+    // eigenvalues (bounded selection over a fixed 14-element set).
+    let mut used = [false; 14];
+    let mut n = SMatrix::<f64, 14, 6>::zeros();
+    for col in 0..6 {
+        let mut best = usize::MAX;
+        let mut best_val = f64::INFINITY;
+        for i in 0..14 {
+            if !used[i] && se.eigenvalues[i] < best_val {
+                best_val = se.eigenvalues[i];
+                best = i;
+            }
+        }
+        used[best] = true;
+        for row in 0..14 {
+            n[(row, col)] = se.eigenvectors[(row, best)];
+        }
+    }
+    n
+}
+
+/// Moore-Penrose pseudo-inverse (8x14) of the 14x8 matrix `q`, via SVD.
+///
+/// Falls back to the all-zero matrix if the decomposition does not converge;
+/// callers treat the resulting candidate as degenerate and skip it.
+pub fn rr_pseudo_inverse(q: &SMatrix<f64, 14, 8>) -> SMatrix<f64, 8, 14> {
+    q.svd(true, true)
+        .pseudo_inverse(1e-12)
+        .unwrap_or_else(|_| SMatrix::<f64, 8, 14>::zeros())
+}
+
+/// Joint row+column equilibration of the quadratic matrix pencil
+/// `(A, B, C)` (each 12x12), mirroring
+/// `ssik._pencil.equilibrate_three_matrix_pencil` with `rescale_variable=False`.
+///
+/// Returns `(A_eq, B_eq, C_eq, d_r)` where `S_eq = D_l S D_r` and `d_r` is the
+/// column scaling needed to map an equilibrated kernel back to the original
+/// basis (`v = d_r ⊙ v_eq`).
+fn rr_equilibrate(
+    a: &SMatrix<f64, 12, 12>,
+    b: &SMatrix<f64, 12, 12>,
+    c: &SMatrix<f64, 12, 12>,
+) -> (
+    SMatrix<f64, 12, 12>,
+    SMatrix<f64, 12, 12>,
+    SMatrix<f64, 12, 12>,
+    [f64; 12],
+) {
+    // Row scaling: d_l[i] = 1 / max_k max_j |S_k[i][j]|.
+    let mut d_l = [0.0_f64; 12];
+    for i in 0..12 {
+        let mut row_max = 0.0_f64;
+        for j in 0..12 {
+            row_max = row_max.max(fabs(a[(i, j)]));
+            row_max = row_max.max(fabs(b[(i, j)]));
+            row_max = row_max.max(fabs(c[(i, j)]));
+        }
+        d_l[i] = if row_max > 0.0 { 1.0 / row_max } else { 1.0 };
+    }
+    let mut a_r = *a;
+    let mut b_r = *b;
+    let mut c_r = *c;
+    for i in 0..12 {
+        for j in 0..12 {
+            a_r[(i, j)] *= d_l[i];
+            b_r[(i, j)] *= d_l[i];
+            c_r[(i, j)] *= d_l[i];
+        }
+    }
+    // Column scaling computed on the row-scaled matrices.
+    let mut d_r = [0.0_f64; 12];
+    for j in 0..12 {
+        let mut col_max = 0.0_f64;
+        for i in 0..12 {
+            col_max = col_max.max(fabs(a_r[(i, j)]));
+            col_max = col_max.max(fabs(b_r[(i, j)]));
+            col_max = col_max.max(fabs(c_r[(i, j)]));
+        }
+        d_r[j] = if col_max > 0.0 { 1.0 / col_max } else { 1.0 };
+    }
+    for i in 0..12 {
+        for j in 0..12 {
+            a_r[(i, j)] *= d_r[j];
+            b_r[(i, j)] *= d_r[j];
+            c_r[(i, j)] *= d_r[j];
+        }
+    }
+    (a_r, b_r, c_r, d_r)
+}
+
+/// 2-norm condition number of a 12×12 matrix (`sigma_max / sigma_min`).
+///
+/// Mirrors `numpy.linalg.cond(a, 2)` used by the Python Raghavan-Roth pipeline
+/// to flag the ill-conditioned `A_eq` poses. Returns [`f64::INFINITY`] when the
+/// smallest singular value underflows to zero so callers treat the matrix as
+/// singular/ill-conditioned.
+fn rr_condition_number(m: &SMatrix<f64, 12, 12>) -> f64 {
+    let sv = m.singular_values();
+    let mut smax = 0.0_f64;
+    let mut smin = f64::INFINITY;
+    for k in 0..12 {
+        let s = sv[k];
+        if s > smax {
+            smax = s;
+        }
+        if s < smin {
+            smin = s;
+        }
+    }
+    if smin <= 0.0 || !smin.is_finite() {
+        return f64::INFINITY;
+    }
+    smax / smin
+}
+
+/// Right singular vector of `m` (12x12) for its smallest singular value, i.e.
+/// an approximate null vector. Returns the canonical basis vector `e_11` if the
+/// SVD does not converge so callers degrade gracefully.
+fn rr_null_vector(m: &SMatrix<f64, 12, 12>) -> [f64; 12] {
+    let mut v = [0.0_f64; 12];
+    let svd = m.svd(true, true);
+    match svd.v_t {
+        Some(v_t) => {
+            // nalgebra orders singular values in descending magnitude, so the
+            // smallest sits in the last (row 11) right singular vector.
+            for j in 0..12 {
+                v[j] = v_t[(11, j)];
+            }
+        }
+        None => v[11] = 1.0,
+    }
+    v
+}
+
+/// Real `tan(q/2)` roots of `det M(x) = 0` and their kernels via the 24x24
+/// companion linearisation (Manocha-Canny Theorem 1).
+///
+/// Builds the companion `Sigma = [[0, I], [-A⁻¹C, -A⁻¹B]]` from the
+/// *equilibrated* pencil, reduces it to upper-Hessenberg form and extracts the
+/// eigenvalues with the bounded Francis-QR [`hessenberg_eigenvalues`]. Spurious
+/// near-`+/-i` roots and roots with non-negligible imaginary parts are
+/// filtered out. For every accepted real root `x` the matching 12-vector kernel
+/// `v_12` of `M(x)` is recovered (`v_12 = d_r ⊙ nullvec(M_eq(x))`).
+///
+/// Fills `roots`/`vecs` and returns the number of accepted roots (`<= 16`). If
+/// the equilibrated leading matrix is singular, returns `0`.
+///
+/// `cond_out` receives the 2-norm condition number of the equilibrated leading
+/// matrix `A_eq` (== Python's `np.linalg.cond(a_eq)`). Callers compare it to the
+/// `1e10` threshold to detect the ill-conditioned poses that the Python
+/// reference handles with its Möbius/random-eigenvalue fallback.
+pub fn rr_real_roots(
+    m_quad: &SMatrix<f64, 12, 12>,
+    m_lin: &SMatrix<f64, 12, 12>,
+    m_const: &SMatrix<f64, 12, 12>,
+    roots: &mut [f64; 24],
+    vecs: &mut [[f64; 12]; 24],
+    cond_out: &mut f64,
+) -> usize {
+    let (a_eq, b_eq, c_eq, d_r) = rr_equilibrate(m_quad, m_lin, m_const);
+
+    *cond_out = rr_condition_number(&a_eq);
+
+    // Solve A [X_b | X_c] = [B | C] with a single LU factorisation.
+    let mut bc = SMatrix::<f64, 12, 24>::zeros();
+    bc.fixed_view_mut::<12, 12>(0, 0).copy_from(&b_eq);
+    bc.fixed_view_mut::<12, 12>(0, 12).copy_from(&c_eq);
+    let a_inv_bc = match a_eq.lu().solve(&bc) {
+        Some(x) => x,
+        None => return 0,
+    };
+
+    // Companion matrix Sigma (24x24).
+    let mut sigma = [[0.0_f64; 24]; 24];
+    for i in 0..12 {
+        sigma[i][i + 12] = 1.0;
+    }
+    for i in 0..12 {
+        for j in 0..12 {
+            sigma[i + 12][j] = -a_inv_bc[(i, j + 12)]; // -A⁻¹C
+            sigma[i + 12][j + 12] = -a_inv_bc[(i, j)]; // -A⁻¹B
+        }
+    }
+
+    // Reduce to upper-Hessenberg form (nalgebra) before the bounded QR sweep.
+    let sigma_mat = SMatrix::<f64, 24, 24>::from_fn(|i, j| sigma[i][j]);
+    let hess = sigma_mat.hessenberg().unpack_h();
+    let mut h = [[0.0_f64; 24]; 24];
+    for i in 0..24 {
+        for j in 0..24 {
+            h[i][j] = hess[(i, j)];
+        }
+    }
+    let eigvals = hessenberg_eigenvalues::<24>(h);
+
+    let mut count = 0usize;
+    for ev in eigvals.iter() {
+        if count >= 24 {
+            break;
+        }
+        let ar = fabs(ev.re);
+        let ai = fabs(ev.im);
+        // Drop the spurious roots clustered near +/-i.
+        if fabs(ai - 1.0) < RR_SPURIOUS_TOL && ar < RR_SPURIOUS_TOL {
+            continue;
+        }
+        // Drop genuinely complex roots (scale-aware imag test).
+        if ai > RR_IMAG_REL_TOL * ar.max(1.0) {
+            continue;
+        }
+        let x = ev.re;
+        // Kernel of M(x): null vector of the equilibrated pencil, de-scaled.
+        let m_eq = a_eq * (x * x) + b_eq * x + c_eq;
+        let v_eq = rr_null_vector(&m_eq);
+        roots[count] = x;
+        for k in 0..12 {
+            vecs[count][k] = d_r[k] * v_eq[k];
+        }
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]

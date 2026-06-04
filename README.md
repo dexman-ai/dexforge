@@ -18,9 +18,16 @@ hardcoded iteration ceiling so worst-case execution time is bounded.
 | `src/drivers/franka_panda/ik_solver.rs` | Franka Emika **Panda** (7-DOF) closed-form solver (`compute_ik`), ported from `ssik/prebuilt/franka_panda_ik.py` (solver `jointlock.seven_r`). Locks joint 4 across 16 samples, solves the residual 6R sub-chain (SP1/3/4/5 subproblems), FK-verifies, and refines each root with bounded Levenberg-Marquardt. |
 | `src/drivers/franka_panda/consts.rs` | Auto-generated baked spatial constants (lock samples, screw axes, link transforms). |
 | `src/drivers/franka_panda/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution). |
+| `src/drivers/piper/ik_solver.rs` | AgileX **Piper** (6-DOF) solver (`solve`, `fk`), ported from `ssik/prebuilt/piper_ik.py` (solver `ikgeo.general_6r`, tier 2). Numeric Raghavan-Roth elimination + Manocha-Canny `24x24` companion-eigenvalue route, back-substitution, FK verification, and the `#[cfg(test)]` reference test. |
+| `src/drivers/piper/consts.rs` | Auto-generated baked geometry (joint axes/transforms, DH parameters, frame offsets, joint limits). |
+| `src/drivers/piper/pq.rs` | Machine-generated `(P_sin, P_cos, P_one, Q)` Raghavan-Roth matrix builder. |
+| `src/drivers/piper/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution; singular poses flagged for FK-residual comparison). |
 | `scripts/generate_test_data.py` | Regenerates `test_data.rs` from the reference Python solver. |
 | `scripts/generate_franka_consts.py` | Regenerates the Franka `consts.rs` from the Python artifact. |
 | `scripts/generate_franka_test_data.py` | Regenerates the Franka `test_data.rs` from the reference Python solver. |
+| `scripts/generate_piper_pq.py` | Regenerates the Piper `pq.rs` matrix builder from the Python artifact. |
+| `scripts/generate_piper_test_data.py` | Regenerates the Piper `test_data.rs` from the reference Python solver. |
+| `examples/piper_solve.rs` | Host harness that runs the Piper solver on stdin poses (used by the Piper data generator). |
 | `ssik-py/` | Secondary crate: Python bindings (pyo3) wrapping `ssik-rust`. |
 
 ## Rust interface
@@ -57,6 +64,27 @@ The Panda is kinematically redundant, so `franka_panda_ik.solve` locks joint 4
 across a fixed set of samples and solves the resulting 6R sub-problem. The full
 discrete solution set is therefore much larger than a 6-DOF arm's: the output is
 a `[Option<[f64; 7]>; 128]` stack array (unused slots are `None`).
+
+### AgileX Piper (6-DOF)
+
+```rust
+use nalgebra::SMatrix;
+use ssik_rust::drivers::piper::ik_solver::{fk, solve, TolerancePolicy};
+
+let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of link6 in base_link */;
+let solutions: [Option<[f64; 6]>; 16] =
+    solve(&target_tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
+for q in solutions.iter().flatten() {
+    // q = [q1, q2, q3, q4, q5, q6]
+}
+```
+
+The Piper is a generic (non-Pieper) 6R arm, so it is solved with the numeric
+Raghavan-Roth elimination followed by the Manocha-Canny `24x24` companion
+eigenvalue route in [`math::ssik_core::rr_real_roots`], then back-substitution.
+For deterministic, bounded real-time execution the randomised Möbius /
+generalised-eigenvalue fallback used by the Python reference for ill-conditioned
+poses is intentionally omitted; equilibration covers the reachable workspace.
 
 ## Python interface
 
