@@ -11,6 +11,5 @@ license = { text = "BSD-3-Clause" }
 dependencies = ["scipy", "numpy"]
 
 [tool.maturin]
-python-source = "python"
 module-name = "ssik_py"
 manifest-path = "Cargo.toml"
