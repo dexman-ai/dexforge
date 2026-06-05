@@ -168,6 +168,27 @@ pub fn frob_diff(a: &Transform, b: &Transform) -> f64 {
     libm::sqrt(s)
 }
 
+/// 12-vector pose residual `[vec(a.R − b.R); a.t − b.t]` between two transforms.
+///
+/// The first 9 elements are the column-major flattening of `(a.R − b.R)` and
+/// the last 3 are the translation difference `a.t − b.t`.  This is the
+/// standard residual vector consumed by [`lm_refine`] and [`dls_ik`].
+#[inline]
+pub fn pose_residual12(a: &Transform, b: &Transform) -> [f64; 12] {
+    let mut r = [0.0f64; 12];
+    let mut k = 0usize;
+    for i in 0..3 {
+        for j in 0..3 {
+            r[k] = a.r[i][j] - b.r[i][j];
+            k += 1;
+        }
+    }
+    for i in 0..3 {
+        r[9 + i] = a.t[i] - b.t[i];
+    }
+    r
+}
+
 // ---------------------------------------------------------------------------
 // Shared Levenberg-Marquardt tuning constants
 //
@@ -399,21 +420,7 @@ where
 {
     lm_refine::<DOF, _>(
         q_init,
-        |q| {
-            let tf = fk_fn(q);
-            let mut r = [0.0f64; 12];
-            let mut k = 0usize;
-            for i in 0..3 {
-                for j in 0..3 {
-                    r[k] = tf.r[i][j] - goal.r[i][j];
-                    k += 1;
-                }
-            }
-            for i in 0..3 {
-                r[9 + i] = tf.t[i] - goal.t[i];
-            }
-            r
-        },
+        |q| pose_residual12(&fk_fn(q), goal),
         max_iters,
         fk_atol,
     )
