@@ -11,10 +11,12 @@
 //!   match.
 //! * `singular == true` — the deterministic Raghavan-Roth kernel and
 //!   the reference husty_pfurner path resolve near-singular lock
-//!   samples differently. The solutions are the *complete*
-//!   `allow_refinement=True` reference set; the test compares the Rust
-//!   output with a relaxed joint tolerance plus an FK-closure bound
-//!   (see `ik_solver`'s test module).
+//!   samples differently (the kernel surfaces extra genuine roots and
+//!   may miss others). The stored solutions are the *complete*
+//!   `allow_refinement=True` reference set, kept for inspection; the
+//!   driver test asserts only FK-closure soundness for these poses
+//!   (completeness is asserted strictly only for `singular == false`).
+//!   See `ik_solver`'s test module.
 
 /// `(pose, solutions, singular)` regression cases.
 pub static CASES: &[(&[f64; 16], &[[f64; 7]], bool)] = &[

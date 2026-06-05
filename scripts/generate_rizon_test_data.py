@@ -18,11 +18,13 @@ and xArm7 regression sets:
      unrefined ``allow_refinement=False`` reference set exactly (count + every
      value to ``REPRO_TOL``). The golden set is that reference output.
    * **singular** (``singular == true``) — the deterministic Raghavan-Roth
-     kernel surfaces a different (usually larger, never missing) set of genuine
-     roots than the reference husty_pfurner path at near-singular lock samples.
-     The golden set becomes the *complete* ``allow_refinement=True`` reference
-     set; the Rust output is checked against it with a relaxed joint tolerance
-     plus an FK-closure bound (see ``ik_solver``'s test module).
+     kernel surfaces a different set of genuine roots than the reference
+     husty_pfurner path at near-singular lock samples (usually extra roots, but
+     occasionally missing some). The golden set becomes the *complete*
+     ``allow_refinement=True`` reference set, retained for inspection; the
+     driver test asserts only FK-closure soundness on these poses (strict
+     completeness is asserted only for ``singular == false``). See
+     ``ik_solver``'s test module.
 
 The retained ``(pose, solutions, singular)`` triples are written as a Rust
 source module (``src/drivers/<arm>/test_data.rs``).
@@ -160,10 +162,12 @@ def _write_rust(arm, dest, cases) -> None:
         "//!   match.",
         "//! * `singular == true` — the deterministic Raghavan-Roth kernel and",
         "//!   the reference husty_pfurner path resolve near-singular lock",
-        "//!   samples differently. The solutions are the *complete*",
-        "//!   `allow_refinement=True` reference set; the test compares the Rust",
-        "//!   output with a relaxed joint tolerance plus an FK-closure bound",
-        "//!   (see `ik_solver`'s test module).",
+        "//!   samples differently (the kernel surfaces extra genuine roots and",
+        "//!   may miss others). The stored solutions are the *complete*",
+        "//!   `allow_refinement=True` reference set, kept for inspection; the",
+        "//!   driver test asserts only FK-closure soundness for these poses",
+        "//!   (completeness is asserted strictly only for `singular == false`).",
+        "//!   See `ik_solver`'s test module.",
         "",
         "/// `(pose, solutions, singular)` regression cases.",
         "pub static CASES: &[(&[f64; 16], &[[f64; 7]], bool)] = &[",
