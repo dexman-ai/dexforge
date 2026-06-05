@@ -137,3 +137,29 @@ cargo build --release --target thumbv7em-none-eabihf   # embedded no_std build
 pip install ssik
 python scripts/generate_test_data.py
 ```
+
+## ssik Version Locking
+
+dexforge uses a **locked version** of the `ssik` library (`personalrobotics/ssik`)
+to ensure that newly translated artifacts are compatible with the already-translated
+core math functions in `src/math/ssik_core.rs` and `src/math/kinematics.rs`.
+
+### Checking the locked version
+
+```sh
+cat SSIK_VERSION.txt
+```
+
+### Installing the locked version for development
+
+Before running the IK generator or regenerating test data:
+
+```sh
+pip install $(grep ssik SSIK_VERSION.txt)
+```
+
+### Upgrading the ssik version
+
+Upgrading to a new ssik version requires careful inspection of changes and
+regeneration of affected artifacts. See `codegen/upgrade_ssik_version.md` for
+detailed instructions.

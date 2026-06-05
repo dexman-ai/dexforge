@@ -23,6 +23,54 @@ _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 
 
+def _get_locked_ssik_version() -> str:
+    """Read the locked ssik version from SSIK_VERSION.txt.
+
+    :returns: Version string (e.g., "0.8.3").
+    :raises FileNotFoundError: If SSIK_VERSION.txt is not found.
+    """
+    version_file = _REPO_ROOT / "SSIK_VERSION.txt"
+    if not version_file.exists():
+        raise FileNotFoundError(
+            f"SSIK_VERSION.txt not found at {version_file}. "
+            "Create it with the locked ssik version (e.g., 'ssik==0.8.3')."
+        )
+    content = version_file.read_text(encoding="utf-8").strip()
+    # Parse "ssik==X.Y.Z" or "X.Y.Z" format
+    if content.startswith("ssik=="):
+        return content[6:]
+    elif content.startswith("ssik "):
+        return content[5:].split(",")[0].strip()
+    return content
+
+
+def _verify_ssik_version() -> str:
+    """Verify that the installed ssik version matches the locked version.
+
+    :returns: The locked ssik version string.
+    :raises ImportError: If ssik is not installed or version doesn't match.
+    """
+    try:
+        import ssik
+    except ImportError:
+        raise ImportError(
+            "ssik package is not installed. "
+            "Install it with: pip install ssik==<version> (see SSIK_VERSION.txt)"
+        )
+
+    locked_version = _get_locked_ssik_version()
+    installed_version = getattr(ssik, "__version__", "unknown")
+
+    if installed_version != "unknown" and installed_version != locked_version:
+        raise ImportError(
+            f"ssik version mismatch: installed={installed_version}, "
+            f"locked={locked_version}. "
+            f"Update your environment: pip install ssik=={locked_version}"
+        )
+
+    return locked_version
+
+
 def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
     """Load a ssik prebuilt artifact by name or file path.
 
@@ -34,13 +82,17 @@ def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
         - For module names: the module name as provided (e.g., ``"ur5_ik"``).
         Callers should use ``.removesuffix("_ik")`` to extract the arm name.
     :raises FileNotFoundError: If a path argument does not exist on disk.
-    :raises ImportError: If a module name is not found in ``ssik.prebuilt``.
+    :raises ImportError: If a module name is not found in ``ssik.prebuilt`` or
+        if the installed ssik version does not match the locked version.
     """
     candidate = Path(artifact_name)
     if candidate.exists():
         source_code = candidate.read_text(encoding="utf-8")
         stem = candidate.stem  # e.g. "ur5_ik"
         return source_code, stem
+
+    # Verify ssik version before attempting to import prebuilt artifacts
+    _verify_ssik_version()
 
     # Try ssik.prebuilt.<artifact_name>
     module_name = artifact_name if not artifact_name.endswith(".py") else artifact_name[:-3]
@@ -49,7 +101,7 @@ def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
     except ModuleNotFoundError:
         raise ImportError(
             f"Cannot find '{artifact_name}' as a file or as ssik.prebuilt.{module_name}. "
-            "Install ssik (`pip install ssik`) or provide a path to the artifact file."
+            "Install ssik (`pip install ssik==$(cat SSIK_VERSION.txt | cut -d= -f3)`) or provide a path to the artifact file."
         )
 
     source_code = inspect.getsource(mod)
@@ -64,6 +116,9 @@ def generate_artifact_from_urdf(
 ) -> Tuple[str, str]:
     """Generate a ssik artifact from a URDF using ``ssik build``.
 
+    Verifies that the installed ssik version matches the locked version
+    before generating the artifact.
+
     :param urdf_path: Path to the URDF file.
     :param base_link: Name of the base link in the URDF.
     :param ee_link: Name of the end-effector link in the URDF.
@@ -71,10 +126,14 @@ def generate_artifact_from_urdf(
         written.
     :returns: ``(source_code, module_stem)``.
     :raises RuntimeError: If ``ssik build`` exits with a non-zero status.
+    :raises ImportError: If the installed ssik version does not match the locked version.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = urdf_path.stem  # e.g. "ur5" from "ur5.urdf"
     out_path = output_dir / f"{stem}_ik.py"
+
+    # Verify ssik version before attempting to use ssik build
+    _verify_ssik_version()
 
     # Prefer the Python API (avoids shell PATH lookup and subprocess env issues).
     try:
