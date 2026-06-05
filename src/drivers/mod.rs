@@ -3,3 +3,4 @@
 pub mod franka_panda;
 pub mod piper;
 pub mod ur5;
+pub mod xarm7;
