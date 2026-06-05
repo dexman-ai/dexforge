@@ -40,13 +40,7 @@ mod test_data;
 /// Degrees of freedom of the UR5.
 pub const DOF: usize = 6;
 
-// --- tolerances (ssik DEFAULT_TOLERANCE_POLICY) ---
-const NUM_TOL: f64 = 1e-5; // subproblem_numerical (algebraic block)
-const DEG_TOL: f64 = 1e-12; // subproblem_degeneracy (algebraic block)
-
 // --- algebraic-block degeneracy constants from ur5_ik.py ---
-const DEG_SQ: f64 = 1e-16;
-const FEAS_TOL: f64 = 1e-8;
 const TWO_PI: f64 = 2.0 * PI;
 
 // --- baked KinBody constants (for FK verification) ---
@@ -137,7 +131,7 @@ pub fn solve(
 
     // Raw algebraic candidates (stack array, at most 8 for the UR5).
     let mut cands = [[0.0f64; 6]; 8];
-    let cand_count = solve_algebraic(t, &mut cands);
+    let cand_count = solve_algebraic(t, &mut cands, policy);
 
     for ci in 0..cand_count {
         let q = cands[ci];
@@ -317,7 +311,7 @@ fn refine6(
 // ---------------------------------------------------------------------------
 
 /// Fills `out` with the raw algebraic IK candidates and returns the count.
-fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8]) -> usize {
+fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8], policy: TolerancePolicy) -> usize {
     let r_00 = t[(0, 0)];
     let r_01 = t[(0, 1)];
     let r_02 = t[(0, 2)];
@@ -351,7 +345,7 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8]) -> usize {
     let p_sp = [p_16, NEG_P_5, r_06_axes5, NEG_AXES_5];
 
     let mut theta15 = [(0.0f64, 0.0f64); 4];
-    let n15 = sp6_solve(&h_sp, &k_sp, &p_sp, 0.10915, 0.0, NUM_TOL, DEG_TOL, &mut theta15);
+    let n15 = sp6_solve(&h_sp, &k_sp, &p_sp, 0.10915, 0.0, policy.subproblem_numerical, policy.subproblem_degeneracy, &mut theta15);
 
     for si in 0..n15 {
         let (q1, q5) = theta15[si];
@@ -469,12 +463,12 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8]) -> usize {
         let q3_phi = PI;
         let theta_q3_plus;
         let theta_q3_minus;
-        if q3_r_sq < DEG_SQ {
+        if q3_r_sq < policy.axis_parallel * policy.axis_parallel {
             theta_q3_plus = 0.0;
             theta_q3_minus = 0.0;
         } else {
             let q3_r = libm::sqrt(q3_r_sq);
-            if libm::fabs(q3_rhs) > q3_r + FEAS_TOL {
+            if libm::fabs(q3_rhs) > q3_r + policy.subproblem_feasibility {
                 let p = if q3_rhs > 0.0 { q3_phi } else { q3_phi + PI };
                 theta_q3_plus = p;
                 theta_q3_minus = p;
