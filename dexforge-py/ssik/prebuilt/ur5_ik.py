@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 import dexforge_py
-from ssik.core import Solution
+from ssik import Solution
 
 __all__ = [
     "BASE_LINK",
@@ -63,7 +63,7 @@ def fk(q: NDArray[np.float64]) -> NDArray[np.float64]:
     :returns: 4×4 SE(3) pose of ee_link in base_link
     """
     q_list = q.tolist() if hasattr(q, 'tolist') else list(q)
-    T = dexforge_py.fk("ur5", q_list)
+    T = dexforge_py.ur5_fk(q_list)
     return np.array(T, dtype=np.float64)
 
 
@@ -99,8 +99,7 @@ def solve(
         dedup_atol = 1e-3
     
     # Call dexforge_py
-    solutions_raw = dexforge_py.solve(
-        "ur5",
+    solutions_raw = dexforge_py.ur5_solve(
         T_target,
         max_solutions=max_solutions,
         q_seed=q_seed_list,
