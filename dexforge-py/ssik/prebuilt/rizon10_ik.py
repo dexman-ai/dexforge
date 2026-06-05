@@ -64,7 +64,7 @@ def fk(q: NDArray[np.float64]) -> NDArray[np.float64]:
     :returns: 4×4 SE(3) pose of flange in base_link
     """
     q_list = q.tolist() if hasattr(q, 'tolist') else list(q)
-    T = dexforge_py.fk("rizon10", q_list)
+    T = dexforge_py.rizon10_fk(q_list)
     return np.array(T, dtype=np.float64)
 
 
@@ -100,8 +100,7 @@ def solve(
         dedup_atol = 1e-3
     
     # Call dexforge_py
-    solutions_raw = dexforge_py.solve(
-        "rizon10",
+    solutions_raw = dexforge_py.rizon10_solve(
         T_target,
         max_solutions=max_solutions,
         q_seed=q_seed_list,
