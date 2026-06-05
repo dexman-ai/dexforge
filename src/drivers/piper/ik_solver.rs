@@ -743,8 +743,9 @@ mod tests {
     const SINGULAR_JOINT_TOL: f64 = 1e-3;
     // Cartesian FK-residual tolerance every returned Rust solution must satisfy
     // (max-abs entry of `fk(q) - target`). This is the Cartesian comparison that
-    // backs the relaxed joint tolerance at singularities.
-    const FK_RESIDUAL_TOL: f64 = 1e-4;
+    // backs the relaxed joint tolerance at singularities. Matches the FK closure
+    // tolerance of 1e-5 for consistency across all artifacts.
+    const FK_RESIDUAL_TOL: f64 = 1e-5;
 
     #[test]
     fn matches_ssik_reference_dataset() {
