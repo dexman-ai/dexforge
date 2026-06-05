@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 import dexforge_py
-from ssik import Solution
+from ssik.core import Solution
 
 __all__ = [
     "BASE_LINK",
@@ -101,6 +101,7 @@ def solve(
     
     # Call dexforge_py
     solutions_raw = dexforge_py.franka_panda_solve(
+        "franka_panda",
         T_target,
         max_solutions=max_solutions,
         q_seed=q_seed_list,

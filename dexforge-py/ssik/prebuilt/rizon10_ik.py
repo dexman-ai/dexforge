@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 import dexforge_py
-from ssik import Solution
+from ssik.core import Solution
 
 __all__ = [
     "BASE_LINK",
@@ -26,42 +26,29 @@ __all__ = [
     "solve",
 ]
 
-# --- Metadata constants (from ssik.prebuilt.rizon10_ik) ---
+# --- Metadata constants ---
 
 BASE_LINK = "base_link"
-EE_LINK = "flange"
+EE_LINK = "ee_link"
 DOF = 7
 SOLVER_NAME = "jointlock.seven_r"
 SOLVER_TIER = 1
 EXPECTED_MS_MEDIAN = 50.0
 FLOP_BUDGET = 30274
-DISPATCH_REASON = "7R jointlock (tier 1, Raghavan-Roth)"
+DISPATCH_REASON = "7R revolute chain. Locking one joint reduces to 6R IK."
 
-# Home pose: FK at q = np.zeros(DOF)
-T_HOME = np.array([
-    [6.123233995736761e-17, 3.6739403974420594e-16, 1.0, 0.09599999999999997],
-    [-1.2246467991473535e-16, 1.0, -3.6739403974420594e-16, -0.11300000000000002],
-    [-1.0, -1.2246467991473532e-16, 6.123233995736766e-17, 1.405],
-    [0.0, 0.0, 0.0, 1.0]
-], dtype=np.float64)
+# Home pose: computed at module import via FK(zeros)
+T_HOME = None
 
-# Joint limits (from Rizon 10 URDF)
-_JOINT_LIMITS = [
-    (-3.1416, 3.1416),
-    (-2.618, 2.618),
-    (-2.8798, 2.8798),
-    (-2.618, 2.618),
-    (-2.8798, 2.8798),
-    (-2.618, 2.618),
-    (-3.1416, 3.1416),
-]
+# Joint limits
+_JOINT_LIMITS = [(-2.7925, 2.7925), (-2.2689, 2.2689), (-2.7925, 2.7925), (-2.2689, 2.2689), (-2.7925, 2.7925), (-2.2689, 2.2689), (-2.9671, 2.9671)]
 
 
 def fk(q: NDArray[np.float64]) -> NDArray[np.float64]:
     """Forward kinematics.
     
     :param q: 7-element joint-angle vector in radians
-    :returns: 4×4 SE(3) pose of flange in base_link
+    :returns: 4×4 SE(3) pose of ee_link in base_link
     """
     q_list = q.tolist() if hasattr(q, 'tolist') else list(q)
     T = dexforge_py.rizon10_fk(q_list)
@@ -79,7 +66,7 @@ def solve(
 ) -> list[Solution]:
     """Inverse kinematics.
     
-    :param T_target: 4×4 SE(3) target pose of flange in base_link
+    :param T_target: 4×4 SE(3) target pose of ee_link in base_link
     :param max_solutions: cap on returned solutions (post-dedup, post-limits)
     :param q_seed: optional seed configuration for nearest-first sorting
     :param respect_limits: when True, filter solutions outside joint limits
@@ -125,3 +112,7 @@ def solve(
         ))
     
     return solutions
+
+
+# Compute T_HOME at module load time
+T_HOME = fk(np.zeros(DOF))

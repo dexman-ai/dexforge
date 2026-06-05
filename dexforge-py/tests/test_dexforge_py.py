@@ -1,6 +1,6 @@
 """Pytest suite for the dexforge_py Python interface.
 
-Cross-validates per-arm ``dexforge_py.prebuilt`` modules against the reference
+Cross-validates per-arm native ``dexforge_py`` functions against the reference
 Python ``ssik.prebuilt`` artifacts side by side, using random input poses.
 
 Run with::
@@ -31,17 +31,17 @@ import dexforge_py
 # ---------------------------------------------------------------------------
 # Arm registry
 # ---------------------------------------------------------------------------
-# Map canonical arm name -> prebuilt module name (without codebase prefix).
+# Map canonical arm name -> (prebuilt module name, native fk, native solve).
 # To add a new arm once its Rust driver is implemented:
-#   1. Add an entry here.
-#   2. Make sure both ssik.prebuilt and prebuilt have modules.
+#   1. Add an entry here with the native function names.
+#   2. Make sure ssik.prebuilt has a matching module.
 ARMS = {
-    "ur5": "ur5_ik",
-    "piper": "piper_ik",
-    "franka_panda": "franka_panda_ik",
-    "xarm7": "xarm7_ik",
-    "rizon4": "rizon4_ik",
-    "rizon10": "rizon10_ik",
+    "ur5": ("ur5_ik", dexforge_py.ur5_fk, dexforge_py.ur5_solve),
+    "piper": ("piper_ik", dexforge_py.piper_fk, dexforge_py.piper_solve),
+    "franka_panda": ("franka_panda_ik", dexforge_py.franka_panda_fk, dexforge_py.franka_panda_solve),
+    "xarm7": ("xarm7_ik", dexforge_py.xarm7_fk, dexforge_py.xarm7_solve),
+    "rizon4": ("rizon4_ik", dexforge_py.rizon4_fk, dexforge_py.rizon4_solve),
+    "rizon10": ("rizon10_ik", dexforge_py.rizon10_fk, dexforge_py.rizon10_solve),
 }
 
 TWO_PI = 2.0 * math.pi
@@ -60,23 +60,22 @@ def _q_close_mod(a: List[float], b: List[float], tol: float = DEDUP_TOL) -> bool
     )
 
 
-def _load_artifact(arm: str, code_base: str):
-    """Import and return the prebuilt module for the given arm from the specified codebase.
+def _load_ssik_artifact(arm: str):
+    """Import and return the ssik.prebuilt module for the given arm.
     
     Args:
         arm: Canonical arm name (e.g., 'ur5', 'franka_panda')
-        code_base: Either 'ssik.prebuilt' or 'prebuilt'
     
     Returns:
-        The imported module with solve() and fk() functions
+        The imported ssik.prebuilt module with solve() and fk() functions
     """
-    module_name = ARMS.get(arm)
+    module_name, _, _ = ARMS.get(arm, (None, None, None))
     if module_name is None:
         pytest.skip(f"arm '{arm}' is not in the ARMS registry; skipping")
     try:
-        return importlib.import_module(f"{code_base}.{module_name}")
+        return importlib.import_module(f"ssik.prebuilt.{module_name}")
     except ImportError as e:
-        pytest.skip(f"{code_base}.{module_name} not available for arm '{arm}': {e}")
+        pytest.skip(f"ssik.prebuilt.{module_name} not available for arm '{arm}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -98,20 +97,20 @@ def _random_poses(artifact, n: int, seed: int = 42):
 
 
 # ---------------------------------------------------------------------------
-# Test: cross-validation (Python artifact vs Rust dexforge_py)
+# Test: cross-validation (Python artifact vs native Rust dexforge_py)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("arm", list(ARMS))
 def test_cross_validate_solve(arm, request):
-    """For N random poses, dexforge_py must return the same solution set as
+    """For N random poses, dexforge_py native functions must return the same solution set as
     the Python ssik prebuilt artifact.
 
     Solution sets are compared modulo 2π with the same dedup tolerance used by
     the solver itself, matching the approach of the Rust reference test suite.
     """
     n = request.config.getoption("--n")
-    ssik_artifact = _load_artifact(arm, "ssik.prebuilt")
-    dexforge_artifact = _load_artifact(arm, "prebuilt")
+    ssik_artifact = _load_ssik_artifact(arm)
+    _, _, native_solve = ARMS[arm]
     poses = _random_poses(ssik_artifact, n)
 
     mismatches = 0
@@ -121,9 +120,9 @@ def test_cross_validate_solve(arm, request):
         py_sols = ssik_artifact.solve(T, respect_limits=False, allow_refinement=False)
         py_qs = [list(map(float, s.q)) for s in py_sols]
 
-        # Rust dexforge_py: same parameters.
+        # Rust dexforge_py native: same parameters.
         # Returns plain lists.
-        rust_qs = dexforge_artifact.solve(T, respect_limits=False, allow_refinement=False)
+        rust_qs = native_solve(T, respect_limits=False, allow_refinement=False)
 
         # Compare solution counts.
         if len(py_qs) != len(rust_qs):
@@ -143,10 +142,10 @@ def test_cross_validate_solve(arm, request):
 
 @pytest.mark.parametrize("arm", list(ARMS))
 def test_cross_validate_fk(arm, request):
-    """dexforge_py.fk must return the same FK matrix as the Python artifact's fk."""
+    """dexforge_py native fk must return the same FK matrix as the Python artifact's fk."""
     n = request.config.getoption("--n")
-    ssik_artifact = _load_artifact(arm, "ssik.prebuilt")
-    dexforge_artifact = _load_artifact(arm, "prebuilt")
+    ssik_artifact = _load_ssik_artifact(arm)
+    _, native_fk, _ = ARMS[arm]
     dof = ssik_artifact.DOF
     rng = np.random.default_rng(99)
     lims = ssik_artifact._JOINT_LIMITS
@@ -154,7 +153,7 @@ def test_cross_validate_fk(arm, request):
     for _ in range(n):
         q = np.array([rng.uniform(lo, hi) for lo, hi in lims])
         T_py = ssik_artifact.fk(q)
-        T_rust = dexforge_artifact.fk(q)
+        T_rust = np.array(native_fk(q.tolist()), dtype=np.float64)
         np.testing.assert_allclose(
             T_rust, T_py, atol=1e-12,
             err_msg=f"{arm}: fk mismatch at q={q}"
@@ -167,40 +166,41 @@ def test_cross_validate_fk(arm, request):
 
 def test_unreachable_pose_returns_empty():
     """A pose far outside the workspace should return no solutions."""
-    from prebuilt import ur5_ik
+    _, _, native_solve = ARMS["ur5"]
     T = np.eye(4)
     T[:3, 3] = [100.0, 100.0, 100.0]
-    solutions = ur5_ik.solve(T, respect_limits=False)
+    solutions = native_solve(T, respect_limits=False)
     assert solutions == []
 
 
 def test_solve_accepts_list_of_lists():
     """solve() must accept a plain Python list-of-lists for T_target."""
-    from prebuilt import ur5_ik
+    _, _, native_solve = ARMS["ur5"]
     T = [
         [1.0, 0.0, 0.0, 0.3],
         [0.0, 1.0, 0.0, 0.1],
         [0.0, 0.0, 1.0, 0.5],
         [0.0, 0.0, 0.0, 1.0],
     ]
-    result = ur5_ik.solve(T, respect_limits=False)
+    result = native_solve(T, respect_limits=False)
     assert isinstance(result, list)
 
 
 def test_fk_wrong_dof_raises():
     """fk() must raise ValueError when q has the wrong length."""
-    from prebuilt import ur5_ik, franka_panda_ik
+    _, ur5_fk, _ = ARMS["ur5"]
+    _, franka_fk, _ = ARMS["franka_panda"]
     with pytest.raises(ValueError, match="requires"):
-        ur5_ik.fk([0.0] * 7)
+        ur5_fk([0.0] * 7)
     with pytest.raises(ValueError, match="requires"):
-        franka_panda_ik.fk([0.0] * 6)
+        franka_fk([0.0] * 6)
 
 
 def test_fk_returns_valid_se3():
     """fk() must return a 4×4 matrix with a valid rotation block and [0,0,0,1] bottom row."""
-    from prebuilt import ur5_ik
+    _, ur5_fk, _ = ARMS["ur5"]
     q = [0.0] * 6
-    T = ur5_ik.fk(q)
+    T = np.array(ur5_fk(q), dtype=np.float64)
     assert T.shape == (4, 4)
     R = T[:3, :3]
     np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-10)
@@ -209,22 +209,22 @@ def test_fk_returns_valid_se3():
 
 def test_q_seed_accepted():
     """q_seed keyword argument must be accepted without error."""
-    from prebuilt import ur5_ik
-    from ssik.prebuilt import ur5_ik as ssik_ur5_ik
-    T = ssik_ur5_ik.T_HOME.copy()
+    ssik_artifact = _load_ssik_artifact("ur5")
+    _, _, native_solve = ARMS["ur5"]
+    T = ssik_artifact.T_HOME.copy()
     T[0, 3] = 0.3
     seed = [0.0] * 6
-    result = ur5_ik.solve(T, q_seed=seed, respect_limits=False)
+    result = native_solve(T, q_seed=seed, respect_limits=False)
     assert isinstance(result, list)
 
 
 def test_max_solutions_caps_output():
     """max_solutions must limit the number of returned solutions."""
-    from prebuilt import ur5_ik
-    from ssik.prebuilt import ur5_ik as ssik_ur5_ik
-    T = ssik_ur5_ik.T_HOME.copy()
+    ssik_artifact = _load_ssik_artifact("ur5")
+    _, _, native_solve = ARMS["ur5"]
+    T = ssik_artifact.T_HOME.copy()
     T[0, 3] = 0.3
-    result = ur5_ik.solve(T, max_solutions=2, respect_limits=False)
+    result = native_solve(T, max_solutions=2, respect_limits=False)
     assert len(result) <= 2
 
 
@@ -234,15 +234,15 @@ def test_max_solutions_caps_output():
 
 @pytest.mark.parametrize("arm", list(ARMS))
 def test_perf_solve(arm, request):
-    """Wall-clock timing for Python vs Rust solve().
+    """Wall-clock timing for Python vs native Rust solve().
 
     Printed only when ``--perf`` is passed; otherwise runs as a fast
     correctness smoke test.
     """
     n = max(request.config.getoption("--n"), 100)
     do_perf = request.config.getoption("--perf")
-    ssik_artifact = _load_artifact(arm, "ssik.prebuilt")
-    dexforge_artifact = _load_artifact(arm, "prebuilt")
+    ssik_artifact = _load_ssik_artifact(arm)
+    _, _, native_solve = ARMS[arm]
     poses = _random_poses(ssik_artifact, n)
 
     # ── Python ssik artifact ──────────────────────────────────────────────
@@ -251,10 +251,10 @@ def test_perf_solve(arm, request):
         ssik_artifact.solve(T, respect_limits=False, allow_refinement=False)
     t_py = time.perf_counter() - t0
 
-    # ── Rust via dexforge_py ──────────────────────────────────────────────
+    # ── Native Rust via dexforge_py ──────────────────────────────────────────────
     t0 = time.perf_counter()
     for T in poses:
-        dexforge_artifact.solve(T, respect_limits=False, allow_refinement=False)
+        native_solve(T, respect_limits=False, allow_refinement=False)
     t_rust = time.perf_counter() - t0
 
     if do_perf:
@@ -267,5 +267,5 @@ def test_perf_solve(arm, request):
 
     # Minimal correctness check: at least one pose should produce solutions.
     assert any(
-        len(dexforge_artifact.solve(T, respect_limits=False)) > 0 for T in poses[:5]
+        len(native_solve(T, respect_limits=False)) > 0 for T in poses[:5]
     )

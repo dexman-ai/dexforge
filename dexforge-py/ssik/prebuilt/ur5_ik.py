@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 import dexforge_py
-from ssik import Solution
+from ssik.core import Solution
 
 __all__ = [
     "BASE_LINK",

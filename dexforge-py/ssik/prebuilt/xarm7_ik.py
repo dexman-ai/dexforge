@@ -10,7 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 import dexforge_py
-from ssik import Solution
+from ssik.core import Solution
 
 __all__ = [
     "BASE_LINK",
@@ -26,7 +26,7 @@ __all__ = [
     "solve",
 ]
 
-# --- Metadata constants (from ssik.prebuilt.xarm7_ik) ---
+# --- Metadata constants ---
 
 BASE_LINK = "base_link"
 EE_LINK = "ee_link"
@@ -35,26 +35,13 @@ SOLVER_NAME = "jointlock.seven_r"
 SOLVER_TIER = 1
 EXPECTED_MS_MEDIAN = 50.0
 FLOP_BUDGET = 30274
-DISPATCH_REASON = "7R jointlock (tier 1)"
+DISPATCH_REASON = "7R revolute chain. Locking one joint reduces to 6R IK."
 
-# Home pose: FK at q = np.zeros(DOF)
-T_HOME = np.array([
-    [1.0, 0.0, 0.0, 0.20600000000000002],
-    [0.0, -0.9999999999999987, -4.4408920985006217e-16, -2.0572432646304143e-16],
-    [0.0, 4.4408920985006217e-16, -0.9999999999999987, 0.8444999999999997],
-    [0.0, 0.0, 0.0, 1.0]
-], dtype=np.float64)
+# Home pose: computed at module import via FK(zeros)
+T_HOME = None
 
-# Joint limits (from xArm7 URDF)
-_JOINT_LIMITS = [
-    (-6.283185307179586, 6.283185307179586),
-    (-2.059, 2.0944),
-    (-6.283185307179586, 6.283185307179586),
-    (-0.19198, 3.927),
-    (-6.283185307179586, 6.283185307179586),
-    (-1.69297, 3.141592653589793),
-    (-6.283185307179586, 6.283185307179586),
-]
+# Joint limits
+_JOINT_LIMITS = [(-6.28318530717959, 6.28318530717959), (-2.059, 2.0944), (-6.28318530717959, 6.28318530717959), (-0.19198, 3.927), (-6.28318530717959, 6.28318530717959), (-1.69297, 3.14159265358979), (-6.28318530717959, 6.28318530717959)]
 
 
 def fk(q: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -125,3 +112,7 @@ def solve(
         ))
     
     return solutions
+
+
+# Compute T_HOME at module load time
+T_HOME = fk(np.zeros(DOF))
