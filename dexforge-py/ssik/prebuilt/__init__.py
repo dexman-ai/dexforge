@@ -7,10 +7,14 @@ Available arms:
 - ur5_ik
 - piper_ik
 - franka_panda_ik
+- rizon4_ik (Flexiv Rizon 4, ssik passthrough)
+- rizon10_ik (Flexiv Rizon 10, ssik passthrough)
 """
 
 __all__ = [
     "ur5_ik",
     "piper_ik",
     "franka_panda_ik",
+    "rizon4_ik",
+    "rizon10_ik",
 ]
