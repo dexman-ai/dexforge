@@ -48,10 +48,9 @@
 use nalgebra::SMatrix;
 
 use crate::math::kinematics::{
-    compose, frob_diff, norm12, se3_inv, Transform, IDENTITY, LM_CONVERGENCE_THRESHOLD,
-    LM_INITIAL_LAMBDA, LM_LAMBDA_DECAY, LM_LAMBDA_GROWTH, LM_LAMBDA_MAX, LM_LAMBDA_MIN,
-    LM_BACKTRACK_MAX, REFINE_EPS,
+    compose, frob_diff, lm_refine_masked, pose_residual12, se3_inv, Transform, IDENTITY,
 };
+use crate::math::postprocess::{dedup_solutions, q_close};
 use crate::math::ssik_core::{
     add3, dot3, mat3_mul, mat3_transpose, mat3_vec, mat3t_vec, neg3, norm3, rotate,
     rotation_matrix, sp1_solve, sp3_solve, sp4_solve, sp5_solve, sub3, wrap_to_pi,
@@ -379,7 +378,7 @@ fn verify_inner(
         // Dedup vs already-kept survivors (wrap-to-pi within DEDUP_TOL).
         let mut dup = usize::MAX;
         for j in 0..n {
-            if q_close6(&q, &out[j], DEDUP_TOL) {
+            if q_close::<6>(&q, &out[j], DEDUP_TOL) {
                 dup = j;
                 break;
             }
@@ -396,26 +395,6 @@ fn verify_inner(
     n
 }
 
-#[inline]
-fn q_close6(a: &[f64; 6], b: &[f64; 6], tol: f64) -> bool {
-    for i in 0..6 {
-        if libm::fabs(wrap_to_pi(a[i] - b[i])) > tol {
-            return false;
-        }
-    }
-    true
-}
-
-#[inline]
-fn q_close7(a: &[f64; 7], b: &[f64; 7], tol: f64) -> bool {
-    for i in 0..7 {
-        if libm::fabs(wrap_to_pi(a[i] - b[i])) > tol {
-            return false;
-        }
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Shared Newton refinement
 // ---------------------------------------------------------------------------
@@ -423,24 +402,6 @@ fn q_close7(a: &[f64; 7], b: &[f64; 7], tol: f64) -> bool {
 /// Iteration ceiling for the Levenberg-Marquardt pose-refinement polish.
 #[cfg(test)]
 const REFINE_ITERS: usize = 60;
-
-/// 12-vector pose residual `[vec(R(q) - R_t); t(q) - t_t]` of the full 7R FK.
-#[inline]
-fn residual12(q: &[f64; 7], target: &Transform) -> [f64; 12] {
-    let tf = fk7(q);
-    let mut r = [0.0f64; 12];
-    let mut k = 0usize;
-    for i in 0..3 {
-        for j in 0..3 {
-            r[k] = tf.r[i][j] - target.r[i][j];
-            k += 1;
-        }
-    }
-    for i in 0..3 {
-        r[9 + i] = tf.t[i] - target.t[i];
-    }
-    r
-}
 
 /// Levenberg-Marquardt polish of a 7R configuration onto the exact pose root,
 /// **holding the locked joint 4 fixed**.
@@ -454,72 +415,13 @@ fn residual12(q: &[f64; 7], target: &Transform) -> [f64; 12] {
 /// generator (`scripts/generate_xarm7_test_data.py`) — which applies the
 /// identical step — converge to the same configuration well within the `1e-5`
 /// test tolerance. The iteration count is hard-bounded by `max_iters`.
+///
+/// Delegates to the shared joint-masked LM loop
+/// [`crate::math::kinematics::lm_refine_masked`] with the locked joint 4
+/// excluded from the free set.
 fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
     const FREE: [usize; 6] = [0, 1, 2, 3, 5, 6];
-    let mut q = *q_in;
-    let mut lambda = LM_INITIAL_LAMBDA;
-    let mut r = residual12(&q, target);
-    let mut rn = norm12(&r);
-
-    for _ in 0..max_iters {
-        if rn < LM_CONVERGENCE_THRESHOLD {
-            break;
-        }
-        // Finite-difference Jacobian J (12x6) over the free joints.
-        let mut jac = SMatrix::<f64, 12, 6>::zeros();
-        for (c, &jidx) in FREE.iter().enumerate() {
-            let mut qp = q;
-            qp[jidx] += REFINE_EPS;
-            let rp = residual12(&qp, target);
-            for row in 0..12 {
-                jac[(row, c)] = (rp[row] - r[row]) / REFINE_EPS;
-            }
-        }
-        let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
-        let jt = jac.transpose();
-        let jtj = jt * jac; // 6x6
-        let jtr = jt * rv; // 6x1
-
-        // Levenberg-Marquardt damped step with one accept/reject backtrack
-        // ladder; lambda grows until the step decreases the residual.
-        let mut accepted = false;
-        for _ in 0..LM_BACKTRACK_MAX {
-            let mut damped = jtj;
-            for d in 0..6 {
-                damped[(d, d)] += lambda;
-            }
-            let inv = match damped.try_inverse() {
-                Some(m) => m,
-                None => {
-                    lambda *= LM_LAMBDA_GROWTH;
-                    continue;
-                }
-            };
-            let dq = inv * jtr;
-            let mut q_trial = q;
-            for (c, &jidx) in FREE.iter().enumerate() {
-                q_trial[jidx] -= dq[(c, 0)];
-            }
-            let r_trial = residual12(&q_trial, target);
-            let rn_trial = norm12(&r_trial);
-            if rn_trial < rn {
-                q = q_trial;
-                r = r_trial;
-                rn = rn_trial;
-                lambda = (lambda * LM_LAMBDA_DECAY).max(LM_LAMBDA_MIN);
-                accepted = true;
-                break;
-            }
-            lambda *= LM_LAMBDA_GROWTH;
-            if lambda > LM_LAMBDA_MAX {
-                break;
-            }
-        }
-        if !accepted {
-            break;
-        }
-    }
-    q
+    lm_refine_masked::<7, 6, _>(q_in, &FREE, |q| pose_residual12(&fk7(q), target), max_iters)
 }
 
 // ---------------------------------------------------------------------------
@@ -666,7 +568,7 @@ pub fn solve(
     // First dedup (mirrors `seven_r.solve`'s `dedup_by_wrap_close`).
     let mut d1_q = [[0.0f64; 7]; CAND_CAP];
     let mut d1_res = [0.0f64; CAND_CAP];
-    let n_d1 = dedup7(&cand_q, &cand_res, n_cand, &mut d1_q, &mut d1_res, dedup_atol);
+    let n_d1 = dedup_solutions::<7, CAND_CAP>(&cand_q, &cand_res, n_cand, &mut d1_q, &mut d1_res, dedup_atol);
 
     // Outer 7R FK verification, then final dedup (mirrors the prebuilt
     // `solve` body).
@@ -688,7 +590,7 @@ pub fn solve(
 
     let mut f_q = [[0.0f64; 7]; CAND_CAP];
     let mut f_res = [0.0f64; CAND_CAP];
-    let n_final = dedup7(&v_q, &v_res, n_v, &mut f_q, &mut f_res, dedup_atol);
+    let n_final = dedup_solutions::<7, CAND_CAP>(&v_q, &v_res, n_v, &mut f_q, &mut f_res, dedup_atol);
 
     let mut sol_count = 0usize;
     for i in 0..n_final {
@@ -794,37 +696,6 @@ fn seed_dist7(q: &[f64; 7], seed: &[f64; 7]) -> f64 {
         s += d * d;
     }
     s
-}
-
-/// Dedup 7-vectors by wrap-to-pi closeness within `tol`, keeping the
-/// lower-residual representative on collision (first-match-wins ordering).
-fn dedup7(
-    q: &[[f64; 7]; CAND_CAP],
-    res: &[f64; CAND_CAP],
-    n: usize,
-    out_q: &mut [[f64; 7]; CAND_CAP],
-    out_res: &mut [f64; CAND_CAP],
-    tol: f64,
-) -> usize {
-    let mut m = 0usize;
-    for i in 0..n {
-        let mut dup = usize::MAX;
-        for j in 0..m {
-            if q_close7(&q[i], &out_q[j], tol) {
-                dup = j;
-                break;
-            }
-        }
-        if dup == usize::MAX {
-            out_q[m] = q[i];
-            out_res[m] = res[i];
-            m += 1;
-        } else if res[i] < out_res[dup] {
-            out_q[dup] = q[i];
-            out_res[dup] = res[i];
-        }
-    }
-    m
 }
 
 // ---------------------------------------------------------------------------

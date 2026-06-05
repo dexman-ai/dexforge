@@ -11,15 +11,17 @@
 //! * **Pose residual norm**: [`norm12`]
 //! * **Rigid-transform type**: [`Transform`], [`IDENTITY`], [`compose`],
 //!   [`se3_inv`], [`frob_diff`]
-//! * **Shared LM tuning constants** and **generic const-DOF refinement loop**:
-//!   [`lm_refine`], [`lm_refine6`]
+//! * **Shared LM tuning constants** and **generic const-DOF refinement loops**:
+//!   [`lm_refine`], [`lm_refine6`] (refine all DOF) and [`lm_refine_masked`]
+//!   (refine a subset of joints, holding the rest fixed)
 //!
 //! # What stays in each driver
 //!
 //! * Arm-specific FK (`fk`, `fk7`, `fk_sub`, …) and the pose-residual
 //!   functions that call them — they encode per-arm kinematics constants.
-//! * Franka `refine7` — its joint-masking strategy is specific to the
-//!   `jointlock.seven_r` redundancy resolution and lives only there.
+//! * Each 7R `jointlock.seven_r` driver's `refine7` is now a thin wrapper that
+//!   selects the free-joint set (excluding the locked joint) and delegates to
+//!   the shared [`lm_refine_masked`] loop.
 //! * Piper `spatial_bypass` and perturbation constants — the 10 µm
 //!   deterministic singularity escape is specific to the Raghavan-Roth
 //!   polynomial-system condition check of that driver.
@@ -258,6 +260,78 @@ pub fn lm_refine<const DOF: usize, F>(
 where
     F: Fn(&[f64; DOF]) -> [f64; 12],
 {
+    // Refine all DOF joints (free = [0, 1, …, DOF−1]).
+    let free: [usize; DOF] = core::array::from_fn(|i| i);
+    let (q, rn) = lm_refine_core::<DOF, DOF, F>(q_in, &free, residual_fn, max_iters);
+    if rn <= fk_atol {
+        Some(q)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Joint-masked Levenberg-Marquardt refinement
+// ---------------------------------------------------------------------------
+
+/// Bounded Levenberg-Marquardt polish that refines **only a subset of joints**.
+///
+/// This is the universal masked LM loop shared by every redundant 7R
+/// `jointlock.seven_r` driver (Franka, xArm7, Rizon).  Those solvers collapse
+/// a redundant arm to a 6R sub-problem by locking one joint to a sample value;
+/// the polish must then refine the remaining free joints while **holding the
+/// locked joint fixed**, otherwise the redundant arm would drift along its
+/// self-motion manifold instead of converging onto the isolated root.
+///
+/// The set of free joints is supplied as `free` (a `[usize; FREE]` array of
+/// joint indices into the `DOF`-vector); the locked joint is simply any index
+/// absent from `free`.  Both the full joint count `DOF` and the free-joint
+/// count `FREE` are const generic parameters, so every matrix
+/// (Jacobian `J : 12×FREE`, normal equations `JᵀJ : FREE×FREE`, step
+/// `dq : FREE×1`) lives entirely on the stack — no heap, `#![no_std]`-safe,
+/// and hard-bounded by `max_iters`.
+///
+/// `residual_fn(q)` must return the standard 12-vector pose residual
+/// `[vec(R(q) − R_t); t(q) − t_t]` of the **full** `DOF`-joint FK.
+///
+/// Unlike [`lm_refine`], this returns the refined joint vector unconditionally
+/// (the redundant-arm drivers FK-verify and de-duplicate the result
+/// downstream, so there is no convergence/`fk_atol` gate here).
+///
+/// # Examples
+///
+/// ```ignore
+/// // 7R arm with joint 4 locked: refine joints {0,1,2,3,5,6}.
+/// const FREE: [usize; 6] = [0, 1, 2, 3, 5, 6];
+/// let q = lm_refine_masked::<7, 6, _>(&q7, &FREE, |q| residual12(q, &target), max_iters);
+/// ```
+pub fn lm_refine_masked<const DOF: usize, const FREE: usize, F>(
+    q_in: &[f64; DOF],
+    free: &[usize; FREE],
+    residual_fn: F,
+    max_iters: usize,
+) -> [f64; DOF]
+where
+    F: Fn(&[f64; DOF]) -> [f64; 12],
+{
+    lm_refine_core::<DOF, FREE, F>(q_in, free, residual_fn, max_iters).0
+}
+
+/// Shared accept/reject LM core driving both [`lm_refine`] and
+/// [`lm_refine_masked`].
+///
+/// Refines the joints listed in `free` and returns the refined joint vector
+/// together with the final 12-vector residual norm so callers can apply their
+/// own convergence gate (or ignore it).
+fn lm_refine_core<const DOF: usize, const FREE: usize, F>(
+    q_in: &[f64; DOF],
+    free: &[usize; FREE],
+    residual_fn: F,
+    max_iters: usize,
+) -> ([f64; DOF], f64)
+where
+    F: Fn(&[f64; DOF]) -> [f64; 12],
+{
     let mut q = *q_in;
     let mut lambda = LM_INITIAL_LAMBDA;
     let mut r = residual_fn(&q);
@@ -267,26 +341,26 @@ where
         if rn < LM_CONVERGENCE_THRESHOLD {
             break;
         }
-        // Finite-difference Jacobian J (12×DOF) over all DOF joints.
-        let mut jac = SMatrix::<f64, 12, DOF>::zeros();
-        for col in 0..DOF {
+        // Finite-difference Jacobian J (12×FREE) over the free joints.
+        let mut jac = SMatrix::<f64, 12, FREE>::zeros();
+        for (c, &jidx) in free.iter().enumerate() {
             let mut qp = q;
-            qp[col] += REFINE_EPS;
+            qp[jidx] += REFINE_EPS;
             let rp = residual_fn(&qp);
             for row in 0..12 {
-                jac[(row, col)] = (rp[row] - r[row]) / REFINE_EPS;
+                jac[(row, c)] = (rp[row] - r[row]) / REFINE_EPS;
             }
         }
         let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
         let jt = jac.transpose();
-        let jtj = jt * jac; // DOF×DOF
-        let jtr = jt * rv; // DOF×1
+        let jtj = jt * jac; // FREE×FREE
+        let jtr = jt * rv; // FREE×1
 
         // Adaptive LM damping with accept/reject backtrack.
         let mut accepted = false;
         for _ in 0..LM_BACKTRACK_MAX {
             let mut damped = jtj;
-            for d in 0..DOF {
+            for d in 0..FREE {
                 damped[(d, d)] += lambda;
             }
             let inv = match damped.try_inverse() {
@@ -298,8 +372,8 @@ where
             };
             let dq = inv * jtr;
             let mut q_trial = q;
-            for col in 0..DOF {
-                q_trial[col] -= dq[(col, 0)];
+            for (c, &jidx) in free.iter().enumerate() {
+                q_trial[jidx] -= dq[(c, 0)];
             }
             let r_trial = residual_fn(&q_trial);
             let rn_trial = norm12(&r_trial);
@@ -321,11 +395,7 @@ where
         }
     }
 
-    if rn <= fk_atol {
-        Some(q)
-    } else {
-        None
-    }
+    (q, rn)
 }
 
 /// Bounded Levenberg-Marquardt polish for a **6-DOF** joint vector.
