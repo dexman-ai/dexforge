@@ -13,5 +13,5 @@ dependencies = ["scipy", "numpy"]
 [tool.maturin]
 module-name = "dexforge_py"
 manifest-path = "Cargo.toml"
-# Include Python-only packages: ssik compatibility layer and dexforge_py wrappers
-python-packages = ["ssik", "dexforge_py"]
+# Include Python-only packages: ssik compatibility layer and prebuilt wrappers
+python-packages = ["ssik", "prebuilt"]

@@ -34,14 +34,14 @@ import dexforge_py
 # Map canonical arm name -> prebuilt module name (without codebase prefix).
 # To add a new arm once its Rust driver is implemented:
 #   1. Add an entry here.
-#   2. Make sure both ssik.prebuilt and dexforge_py.prebuilt have modules.
+#   2. Make sure both ssik.prebuilt and prebuilt have modules.
 ARMS = {
-    "ur5": "prebuilt.ur5_ik",
-    "piper": "prebuilt.piper_ik",
-    "franka_panda": "prebuilt.franka_panda_ik",
-    "xarm7": "prebuilt.xarm7_ik",
-    "rizon4": "prebuilt.rizon4_ik",
-    "rizon10": "prebuilt.rizon10_ik",
+    "ur5": "ur5_ik",
+    "piper": "piper_ik",
+    "franka_panda": "franka_panda_ik",
+    "xarm7": "xarm7_ik",
+    "rizon4": "rizon4_ik",
+    "rizon10": "rizon10_ik",
 }
 
 TWO_PI = 2.0 * math.pi
@@ -65,7 +65,7 @@ def _load_artifact(arm: str, code_base: str):
     
     Args:
         arm: Canonical arm name (e.g., 'ur5', 'franka_panda')
-        code_base: Either 'ssik' or 'dexforge_py'
+        code_base: Either 'ssik.prebuilt' or 'prebuilt'
     
     Returns:
         The imported module with solve() and fk() functions
@@ -110,8 +110,8 @@ def test_cross_validate_solve(arm, request):
     the solver itself, matching the approach of the Rust reference test suite.
     """
     n = request.config.getoption("--n")
-    ssik_artifact = _load_artifact(arm, "ssik")
-    dexforge_artifact = _load_artifact(arm, "dexforge_py")
+    ssik_artifact = _load_artifact(arm, "ssik.prebuilt")
+    dexforge_artifact = _load_artifact(arm, "prebuilt")
     poses = _random_poses(ssik_artifact, n)
 
     mismatches = 0
@@ -145,8 +145,8 @@ def test_cross_validate_solve(arm, request):
 def test_cross_validate_fk(arm, request):
     """dexforge_py.fk must return the same FK matrix as the Python artifact's fk."""
     n = request.config.getoption("--n")
-    ssik_artifact = _load_artifact(arm, "ssik")
-    dexforge_artifact = _load_artifact(arm, "dexforge_py")
+    ssik_artifact = _load_artifact(arm, "ssik.prebuilt")
+    dexforge_artifact = _load_artifact(arm, "prebuilt")
     dof = ssik_artifact.DOF
     rng = np.random.default_rng(99)
     lims = ssik_artifact._JOINT_LIMITS
@@ -167,7 +167,7 @@ def test_cross_validate_fk(arm, request):
 
 def test_unreachable_pose_returns_empty():
     """A pose far outside the workspace should return no solutions."""
-    from dexforge_py.prebuilt import ur5_ik
+    from prebuilt import ur5_ik
     T = np.eye(4)
     T[:3, 3] = [100.0, 100.0, 100.0]
     solutions = ur5_ik.solve(T, respect_limits=False)
@@ -176,7 +176,7 @@ def test_unreachable_pose_returns_empty():
 
 def test_solve_accepts_list_of_lists():
     """solve() must accept a plain Python list-of-lists for T_target."""
-    from dexforge_py.prebuilt import ur5_ik
+    from prebuilt import ur5_ik
     T = [
         [1.0, 0.0, 0.0, 0.3],
         [0.0, 1.0, 0.0, 0.1],
@@ -189,7 +189,7 @@ def test_solve_accepts_list_of_lists():
 
 def test_fk_wrong_dof_raises():
     """fk() must raise ValueError when q has the wrong length."""
-    from dexforge_py.prebuilt import ur5_ik, franka_panda_ik
+    from prebuilt import ur5_ik, franka_panda_ik
     with pytest.raises(ValueError, match="requires"):
         ur5_ik.fk([0.0] * 7)
     with pytest.raises(ValueError, match="requires"):
@@ -198,7 +198,7 @@ def test_fk_wrong_dof_raises():
 
 def test_fk_returns_valid_se3():
     """fk() must return a 4×4 matrix with a valid rotation block and [0,0,0,1] bottom row."""
-    from dexforge_py.prebuilt import ur5_ik
+    from prebuilt import ur5_ik
     q = [0.0] * 6
     T = ur5_ik.fk(q)
     assert T.shape == (4, 4)
@@ -209,7 +209,7 @@ def test_fk_returns_valid_se3():
 
 def test_q_seed_accepted():
     """q_seed keyword argument must be accepted without error."""
-    from dexforge_py.prebuilt import ur5_ik
+    from prebuilt import ur5_ik
     from ssik.prebuilt import ur5_ik as ssik_ur5_ik
     T = ssik_ur5_ik.T_HOME.copy()
     T[0, 3] = 0.3
@@ -220,7 +220,7 @@ def test_q_seed_accepted():
 
 def test_max_solutions_caps_output():
     """max_solutions must limit the number of returned solutions."""
-    from dexforge_py.prebuilt import ur5_ik
+    from prebuilt import ur5_ik
     from ssik.prebuilt import ur5_ik as ssik_ur5_ik
     T = ssik_ur5_ik.T_HOME.copy()
     T[0, 3] = 0.3
@@ -241,8 +241,8 @@ def test_perf_solve(arm, request):
     """
     n = max(request.config.getoption("--n"), 100)
     do_perf = request.config.getoption("--perf")
-    ssik_artifact = _load_artifact(arm, "ssik")
-    dexforge_artifact = _load_artifact(arm, "dexforge_py")
+    ssik_artifact = _load_artifact(arm, "ssik.prebuilt")
+    dexforge_artifact = _load_artifact(arm, "prebuilt")
     poses = _random_poses(ssik_artifact, n)
 
     # ── Python ssik artifact ──────────────────────────────────────────────
