@@ -1,4 +1,4 @@
-# ssik-rust
+# dexforge
 
 Zero-allocation, `#![no_std]` analytical inverse kinematics translated from the
 Python [`ssik`](https://github.com/personalrobotics/ssik) prebuilt artifacts.
@@ -28,7 +28,7 @@ hardcoded iteration ceiling so worst-case execution time is bounded.
 | `scripts/generate_piper_pq.py` | Regenerates the Piper `pq.rs` matrix builder from the Python artifact. |
 | `scripts/generate_piper_test_data.py` | Regenerates the Piper `test_data.rs` from the reference Python solver. |
 | `examples/piper_solve.rs` | Host harness that runs the Piper solver on stdin poses (used by the Piper data generator). |
-| `dexforge-py/` | Secondary crate: Python bindings (pyo3) wrapping `ssik-rust`. |
+| `dexforge-py/` | Secondary crate: Python bindings (pyo3) wrapping `dexforge`. |
 
 ## Rust interface
 

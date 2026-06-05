@@ -1,4 +1,4 @@
-//! Python bindings for `ssik-rust` analytical inverse kinematics.
+//! Python bindings for `dexforge` analytical inverse kinematics.
 //!
 //! Exposes two functions whose signatures mirror the Python `ssik` prebuilt
 //! artifact interface (e.g. `ssik.prebuilt.ur5_ik`), plus an `arm` name
@@ -17,7 +17,7 @@
 //!
 //! # Adding a new arm driver
 //!
-//! 1. Implement the driver in `ssik-rust/src/drivers/<arm>/ik_solver.rs`
+//! 1. Implement the driver in `dexforge/src/drivers/<arm>/ik_solver.rs`
 //!    (expose `fk`, `solve`, and `TolerancePolicy::DEFAULT`).
 //! 2. In `solve()` below, add a new `"<arm>" | "<arm>_ik"` match arm.
 //! 3. In `fk()` below, add the corresponding match arm.

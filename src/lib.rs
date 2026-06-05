@@ -1,4 +1,4 @@
-//! `ssik-rust`: zero-allocation, `#![no_std]` analytical inverse kinematics.
+//! `dexforge`: zero-allocation, `#![no_std]` analytical inverse kinematics.
 //!
 //! This crate is a faithful translation of the Python `ssik` prebuilt IK
 //! artifacts (<https://github.com/personalrobotics/ssik>) into a deterministic,
