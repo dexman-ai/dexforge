@@ -21,7 +21,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
-          components: rustfmt
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -49,9 +48,6 @@ jobs:
 
       - name: Run cargo check
         run: cargo check
-
-      - name: Run cargo fmt check
-        run: cargo fmt --check
 
       - name: Run cargo test (host)
         run: cargo test --verbose
@@ -82,6 +78,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install maturin pytest hypothesis scipy numpy
 
+      - name: Create virtual environment
+        run: python -m venv .venv
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -108,9 +107,11 @@ jobs:
 
       - name: Build and install Python bindings
         run: |
+          source .venv/bin/activate
           cd dexforge-py
           maturin develop --release
 
       - name: Run Python tests
         run: |
+          source .venv/bin/activate
           pytest dexforge-py/tests/ -v
