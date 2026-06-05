@@ -49,6 +49,9 @@ pub const DEFAULT_TOLERANCE_POLICY: TolerancePolicy = TolerancePolicy {
 };
 
 impl TolerancePolicy {
+    /// Default policy matching the Python `DEFAULT_TOLERANCE_POLICY`.
+    pub const DEFAULT: Self = DEFAULT_TOLERANCE_POLICY;
+
     /// Create a new tolerance policy with all default values.
     #[inline]
     pub const fn new() -> Self {

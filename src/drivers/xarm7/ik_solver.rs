@@ -47,6 +47,7 @@
 
 use nalgebra::SMatrix;
 
+pub use crate::math::tolerances::TolerancePolicy;
 use crate::math::kinematics::{
     compose, frob_diff, norm12, se3_inv, Transform, IDENTITY, LM_CONVERGENCE_THRESHOLD,
     LM_INITIAL_LAMBDA, LM_LAMBDA_DECAY, LM_LAMBDA_GROWTH, LM_LAMBDA_MAX, LM_LAMBDA_MIN,
@@ -120,31 +121,6 @@ pub const T_HOME: [[f64; 4]; 4] = [
     ],
     [0.0, 0.0, 0.0, 1.0],
 ];
-
-/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
-///
-/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
-/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
-/// `subproblem_dedup = 1e-3`).
-#[derive(Clone, Copy, Debug)]
-pub struct TolerancePolicy {
-    /// FK closure tolerance (== `subproblem_numerical`). Candidates whose
-    /// Frobenius-norm FK residual exceeds this value are rejected (or polished
-    /// when `allow_refinement = true`).
-    pub fk_atol: f64,
-    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`). Two
-    /// configurations that agree to within this value per joint (mod `2*pi`)
-    /// are treated as the same root.
-    pub dedup_atol: f64,
-}
-
-impl TolerancePolicy {
-    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
-    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
-        fk_atol: 1e-5,
-        dedup_atol: 1e-3,
-    };
-}
 
 // --- tolerances (ssik DEFAULT_TOLERANCE_POLICY) ---
 const NUM_TOL: f64 = 1e-5; // subproblem_numerical
@@ -577,8 +553,8 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    let fk_atol = policy.fk_atol;
-    let dedup_atol = policy.dedup_atol;
+    let fk_atol = policy.subproblem_numerical;
+    let dedup_atol = policy.subproblem_dedup;
 
     let mut solutions: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
 

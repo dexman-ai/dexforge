@@ -175,10 +175,10 @@ fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
 /// allow_refinement : bool, optional
 ///     When ``True``, algebraic candidates are polished with a bounded
 ///     Levenberg-Marquardt step.  Default ``False``.
-/// fk_atol : float, optional
+/// subproblem_numerical : float, optional
 ///     FK closure tolerance (Frobenius norm).  Default ``1e-5``, matching
 ///     ``ssik``'s ``DEFAULT_TOLERANCE_POLICY.subproblem_numerical``.
-/// dedup_atol : float, optional
+/// subproblem_dedup : float, optional
 ///     Wrap-to-π de-duplication tolerance per joint.  Default ``1e-3``,
 ///     matching ``ssik``'s ``DEFAULT_TOLERANCE_POLICY.subproblem_dedup``.
 /// refinement_max_iters : int, optional
@@ -204,8 +204,8 @@ fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
     q_seed = None,
     respect_limits = true,
     allow_refinement = false,
-    fk_atol = 1e-5,
-    dedup_atol = 1e-3,
+    subproblem_numerical = 1e-5,
+    subproblem_dedup = 1e-3,
     refinement_max_iters = 15,
 ))]
 #[allow(non_snake_case)]
@@ -216,8 +216,8 @@ fn solve(
     q_seed: Option<Vec<f64>>,
     respect_limits: bool,
     allow_refinement: bool,
-    fk_atol: f64,
-    dedup_atol: f64,
+    subproblem_numerical: f64,
+    subproblem_dedup: f64,
     refinement_max_iters: usize,
 ) -> PyResult<Vec<Vec<f64>>> {
     let tf = extract_matrix_4x4(&T_target)?;
@@ -240,7 +240,11 @@ fn solve(
                     Some(v.try_into().unwrap())
                 }
             };
-            let policy = ur5::TolerancePolicy { fk_atol, dedup_atol };
+            let policy = ur5::TolerancePolicy {
+                subproblem_numerical,
+                subproblem_dedup,
+                ..ur5::TolerancePolicy::DEFAULT
+            };
             ur5::solve(
                 &tf, max_solutions, seed.as_ref(), respect_limits,
                 allow_refinement, policy, refinement_max_iters,
@@ -264,7 +268,11 @@ fn solve(
                     Some(v.try_into().unwrap())
                 }
             };
-            let policy = piper::TolerancePolicy { fk_atol, dedup_atol };
+            let policy = piper::TolerancePolicy {
+                subproblem_numerical,
+                subproblem_dedup,
+                ..piper::TolerancePolicy::DEFAULT
+            };
             piper::solve(
                 &tf, max_solutions, seed.as_ref(), respect_limits,
                 allow_refinement, policy, refinement_max_iters,
@@ -290,7 +298,11 @@ fn solve(
                     Some(v.try_into().unwrap())
                 }
             };
-            let policy = franka::TolerancePolicy { fk_atol, dedup_atol };
+            let policy = franka::TolerancePolicy {
+                subproblem_numerical,
+                subproblem_dedup,
+                ..franka::TolerancePolicy::DEFAULT
+            };
             franka::solve(
                 &tf, max_solutions, seed.as_ref(), respect_limits,
                 allow_refinement, policy, refinement_max_iters,

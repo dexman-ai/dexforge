@@ -24,7 +24,7 @@
 //! [`solve`] mirrors `piper_ik.solve` with the same argument list:
 //! `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`, `policy`,
 //! and `refinement_max_iters`. The algebraic solution set is FK-verified to
-//! [`TolerancePolicy::fk_atol`] and de-duplicated modulo `2*pi`.
+//! [`TolerancePolicy::subproblem_numerical`] and de-duplicated modulo `2*pi`.
 //!
 //! [`fk`] mirrors `piper_ik.fk` (alias of `_fk`): product-of-exponentials
 //! forward kinematics using the baked chain constants.
@@ -44,6 +44,7 @@
 use nalgebra::{SMatrix, SVector};
 
 use crate::math::kinematics::{lm_refine6, mat4_mul, rot_homogeneous};
+pub use crate::math::tolerances::TolerancePolicy;
 use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
 
 use super::consts;
@@ -124,31 +125,6 @@ const LEFT_BILINEAR: (usize, usize) = (2, 3);
 const RIGHT_BILINEAR: (usize, usize) = (0, 5);
 const DROP_JOINT: usize = 4;
 
-/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
-///
-/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
-/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
-/// `subproblem_dedup = 1e-3`).
-#[derive(Clone, Copy, Debug)]
-pub struct TolerancePolicy {
-    /// FK closure tolerance (== `subproblem_numerical`). Candidates whose
-    /// Frobenius-norm FK residual exceeds this value are rejected (or polished
-    /// when `allow_refinement = true`).
-    pub fk_atol: f64,
-    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`). Two
-    /// configurations that agree to within this value per joint (mod `2*pi`)
-    /// are treated as the same root.
-    pub dedup_atol: f64,
-}
-
-impl TolerancePolicy {
-    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
-    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
-        fk_atol: 1e-5,
-        dedup_atol: 1e-3,
-    };
-}
-
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
@@ -166,7 +142,8 @@ impl TolerancePolicy {
 ///   limits are dropped (after a `±2π` wrap-into-limits attempt). Pass `false`
 ///   for the raw geometric set.
 /// * `allow_refinement` — when `true`, algebraic candidates that exceed
-///   `policy.fk_atol` are polished with a bounded Levenberg-Marquardt step.
+///   `policy.subproblem_numerical` are polished with a bounded
+///   Levenberg-Marquardt step.
 /// * `policy` — FK closure and dedup tolerances; use
 ///   [`TolerancePolicy::DEFAULT`] for the Python defaults.
 /// * `refinement_max_iters` — maximum LM iterations when
@@ -183,8 +160,8 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 6]>; 16] {
-    let fk_atol = policy.fk_atol;
-    let dedup_atol = policy.dedup_atol;
+    let fk_atol = policy.subproblem_numerical;
+    let dedup_atol = policy.subproblem_dedup;
 
     let mut solutions: [Option<[f64; 6]>; 16] = [None; 16];
     let mut solution_count = 0usize;
@@ -387,7 +364,9 @@ fn spatial_bypass(
                 break;
             }
             // Snap the 10 µm-offset root back onto the true target pose.
-            if let Some(refined) = refine6(cand, t, BYPASS_REFINE_MAX_ITERS, policy.fk_atol) {
+            if let Some(refined) =
+                refine6(cand, t, BYPASS_REFINE_MAX_ITERS, policy.subproblem_numerical)
+            {
                 out[count] = refined;
                 count += 1;
             }

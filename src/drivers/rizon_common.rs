@@ -31,7 +31,7 @@
 //!    (`full = [sub0, sub1, q_lock, sub2, sub3, sub4, sub5]`).
 //!
 //! The collected candidates are FK-verified against the full 7R chain
-//! ([`fk`]'s closure `< fk_atol`), de-duplicated modulo `2π`, and — when
+//! ([`fk`]'s closure `< subproblem_numerical`), de-duplicated modulo `2π`, and — when
 //! `allow_refinement` is set — polished by a bounded Levenberg-Marquardt step
 //! that holds the locked joint fixed ([`refine7`]).
 //!
@@ -42,11 +42,12 @@
 //! loop carries a hard iteration ceiling and every buffer is a fixed-size,
 //! stack-allocated array. The deterministic kernel reproduces every reference
 //! solution and may additionally surface a few extra *genuine* roots (each
-//! verified to close the pose to `< fk_atol`).
+//! verified to close the pose to `< subproblem_numerical`).
 
 use nalgebra::{SMatrix, SVector};
 
 use crate::math::kinematics::{mat4_mul, rot_homogeneous};
+pub use crate::math::tolerances::TolerancePolicy;
 use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
 
 use core::f64::consts::PI;
@@ -142,27 +143,6 @@ pub struct Model {
     pub joint_limits: &'static [(f64, f64); 7],
 }
 
-/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
-///
-/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
-/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
-/// `subproblem_dedup = 1e-3`).
-#[derive(Clone, Copy, Debug)]
-pub struct TolerancePolicy {
-    /// FK closure tolerance (== `subproblem_numerical`).
-    pub fk_atol: f64,
-    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`).
-    pub dedup_atol: f64,
-}
-
-impl TolerancePolicy {
-    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
-    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
-        fk_atol: 1e-5,
-        dedup_atol: 1e-3,
-    };
-}
-
 // ---------------------------------------------------------------------------
 // Ratio candidates (Manocha-Canny IV-C robust selection) — arm-independent.
 // ---------------------------------------------------------------------------
@@ -205,8 +185,8 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    let fk_atol = policy.fk_atol;
-    let dedup_atol = policy.dedup_atol;
+    let fk_atol = policy.subproblem_numerical;
+    let dedup_atol = policy.subproblem_dedup;
 
     let mut solutions: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
 

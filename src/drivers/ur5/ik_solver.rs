@@ -15,16 +15,15 @@
 //! [`solve`] mirrors `ur5_ik.solve` with the same argument list:
 //! `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`, `policy`,
 //! and `refinement_max_iters`. The algebraic solution set is FK-verified to
-//! [`TolerancePolicy::fk_atol`] and de-duplicated modulo `2*pi`.
+//! [`TolerancePolicy::subproblem_numerical`] and de-duplicated modulo `2*pi`.
 //!
 //! [`fk`] mirrors `ur5_ik.fk` (alias of `_fk`): product-of-exponentials forward
 //! kinematics using the baked chain constants.
 
 use nalgebra::SMatrix;
 
-use crate::math::kinematics::{
-    eye_with, lm_refine6, mat4_mul, rot_homogeneous,
-};
+use crate::math::kinematics::{eye_with, lm_refine6, mat4_mul, rot_homogeneous};
+pub use crate::math::tolerances::TolerancePolicy;
 use crate::math::ssik_core::{sp6_solve, wrap_to_pi};
 
 use core::f64::consts::PI;
@@ -38,31 +37,6 @@ mod test_data;
 
 /// Degrees of freedom of the UR5.
 pub const DOF: usize = 6;
-
-/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
-///
-/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
-/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
-/// `subproblem_dedup = 1e-3`).
-#[derive(Clone, Copy, Debug)]
-pub struct TolerancePolicy {
-    /// FK closure tolerance (== `subproblem_numerical`). Candidates whose
-    /// Frobenius-norm FK residual exceeds this value are rejected (or polished
-    /// when `allow_refinement = true`).
-    pub fk_atol: f64,
-    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`). Two
-    /// configurations that agree to within this value per joint (mod `2*pi`)
-    /// are treated as the same root.
-    pub dedup_atol: f64,
-}
-
-impl TolerancePolicy {
-    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
-    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
-        fk_atol: 1e-5,
-        dedup_atol: 1e-3,
-    };
-}
 
 // --- tolerances (ssik DEFAULT_TOLERANCE_POLICY) ---
 const NUM_TOL: f64 = 1e-5; // subproblem_numerical (algebraic block)
@@ -135,7 +109,8 @@ const JOINT_LIMITS: [(f64, f64); 6] = [
 ///   limits are dropped (after a `±2π` wrap-into-limits attempt). Pass
 ///   `false` for the raw geometric set.
 /// * `allow_refinement` — when `true`, algebraic candidates that exceed
-///   `policy.fk_atol` are polished with a bounded Levenberg-Marquardt step.
+///   `policy.subproblem_numerical` are polished with a bounded
+///   Levenberg-Marquardt step.
 ///   For the UR5 (tier-0 arm) this is rarely needed; default `false`.
 /// * `policy` — FK closure and dedup tolerances; use
 ///   [`TolerancePolicy::DEFAULT`] for the Python defaults.
@@ -153,8 +128,8 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 6]>; 16] {
-    let fk_atol = policy.fk_atol;
-    let dedup_atol = policy.dedup_atol;
+    let fk_atol = policy.subproblem_numerical;
+    let dedup_atol = policy.subproblem_dedup;
 
     let mut solutions: [Option<[f64; 6]>; 16] = [None; 16];
     let mut solution_count = 0usize;
