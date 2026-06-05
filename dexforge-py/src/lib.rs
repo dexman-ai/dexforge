@@ -1,27 +1,27 @@
 //! Python bindings for `dexforge` analytical inverse kinematics.
 //!
-//! Exposes two functions whose signatures mirror the Python `ssik` prebuilt
-//! artifact interface (e.g. `ssik.prebuilt.ur5_ik`), plus an `arm` name
-//! parameter to select the robot:
+//! Exposes per-arm `solve` and `fk` functions that mirror the Python `ssik`
+//! prebuilt artifact interface (e.g. `ssik.prebuilt.ur5_ik`):
 //!
 //! ```python
 //! import numpy as np
-//! import dexforge_py
+//! from ssik.prebuilt import ur5_ik
 //!
 //! T = np.eye(4)           # 4x4 SE(3) target pose
 //! q = [0.0] * 6          # joint angles in radians
 //!
-//! solutions = dexforge_py.solve("ur5", T, respect_limits=False)
-//! T_fk      = dexforge_py.fk("ur5", q)
+//! solutions = ur5_ik.solve(T, respect_limits=False)
+//! T_fk      = ur5_ik.fk(q)
 //! ```
 //!
 //! # Adding a new arm driver
 //!
 //! 1. Implement the driver in `dexforge/src/drivers/<arm>/ik_solver.rs`
 //!    (expose `fk`, `solve`, and `TolerancePolicy::DEFAULT`).
-//! 2. In `solve()` below, add a new `"<arm>" | "<arm>_ik"` match arm.
-//! 3. In `fk()` below, add the corresponding match arm.
-//! 4. Update the error messages in both functions.
+//! 2. Add a `use` statement for the driver alias.
+//! 3. Add `#[pyfunction]` wrappers calling `solve_impl` and `fk_impl`.
+//! 4. Register the functions in the Python module.
+//! 5. Create the corresponding Python shim in `ssik/prebuilt/<arm>_ik.py`.
 
 use nalgebra::SMatrix;
 use pyo3::exceptions::PyValueError;
@@ -29,7 +29,10 @@ use pyo3::prelude::*;
 
 use ssik_rust::drivers::franka_panda::ik_solver as franka;
 use ssik_rust::drivers::piper::ik_solver as piper;
+use ssik_rust::drivers::rizon10::ik_solver as rizon10;
+use ssik_rust::drivers::rizon4::ik_solver as rizon4;
 use ssik_rust::drivers::ur5::ik_solver as ur5;
+use ssik_rust::drivers::xarm7::ik_solver as xarm7;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -69,136 +72,106 @@ fn matrix_to_nested(tf: &SMatrix<f64, 4, 4>) -> Vec<Vec<f64>> {
 }
 
 // ---------------------------------------------------------------------------
-// Public Python functions
+// Generic wrappers
 // ---------------------------------------------------------------------------
 
-/// Compute analytical forward kinematics for the given robot arm.
+/// Generic forward kinematics wrapper.
 ///
-/// Parameters
-/// ----------
-/// arm : str
-///     Name of the robot arm.  Supported values:
-///     ``"ur5"`` / ``"ur5_ik"``, ``"piper"`` / ``"piper_ik"``, and
-///     ``"franka_panda"`` / ``"franka_panda_ik"``.
-/// q : list[float]
-///     Joint angles in radians.  Length must match the arm's DOF
-///     (6 for UR5, 7 for Franka Panda).
-///
-/// Returns
-/// -------
-/// list[list[float]]
-///     4×4 SE(3) pose of ``ee_link`` in ``base_link`` as a nested list.
-///
-/// Raises
-/// ------
-/// ValueError
-///     If the arm name is unsupported or ``q`` has the wrong length.
-#[pyfunction]
-fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
-    let tf: SMatrix<f64, 4, 4> = match arm {
-        // ── UR5 ──────────────────────────────────────────────────────────────
-        // To add a new 6-DOF arm: copy this block and replace the driver alias.
-        "ur5" | "ur5_ik" => {
-            if q.len() != ur5::DOF {
-                return Err(PyValueError::new_err(format!(
-                    "ur5 requires {} joint angles, got {}",
-                    ur5::DOF,
-                    q.len()
-                )));
-            }
-            let arr: [f64; 6] = q.try_into().unwrap();
-            ur5::fk(&arr)
-        }
-        // ── Piper ────────────────────────────────────────────────────────────
-        "piper" | "piper_ik" => {
-            if q.len() != piper::DOF {
-                return Err(PyValueError::new_err(format!(
-                    "piper requires {} joint angles, got {}",
-                    piper::DOF,
-                    q.len()
-                )));
-            }
-            let arr: [f64; 6] = q.try_into().unwrap();
-            piper::fk(&arr)
-        }
-        // ── Franka Panda ─────────────────────────────────────────────────────
-        // To add a new 7-DOF arm: copy this block and replace the driver alias.
-        "franka_panda" | "franka_panda_ik" => {
-            if q.len() != franka::DOF {
-                return Err(PyValueError::new_err(format!(
-                    "franka_panda requires {} joint angles, got {}",
-                    franka::DOF,
-                    q.len()
-                )));
-            }
-            let arr: [f64; 7] = q.try_into().unwrap();
-            franka::fk(&arr)
-        }
-        // ── Unsupported ───────────────────────────────────────────────────────
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "unsupported arm '{arm}'; supported arms: ur5, piper, franka_panda"
-            )));
-        }
-    };
-
+/// Templatized on DOF and the FK delegate function.
+#[inline]
+fn fk_impl<const DOF: usize, F>(arm_name: &str, q: Vec<f64>, fk_fn: F) -> PyResult<Vec<Vec<f64>>>
+where
+    F: FnOnce(&[f64; DOF]) -> SMatrix<f64, 4, 4>,
+{
+    if q.len() != DOF {
+        return Err(PyValueError::new_err(format!(
+            "{} requires {} joint angles, got {}",
+            arm_name,
+            DOF,
+            q.len()
+        )));
+    }
+    let arr: [f64; DOF] = q.try_into().unwrap();
+    let tf = fk_fn(&arr);
     Ok(matrix_to_nested(&tf))
 }
 
-/// Compute analytical inverse kinematics for the given robot arm.
+/// Generic inverse kinematics wrapper.
 ///
-/// The signature mirrors the Python ``ssik`` prebuilt artifact interface
-/// (e.g. ``ssik.prebuilt.ur5_ik.solve``), with an additional leading ``arm``
-/// argument to select the robot.
-///
-/// Parameters
-/// ----------
-/// arm : str
-///     Name of the robot arm.  Supported values:
-///     ``"ur5"`` / ``"ur5_ik"``, ``"piper"`` / ``"piper_ik"``, and
-///     ``"franka_panda"`` / ``"franka_panda_ik"``.
-/// T_target : array-like (4×4)
-///     SE(3) target pose of ``ee_link`` in ``base_link``.  Accepts a numpy
-///     ``ndarray`` or a plain list-of-lists.
-/// max_solutions : int or None, optional
-///     Cap on the number of returned solutions (post-dedup, post-limits).
-///     ``None`` (default) returns the full geometric set.
-/// q_seed : list[float] or None, optional
-///     Optional seed joint configuration.  When provided, solutions are sorted
-///     by wrap-to-π distance from the seed (closest first).  For the Franka
-///     Panda the lock-joint sweep also visits samples nearest to the seed
-///     first, enabling an efficient trajectory-tracking path when combined
-///     with ``max_solutions=1``.
-/// respect_limits : bool, optional
-///     When ``True`` (default), solutions outside the URDF joint limits are
-///     dropped.  Pass ``False`` for the raw geometric set.
-/// allow_refinement : bool, optional
-///     When ``True``, algebraic candidates are polished with a bounded
-///     Levenberg-Marquardt step.  Default ``False``.
-/// fk_atol : float, optional
-///     FK closure tolerance (Frobenius norm).  Default ``1e-5``, matching
-///     ``ssik``'s ``DEFAULT_TOLERANCE_POLICY.subproblem_numerical``.
-/// dedup_atol : float, optional
-///     Wrap-to-π de-duplication tolerance per joint.  Default ``1e-3``,
-///     matching ``ssik``'s ``DEFAULT_TOLERANCE_POLICY.subproblem_dedup``.
-/// refinement_max_iters : int, optional
-///     Maximum LM iterations per candidate when ``allow_refinement=True``.
-///     Default ``15``.
-///
-/// Returns
-/// -------
-/// list[list[float]]
-///     Each element is a valid joint-angle vector in radians.  Returns an
-///     empty list when no solution exists.
-///
-/// Raises
-/// ------
-/// ValueError
-///     If the arm name is unsupported, ``T_target`` is not 4×4, or
-///     ``q_seed`` has the wrong length.
+/// Templatized on DOF, MAX_SOLUTIONS, and the solve delegate function.
+#[inline]
+#[allow(non_snake_case)]
+fn solve_impl<const DOF: usize, const MAX_SOLUTIONS: usize, F>(
+    arm_name: &str,
+    T_target: Bound<'_, PyAny>,
+    max_solutions: Option<usize>,
+    q_seed: Option<Vec<f64>>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    fk_atol: f64,
+    dedup_atol: f64,
+    refinement_max_iters: usize,
+    solve_fn: F,
+) -> PyResult<Vec<Vec<f64>>>
+where
+    F: FnOnce(
+        &SMatrix<f64, 4, 4>,
+        Option<usize>,
+        Option<&[f64; DOF]>,
+        bool,
+        bool,
+        f64,
+        f64,
+        usize,
+    ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS],
+{
+    let tf = extract_matrix_4x4(&T_target)?;
+
+    let seed: Option<[f64; DOF]> = match q_seed {
+        None => None,
+        Some(v) => {
+            if v.len() != DOF {
+                return Err(PyValueError::new_err(format!(
+                    "q_seed for {} must have {} elements, got {}",
+                    arm_name,
+                    DOF,
+                    v.len()
+                )));
+            }
+            Some(v.try_into().unwrap())
+        }
+    };
+
+    let solutions: Vec<Vec<f64>> = solve_fn(
+        &tf,
+        max_solutions,
+        seed.as_ref(),
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+    )
+    .iter()
+    .filter_map(|s| s.map(|q| q.to_vec()))
+    .collect();
+
+    Ok(solutions)
+}
+
+// ---------------------------------------------------------------------------
+// Per-arm Python functions: UR5
+// ---------------------------------------------------------------------------
+
+/// Compute analytical forward kinematics for UR5.
+#[pyfunction]
+fn ur5_fk(q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    fk_impl::<{ ur5::DOF }, _>("ur5", q, ur5::fk)
+}
+
+/// Compute analytical inverse kinematics for UR5.
 #[pyfunction]
 #[pyo3(signature = (
-    arm,
     T_target,
     max_solutions = None,
     q_seed = None,
@@ -209,8 +182,7 @@ fn fk(arm: &str, q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
     refinement_max_iters = 15,
 ))]
 #[allow(non_snake_case)]
-fn solve(
-    arm: &str,
+fn ur5_solve(
     T_target: Bound<'_, PyAny>,
     max_solutions: Option<usize>,
     q_seed: Option<Vec<f64>>,
@@ -220,111 +192,360 @@ fn solve(
     dedup_atol: f64,
     refinement_max_iters: usize,
 ) -> PyResult<Vec<Vec<f64>>> {
-    let tf = extract_matrix_4x4(&T_target)?;
-
-    let solutions: Vec<Vec<f64>> = match arm {
-        // ── UR5 ──────────────────────────────────────────────────────────────
-        // To add a new arm: copy this block, replace the driver alias, and
-        // adjust the q_seed array size to match the arm's DOF.
-        "ur5" | "ur5_ik" => {
-            let seed: Option<[f64; 6]> = match q_seed {
-                None => None,
-                Some(v) => {
-                    if v.len() != ur5::DOF {
-                        return Err(PyValueError::new_err(format!(
-                            "q_seed for ur5 must have {} elements, got {}",
-                            ur5::DOF,
-                            v.len()
-                        )));
-                    }
-                    Some(v.try_into().unwrap())
-                }
-            };
-            let policy = ur5::TolerancePolicy { fk_atol, dedup_atol };
+    solve_impl::<{ ur5::DOF }, 16, _>(
+        "ur5",
+        T_target,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+        |tf, max_sol, seed, respect, refine, fk_a, dedup_a, max_iters| {
             ur5::solve(
-                &tf, max_solutions, seed.as_ref(), respect_limits,
-                allow_refinement, policy, refinement_max_iters,
+                tf,
+                max_sol,
+                seed,
+                respect,
+                refine,
+                ur5::TolerancePolicy {
+                    fk_atol: fk_a,
+                    dedup_atol: dedup_a,
+                },
+                max_iters,
             )
-                .iter()
-                .filter_map(|s| s.map(|q| q.to_vec()))
-                .collect()
-        }
-        // ── Piper ────────────────────────────────────────────────────────────
-        "piper" | "piper_ik" => {
-            let seed: Option<[f64; 6]> = match q_seed {
-                None => None,
-                Some(v) => {
-                    if v.len() != piper::DOF {
-                        return Err(PyValueError::new_err(format!(
-                            "q_seed for piper must have {} elements, got {}",
-                            piper::DOF,
-                            v.len()
-                        )));
-                    }
-                    Some(v.try_into().unwrap())
-                }
-            };
-            let policy = piper::TolerancePolicy { fk_atol, dedup_atol };
-            piper::solve(
-                &tf, max_solutions, seed.as_ref(), respect_limits,
-                allow_refinement, policy, refinement_max_iters,
-            )
-                .iter()
-                .filter_map(|s| s.map(|q| q.to_vec()))
-                .collect()
-        }
-        // ── Franka Panda ─────────────────────────────────────────────────────
-        // To add a new arm: copy this block, replace the driver alias, and
-        // adjust the q_seed array size to match the arm's DOF.
-        "franka_panda" | "franka_panda_ik" => {
-            let seed: Option<[f64; 7]> = match q_seed {
-                None => None,
-                Some(v) => {
-                    if v.len() != franka::DOF {
-                        return Err(PyValueError::new_err(format!(
-                            "q_seed for franka_panda must have {} elements, got {}",
-                            franka::DOF,
-                            v.len()
-                        )));
-                    }
-                    Some(v.try_into().unwrap())
-                }
-            };
-            let policy = franka::TolerancePolicy { fk_atol, dedup_atol };
-            franka::solve(
-                &tf, max_solutions, seed.as_ref(), respect_limits,
-                allow_refinement, policy, refinement_max_iters,
-            )
-                .iter()
-                .filter_map(|s| s.map(|q| q.to_vec()))
-                .collect()
-        }
-        // ── Unsupported ───────────────────────────────────────────────────────
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "unsupported arm '{arm}'; supported arms: ur5, piper, franka_panda"
-            )));
-        }
-    };
+        },
+    )
+}
 
-    Ok(solutions)
+// ---------------------------------------------------------------------------
+// Per-arm Python functions: Piper
+// ---------------------------------------------------------------------------
+
+/// Compute analytical forward kinematics for AgileX Piper.
+#[pyfunction]
+fn piper_fk(q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    fk_impl::<{ piper::DOF }, _>("piper", q, piper::fk)
+}
+
+/// Compute analytical inverse kinematics for AgileX Piper.
+#[pyfunction]
+#[pyo3(signature = (
+    T_target,
+    max_solutions = None,
+    q_seed = None,
+    respect_limits = true,
+    allow_refinement = false,
+    fk_atol = 1e-5,
+    dedup_atol = 1e-3,
+    refinement_max_iters = 15,
+))]
+#[allow(non_snake_case)]
+fn piper_solve(
+    T_target: Bound<'_, PyAny>,
+    max_solutions: Option<usize>,
+    q_seed: Option<Vec<f64>>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    fk_atol: f64,
+    dedup_atol: f64,
+    refinement_max_iters: usize,
+) -> PyResult<Vec<Vec<f64>>> {
+    solve_impl::<{ piper::DOF }, 16, _>(
+        "piper",
+        T_target,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+        |tf, max_sol, seed, respect, refine, fk_a, dedup_a, max_iters| {
+            piper::solve(
+                tf,
+                max_sol,
+                seed,
+                respect,
+                refine,
+                piper::TolerancePolicy {
+                    fk_atol: fk_a,
+                    dedup_atol: dedup_a,
+                },
+                max_iters,
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-arm Python functions: Franka Panda
+// ---------------------------------------------------------------------------
+
+/// Compute analytical forward kinematics for Franka Emika Panda.
+#[pyfunction]
+fn franka_panda_fk(q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    fk_impl::<{ franka::DOF }, _>("franka_panda", q, franka::fk)
+}
+
+/// Compute analytical inverse kinematics for Franka Emika Panda.
+#[pyfunction]
+#[pyo3(signature = (
+    T_target,
+    max_solutions = None,
+    q_seed = None,
+    respect_limits = true,
+    allow_refinement = false,
+    fk_atol = 1e-5,
+    dedup_atol = 1e-3,
+    refinement_max_iters = 15,
+))]
+#[allow(non_snake_case)]
+fn franka_panda_solve(
+    T_target: Bound<'_, PyAny>,
+    max_solutions: Option<usize>,
+    q_seed: Option<Vec<f64>>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    fk_atol: f64,
+    dedup_atol: f64,
+    refinement_max_iters: usize,
+) -> PyResult<Vec<Vec<f64>>> {
+    solve_impl::<{ franka::DOF }, { franka::MAX_SOLUTIONS }, _>(
+        "franka_panda",
+        T_target,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+        |tf, max_sol, seed, respect, refine, fk_a, dedup_a, max_iters| {
+            franka::solve(
+                tf,
+                max_sol,
+                seed,
+                respect,
+                refine,
+                franka::TolerancePolicy {
+                    fk_atol: fk_a,
+                    dedup_atol: dedup_a,
+                },
+                max_iters,
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-arm Python functions: xArm7
+// ---------------------------------------------------------------------------
+
+/// Compute analytical forward kinematics for UFactory xArm7.
+#[pyfunction]
+fn xarm7_fk(q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    fk_impl::<{ xarm7::DOF }, _>("xarm7", q, xarm7::fk)
+}
+
+/// Compute analytical inverse kinematics for UFactory xArm7.
+#[pyfunction]
+#[pyo3(signature = (
+    T_target,
+    max_solutions = None,
+    q_seed = None,
+    respect_limits = true,
+    allow_refinement = false,
+    fk_atol = 1e-5,
+    dedup_atol = 1e-3,
+    refinement_max_iters = 15,
+))]
+#[allow(non_snake_case)]
+fn xarm7_solve(
+    T_target: Bound<'_, PyAny>,
+    max_solutions: Option<usize>,
+    q_seed: Option<Vec<f64>>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    fk_atol: f64,
+    dedup_atol: f64,
+    refinement_max_iters: usize,
+) -> PyResult<Vec<Vec<f64>>> {
+    solve_impl::<{ xarm7::DOF }, { xarm7::MAX_SOLUTIONS }, _>(
+        "xarm7",
+        T_target,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+        |tf, max_sol, seed, respect, refine, fk_a, dedup_a, max_iters| {
+            xarm7::solve(
+                tf,
+                max_sol,
+                seed,
+                respect,
+                refine,
+                xarm7::TolerancePolicy {
+                    fk_atol: fk_a,
+                    dedup_atol: dedup_a,
+                },
+                max_iters,
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-arm Python functions: Rizon4
+// ---------------------------------------------------------------------------
+
+/// Compute analytical forward kinematics for Flexiv Rizon 4.
+#[pyfunction]
+fn rizon4_fk(q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    fk_impl::<{ rizon4::DOF }, _>("rizon4", q, rizon4::fk)
+}
+
+/// Compute analytical inverse kinematics for Flexiv Rizon 4.
+#[pyfunction]
+#[pyo3(signature = (
+    T_target,
+    max_solutions = None,
+    q_seed = None,
+    respect_limits = true,
+    allow_refinement = false,
+    fk_atol = 1e-5,
+    dedup_atol = 1e-3,
+    refinement_max_iters = 15,
+))]
+#[allow(non_snake_case)]
+fn rizon4_solve(
+    T_target: Bound<'_, PyAny>,
+    max_solutions: Option<usize>,
+    q_seed: Option<Vec<f64>>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    fk_atol: f64,
+    dedup_atol: f64,
+    refinement_max_iters: usize,
+) -> PyResult<Vec<Vec<f64>>> {
+    solve_impl::<{ rizon4::DOF }, { rizon4::MAX_SOLUTIONS }, _>(
+        "rizon4",
+        T_target,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+        |tf, max_sol, seed, respect, refine, fk_a, dedup_a, max_iters| {
+            rizon4::solve(
+                tf,
+                max_sol,
+                seed,
+                respect,
+                refine,
+                rizon4::TolerancePolicy {
+                    fk_atol: fk_a,
+                    dedup_atol: dedup_a,
+                },
+                max_iters,
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Per-arm Python functions: Rizon10
+// ---------------------------------------------------------------------------
+
+/// Compute analytical forward kinematics for Flexiv Rizon 10.
+#[pyfunction]
+fn rizon10_fk(q: Vec<f64>) -> PyResult<Vec<Vec<f64>>> {
+    fk_impl::<{ rizon10::DOF }, _>("rizon10", q, rizon10::fk)
+}
+
+/// Compute analytical inverse kinematics for Flexiv Rizon 10.
+#[pyfunction]
+#[pyo3(signature = (
+    T_target,
+    max_solutions = None,
+    q_seed = None,
+    respect_limits = true,
+    allow_refinement = false,
+    fk_atol = 1e-5,
+    dedup_atol = 1e-3,
+    refinement_max_iters = 15,
+))]
+#[allow(non_snake_case)]
+fn rizon10_solve(
+    T_target: Bound<'_, PyAny>,
+    max_solutions: Option<usize>,
+    q_seed: Option<Vec<f64>>,
+    respect_limits: bool,
+    allow_refinement: bool,
+    fk_atol: f64,
+    dedup_atol: f64,
+    refinement_max_iters: usize,
+) -> PyResult<Vec<Vec<f64>>> {
+    solve_impl::<{ rizon10::DOF }, { rizon10::MAX_SOLUTIONS }, _>(
+        "rizon10",
+        T_target,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        fk_atol,
+        dedup_atol,
+        refinement_max_iters,
+        |tf, max_sol, seed, respect, refine, fk_a, dedup_a, max_iters| {
+            rizon10::solve(
+                tf,
+                max_sol,
+                seed,
+                respect,
+                refine,
+                rizon10::TolerancePolicy {
+                    fk_atol: fk_a,
+                    dedup_atol: dedup_a,
+                },
+                max_iters,
+            )
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 
-/// Python module exposing ssik-rust IK solvers.
+/// Python module exposing dexforge analytical IK solvers.
 ///
-/// Functions
-/// ---------
-/// solve(arm, T_target, ...)
-///     Inverse kinematics — mirrors ``ssik.prebuilt.<arm>_ik.solve``.
-/// fk(arm, q)
-///     Forward kinematics — mirrors ``ssik.prebuilt.<arm>_ik.fk``.
+/// Functions are exposed per-arm (e.g., `ur5_solve`, `ur5_fk`) to mirror
+/// the `ssik.prebuilt.<arm>_ik` module structure.
 #[pymodule]
 fn dexforge_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(solve, m)?)?;
-    m.add_function(wrap_pyfunction!(fk, m)?)?;
+    // UR5
+    m.add_function(wrap_pyfunction!(ur5_fk, m)?)?;
+    m.add_function(wrap_pyfunction!(ur5_solve, m)?)?;
+    // Piper
+    m.add_function(wrap_pyfunction!(piper_fk, m)?)?;
+    m.add_function(wrap_pyfunction!(piper_solve, m)?)?;
+    // Franka Panda
+    m.add_function(wrap_pyfunction!(franka_panda_fk, m)?)?;
+    m.add_function(wrap_pyfunction!(franka_panda_solve, m)?)?;
+    // xArm7
+    m.add_function(wrap_pyfunction!(xarm7_fk, m)?)?;
+    m.add_function(wrap_pyfunction!(xarm7_solve, m)?)?;
+    // Rizon4
+    m.add_function(wrap_pyfunction!(rizon4_fk, m)?)?;
+    m.add_function(wrap_pyfunction!(rizon4_solve, m)?)?;
+    // Rizon10
+    m.add_function(wrap_pyfunction!(rizon10_fk, m)?)?;
+    m.add_function(wrap_pyfunction!(rizon10_solve, m)?)?;
     Ok(())
 }

@@ -1,5 +1,6 @@
-"""Core ssik types for dexforge_py compatibility layer."""
+"""ssik compatibility core module for dexforge_py."""
 
-from .solution import Solution, RefinementMode
+from ssik.core.solution import Solution, RefinementMode
+from ssik.core.tolerances import TolerancePolicy, DEFAULT_TOLERANCE_POLICY
 
-__all__ = ["Solution", "RefinementMode"]
+__all__ = ["Solution", "RefinementMode", "TolerancePolicy", "DEFAULT_TOLERANCE_POLICY"]

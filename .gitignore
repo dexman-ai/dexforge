@@ -4,3 +4,7 @@ Cargo.lock
 __pycache__/
 **/__pycache__/
 *.pyc
+.venv/
+**/.venv/
+*.so
+**/*.so
