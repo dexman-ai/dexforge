@@ -21,6 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv7em-none-eabihf
+          components: rustfmt
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -105,14 +106,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-build-target-
 
-      - name: Build Python bindings
+      - name: Build and install Python bindings
         run: |
           cd dexforge-py
-          maturin build --release
-
-      - name: Install Python bindings
-        run: |
-          pip install dexforge-py/target/wheels/dexforge_py-*.whl --force-reinstall --no-deps
+          maturin develop --release
 
       - name: Run Python tests
         run: |
