@@ -11,6 +11,7 @@ This module handles:
 from __future__ import annotations
 
 import importlib
+import inspect
 import re
 import subprocess
 import sys
@@ -28,8 +29,10 @@ def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
     :param artifact_name: Either a bare module name (e.g. ``"ur5_ik"``) to
         look up inside ``ssik.prebuilt``, or an absolute / relative path to an
         existing ``*_ik.py`` file.
-    :returns: ``(source_code, module_stem)`` where *module_stem* is the bare
-        name without the ``_ik`` suffix (e.g. ``"ur5"``).
+    :returns: ``(source_code, artifact_stem)`` where *artifact_stem* is:
+        - For file paths: the file stem with the ``_ik`` suffix (e.g., ``"ur5_ik"``).
+        - For module names: the module name as provided (e.g., ``"ur5_ik"``).
+        Callers should use ``.removesuffix("_ik")`` to extract the arm name.
     :raises FileNotFoundError: If a path argument does not exist on disk.
     :raises ImportError: If a module name is not found in ``ssik.prebuilt``.
     """
@@ -48,7 +51,6 @@ def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
             f"Cannot find '{artifact_name}' as a file or as ssik.prebuilt.{module_name}. "
             "Install ssik (`pip install ssik`) or provide a path to the artifact file."
         )
-    import inspect
 
     source_code = inspect.getsource(mod)
     return source_code, module_name
@@ -218,8 +220,6 @@ def _load_example_py_source(example_arm: str) -> str:
     """Load the ssik Python source artifact for *example_arm* from ssik.prebuilt."""
     try:
         mod = importlib.import_module(f"ssik.prebuilt.{example_arm}_ik")
-        import inspect
-
         return inspect.getsource(mod)
     except ModuleNotFoundError:
         return f"# ssik.prebuilt.{example_arm}_ik is not installed — skipped.\n"
