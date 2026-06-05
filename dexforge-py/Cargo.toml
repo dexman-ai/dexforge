@@ -2,7 +2,7 @@
 name = "dexforge-py"
 version = "0.1.0"
 edition = "2021"
-description = "Python bindings for ssik-rust analytical inverse kinematics."
+description = "Python bindings for dexforge analytical inverse kinematics."
 license = "BSD-3-Clause"
 
 [lib]

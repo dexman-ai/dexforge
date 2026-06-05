@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "dexforge-py"
 version = "0.1.0"
-description = "Python bindings for ssik-rust analytical inverse kinematics."
+description = "Python bindings for dexforge analytical inverse kinematics."
 requires-python = ">=3.8"
 license = { text = "BSD-3-Clause" }
 dependencies = ["scipy", "numpy"]
