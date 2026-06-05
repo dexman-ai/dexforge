@@ -8,6 +8,15 @@ files (``consts.rs``, ``pq.rs``, ``test_data.rs``), then builds and tests the
 Rust crate.  Any build or test failure is fed back to the LLM so it can correct
 the generated code automatically.
 
+**IMPORTANT:** The ssik version is locked in ``SSIK_VERSION.txt`` to ensure
+compatibility with the already-translated math kernels (``ssik_core.rs``,
+``kinematics.rs``). Install the correct version before running this script:
+
+    pip install ssik==<VERSION_FROM_SSIK_VERSION.txt>
+
+For instructions on upgrading the ssik version, see
+``codegen/upgrade_ssik_version.md``.
+
 Usage examples::
 
     # From a ssik prebuilt artifact name (looks up ssik.prebuilt):
@@ -50,6 +59,8 @@ from ik_prompt import (
     find_best_example,
     generate_artifact_from_urdf,
     load_prebuilt_artifact,
+    _get_locked_ssik_version,
+    _verify_ssik_version,
 )
 
 # ---------------------------------------------------------------------------
@@ -159,6 +170,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     """
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+
+    # --- Check locked ssik version ---
+    try:
+        locked_version = _get_locked_ssik_version()
+        print(f"[ik_generator] Locked ssik version: {locked_version}")
+        _verify_ssik_version()
+        print(f"[ik_generator] ✓ ssik version verified")
+    except (ImportError, FileNotFoundError) as exc:
+        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # --- Validate --urdf requires --base and --ee ---
     if args.urdf is not None:
