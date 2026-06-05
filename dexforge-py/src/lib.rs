@@ -210,8 +210,9 @@ fn ur5_solve(
                 respect,
                 refine,
                 ur5::TolerancePolicy {
-                    fk_atol: fk_a,
-                    dedup_atol: dedup_a,
+                    subproblem_numerical: fk_a,
+                    subproblem_dedup: dedup_a,
+                    ..ur5::TolerancePolicy::DEFAULT
                 },
                 max_iters,
             )
@@ -270,8 +271,9 @@ fn piper_solve(
                 respect,
                 refine,
                 piper::TolerancePolicy {
-                    fk_atol: fk_a,
-                    dedup_atol: dedup_a,
+                    subproblem_numerical: fk_a,
+                    subproblem_dedup: dedup_a,
+                    ..piper::TolerancePolicy::DEFAULT
                 },
                 max_iters,
             )
@@ -330,8 +332,9 @@ fn franka_panda_solve(
                 respect,
                 refine,
                 franka::TolerancePolicy {
-                    fk_atol: fk_a,
-                    dedup_atol: dedup_a,
+                    subproblem_numerical: fk_a,
+                    subproblem_dedup: dedup_a,
+                    ..franka::TolerancePolicy::DEFAULT
                 },
                 max_iters,
             )
@@ -390,8 +393,9 @@ fn xarm7_solve(
                 respect,
                 refine,
                 xarm7::TolerancePolicy {
-                    fk_atol: fk_a,
-                    dedup_atol: dedup_a,
+                    subproblem_numerical: fk_a,
+                    subproblem_dedup: dedup_a,
+                    ..xarm7::TolerancePolicy::DEFAULT
                 },
                 max_iters,
             )
@@ -450,8 +454,9 @@ fn rizon4_solve(
                 respect,
                 refine,
                 rizon4::TolerancePolicy {
-                    fk_atol: fk_a,
-                    dedup_atol: dedup_a,
+                    subproblem_numerical: fk_a,
+                    subproblem_dedup: dedup_a,
+                    ..rizon4::TolerancePolicy::DEFAULT
                 },
                 max_iters,
             )
@@ -510,8 +515,9 @@ fn rizon10_solve(
                 respect,
                 refine,
                 rizon10::TolerancePolicy {
-                    fk_atol: fk_a,
-                    dedup_atol: dedup_a,
+                    subproblem_numerical: fk_a,
+                    subproblem_dedup: dedup_a,
+                    ..rizon10::TolerancePolicy::DEFAULT
                 },
                 max_iters,
             )
