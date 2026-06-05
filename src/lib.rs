@@ -9,7 +9,8 @@
 //!   shared by every arm driver.
 //! * [`drivers`] holds the per-arm closed-form solvers: the Universal Robots
 //!   UR5 ([`drivers::ur5`]), the Franka Emika Panda ([`drivers::franka_panda`]),
-//!   and the AgileX Piper ([`drivers::piper`]).
+//!   the AgileX Piper ([`drivers::piper`]), and the UFactory xArm7
+//!   ([`drivers::xarm7`]).
 //!
 //! Every numeric loop in this crate carries a hardcoded iteration ceiling and
 //! every data structure is a fixed-size, stack-allocated array, so the code
