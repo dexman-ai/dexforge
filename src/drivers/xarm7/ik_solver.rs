@@ -568,7 +568,9 @@ pub fn solve(
     // First dedup (mirrors `seven_r.solve`'s `dedup_by_wrap_close`).
     let mut d1_q = [[0.0f64; 7]; CAND_CAP];
     let mut d1_res = [0.0f64; CAND_CAP];
-    let n_d1 = dedup_solutions::<7, CAND_CAP>(&cand_q, &cand_res, n_cand, &mut d1_q, &mut d1_res, dedup_atol);
+    let n_d1 = dedup_solutions::<7, CAND_CAP>(
+        &cand_q, &cand_res, n_cand, &mut d1_q, &mut d1_res, dedup_atol,
+    );
 
     // Outer 7R FK verification, then final dedup (mirrors the prebuilt
     // `solve` body).
@@ -590,7 +592,9 @@ pub fn solve(
 
     let mut f_q = [[0.0f64; 7]; CAND_CAP];
     let mut f_res = [0.0f64; CAND_CAP];
-    let n_final = dedup_solutions::<7, CAND_CAP>(&v_q, &v_res, n_v, &mut f_q, &mut f_res, dedup_atol);
+    let n_final = dedup_solutions::<7, CAND_CAP>(
+        &v_q, &v_res, n_v, &mut f_q, &mut f_res, dedup_atol,
+    );
 
     let mut sol_count = 0usize;
     for i in 0..n_final {

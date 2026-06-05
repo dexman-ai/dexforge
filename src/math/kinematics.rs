@@ -170,6 +170,25 @@ pub fn frob_diff(a: &Transform, b: &Transform) -> f64 {
     libm::sqrt(s)
 }
 
+/// Frobenius norm of the difference between two 4×4 homogeneous matrices.
+///
+/// This is the `[f64; 12]`-free counterpart of [`frob_diff`] for callers that
+/// already hold their pose as an `SMatrix<f64, 4, 4>` (the per-arm FK output
+/// type). It sums the squared difference over **all 16 entries** — including
+/// the bottom row — exactly reproducing each driver's former local
+/// `fk_residual` kernel.
+#[inline]
+pub fn mat4_frob_diff(a: &SMatrix<f64, 4, 4>, b: &SMatrix<f64, 4, 4>) -> f64 {
+    let mut s = 0.0;
+    for i in 0..4 {
+        for j in 0..4 {
+            let d = a[(i, j)] - b[(i, j)];
+            s += d * d;
+        }
+    }
+    libm::sqrt(s)
+}
+
 /// 12-vector pose residual `[vec(a.R − b.R); a.t − b.t]` between two transforms.
 ///
 /// The first 9 elements are the column-major flattening of `(a.R − b.R)` and
@@ -647,5 +666,76 @@ mod tests {
             residual,
             DLS_FK_ATOL
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: mat4_frob_diff matches a hand-rolled 16-entry Frobenius distance
+    // -----------------------------------------------------------------------
+    #[test]
+    fn mat4_frob_diff_matches_manual() {
+        let a = SMatrix::<f64, 4, 4>::from_fn(|i, j| (i * 4 + j) as f64);
+        let b = SMatrix::<f64, 4, 4>::from_fn(|i, j| (i * 4 + j) as f64 + 0.5 * (i as f64));
+        // Reference: explicit sum over all 16 entries, exactly the kernel the
+        // per-arm `fk_residual` helpers used before delegating here.
+        let mut s = 0.0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let d = a[(i, j)] - b[(i, j)];
+                s += d * d;
+            }
+        }
+        let expected = libm::sqrt(s);
+        let got = mat4_frob_diff(&a, &b);
+        assert_eq!(got, expected, "mat4_frob_diff diverged from manual kernel");
+        // Identical matrices yield exactly zero.
+        assert_eq!(mat4_frob_diff(&a, &a), 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: lm_refine_masked refines only the free joints, leaving the locked
+    // joint bit-for-bit unchanged while converging the free joint onto target.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn lm_refine_masked_holds_locked_joint() {
+        let q_true = [0.5f64, -0.3f64];
+        let goal = fk_2dof_nominal(&q_true);
+        // Perturb only joint 0; joint 1 starts at its true (locked) value.
+        let q_init = [q_true[0] + 0.1, q_true[1]];
+        // Free set = {0}; joint 1 is locked.
+        let free = [0usize];
+        let q = lm_refine_masked::<2, 1, _>(
+            &q_init,
+            &free,
+            |q| pose_residual12(&fk_2dof_nominal(q), &goal),
+            DLS_MAX_ITERS,
+        );
+        // Locked joint must be untouched (bit-for-bit).
+        assert_eq!(q[1], q_init[1], "locked joint 1 was modified");
+        // Free joint converged onto the pose goal.
+        let residual = frob_diff(&fk_2dof_nominal(&q), &goal);
+        assert!(
+            residual <= DLS_FK_ATOL,
+            "residual {:.2e} > atol {:.2e}",
+            residual,
+            DLS_FK_ATOL
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: lm_refine (full DOF) and lm_refine_masked with every joint free
+    // produce identical results — the two share a single core loop.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn lm_refine_equals_masked_all_free() {
+        let q_true = [1.0f64, -0.7f64];
+        let goal = fk_2dof_nominal(&q_true);
+        let q_init = [q_true[0] + 0.1, q_true[1] - 0.1];
+        let residual_fn = |q: &[f64; 2]| pose_residual12(&fk_2dof_nominal(q), &goal);
+
+        let full = lm_refine::<2, _>(&q_init, residual_fn, DLS_MAX_ITERS, DLS_FK_ATOL)
+            .expect("lm_refine should converge");
+        let masked =
+            lm_refine_masked::<2, 2, _>(&q_init, &[0, 1], residual_fn, DLS_MAX_ITERS);
+        assert_eq!(full, masked, "full and all-free masked refine diverged");
     }
 }
