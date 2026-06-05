@@ -10,7 +10,7 @@ hand-picked parametrised fixtures in each test file
 (``test_near_singular_pose_returned_solutions_fk_match``) which assert
 FK closure only, not seed recovery.
 
-Singularities the strategy filters:
+Singularities the strategy filters (closes #101, #115, #215):
 
 - ``q[1] ≈ 0 or π`` — shoulder pitch parallel to base.
 - ``q[2] ≈ 0 or π`` — upper-arm / elbow alignment.
@@ -20,18 +20,16 @@ Singularities the strategy filters:
   quartic loses precision.
 - ``q[4] ≈ 0 or π`` — wrist 2 alignment (the spherical-wrist gimbal).
 
-The previous strategy filtered only q[1], q[2], q[4]. Hypothesis
-consistently shrank to ``q[3] = 0`` on UR5, Puma 560, and synthetic-
-spherical fixtures; adding the q[3] filter closes all three flakes.
-Filter rate rises from ~30% to ~40% on uniform input, well under
-Hypothesis' ``filter_too_much`` health-check budget.
+The previous (pre-#101/#115/#215) strategy filtered only q[1], q[2],
+q[4]. Hypothesis consistently shrank to ``q[3] = 0`` on UR5, Puma 560,
+and synthetic-spherical fixtures; adding the q[3] filter closes all
+three flakes. Filter rate rises from ~30% to ~40% on uniform input,
+well under Hypothesis' ``filter_too_much`` health-check budget.
 
 Other axes (``q[0]`` shoulder yaw, ``q[5]`` flange roll) don't trigger
 solver-level degeneracies on the kinematic classes covered by this
-strategy. Per-test custom strategies should compose their own additional
-``assume`` filters as needed.
-
-Adapted from ssik.tests._hypothesis_strategies to work with dexforge_py.
+strategy. Per-test custom strategies should compose their own
+additional ``assume`` filters as needed.
 """
 
 from __future__ import annotations
