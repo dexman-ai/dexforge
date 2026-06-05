@@ -53,15 +53,6 @@ Every driver must include `#[cfg(test)]` module:
 
 Run tests: `cargo test`
 
-### Documentation
-- Module-level docs (`//!`): Explain arm kinematics and equivalence to Python reference.
-- Function docs (`///`): Describe arguments, return semantics, tolerance parameters.
-- Constants: Include `SOLVER_NAME`, `SOLVER_TIER`, `EXPECTED_MS_MEDIAN`, `FLOP_BUDGET`, `DISPATCH_REASON` (mirrored from Python artifact).
-
-### Code Style
-- Format with `cargo fmt`.
-- Use existing code as style reference; avoid over-commenting.
-
 ## Module Responsibilities
 
 ### `src/math/ssik_core.rs` — Generic Numeric Kernels
