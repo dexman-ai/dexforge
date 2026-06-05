@@ -43,11 +43,41 @@
 //! stack-allocated array. The deterministic kernel reproduces every reference
 //! solution and may additionally surface a few extra *genuine* roots (each
 //! verified to close the pose to `< fk_atol`).
+//!
+//! ## What remains Rizon-specific in this module
+//!
+//! After deduplication with the generic math utilities, the code in this module
+//! is exclusively Rizon-specific and cannot be generalized:
+//!
+//! * **Raghavan-Roth back-substitution** ([`back_substitute`], [`ratio_from`],
+//!   [`embed_e`]) — DH-based 6R solution recovery specific to the RR elimination
+//!   scheme. The RR kernels themselves (`rr_real_roots`, etc.) are in
+//!   [`crate::math::ssik_core`].
+//! * **DH-based FK** ([`fk`], [`dh_matrix`]) — product-of-exponentials FK using
+//!   the per-arm Model's axes and transforms. Cannot be moved to kinematics
+//!   because it depends on per-arm geometry stored in the Model.
+//! * **Joint-masked LM refinement** ([`refine7`]) — LM loop that holds the locked
+//!   joint (joint 2) fixed while refining the other 6 DOF. This strategy is
+//!   specific to the `jointlock.seven_r` redundancy resolution and differs from
+//!   the generic [`crate::math::kinematics::lm_refine`] which refines all DOF.
+//! * **Model-aware limit helpers** ([`wrap_to_limits7`], [`in_limits7`]) —
+//!   operate on the per-arm Model's joint_limits array.
+//! * **Sample-level solver** ([`solve_sample`], [`pad_locked`]) — orchestrates
+//!   the per-sample RR solve and result padding specific to the jointlock sweep.
+//!
+//! Generic utilities that were previously duplicated here have been moved to:
+//! * [`crate::math::kinematics`]: `norm12`, LM constants (`REFINE_EPS`, etc.)
+//! * [`crate::math::postprocess`]: `q_close`, `dedup_solutions`, `wrap_distance`
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::kinematics::{mat4_mul, rot_homogeneous};
-use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
+use crate::math::kinematics::{
+    mat4_mul, norm12, rot_homogeneous, LM_BACKTRACK_MAX, LM_CONVERGENCE_THRESHOLD,
+    LM_INITIAL_LAMBDA, LM_LAMBDA_DECAY, LM_LAMBDA_GROWTH, LM_LAMBDA_MAX, LM_LAMBDA_MIN,
+    REFINE_EPS,
+};
+use crate::math::postprocess::{dedup_solutions, wrap_distance};
+use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
 
 use core::f64::consts::PI;
 
@@ -71,17 +101,6 @@ const CAND_CAP: usize = N_SAMPLES * INNER_MAX;
 pub const MAX_SOLUTIONS: usize = CAND_CAP;
 
 const TWO_PI: f64 = 2.0 * PI;
-
-/// Bounded LM iterations used to sharpen an already-accepted root onto exact FK
-/// closure when `allow_refinement` is set.
-const REFINE_EPS: f64 = 1e-7;
-const LM_INITIAL_LAMBDA: f64 = 1e-6;
-const LM_CONVERGENCE_THRESHOLD: f64 = 1e-13;
-const LM_LAMBDA_GROWTH: f64 = 8.0;
-const LM_LAMBDA_DECAY: f64 = 0.5;
-const LM_LAMBDA_MIN: f64 = 1e-12;
-const LM_LAMBDA_MAX: f64 = 1e8;
-const LM_BACKTRACK_MAX: usize = 12;
 
 /// Signature of a per-sample Raghavan-Roth `(P_sin, P_cos, P_one, Q)` builder.
 pub type PqBuilder = fn(
@@ -266,7 +285,7 @@ pub fn solve(
     // De-duplicate modulo 2π, keeping the lower-residual representative.
     let mut d_q = [[0.0f64; 7]; CAND_CAP];
     let mut d_res = [0.0f64; CAND_CAP];
-    let n_d = dedup7(&cand_q, &cand_res, n_cand, &mut d_q, &mut d_res, dedup_atol);
+    let n_d = dedup_solutions(&cand_q, &cand_res, n_cand, &mut d_q, &mut d_res, dedup_atol);
 
     let mut sol_count = 0usize;
     for i in 0..n_d {
@@ -303,7 +322,7 @@ pub fn solve(
             let mut j = i;
             while j > 0 {
                 if let (Some(prev), Some(curr)) = (solutions[j - 1], solutions[j]) {
-                    if seed_dist7(&prev, seed) > seed_dist7(&curr, seed) {
+                    if wrap_distance(&prev, seed) > wrap_distance(&curr, seed) {
                         solutions.swap(j - 1, j);
                         j -= 1;
                     } else {
@@ -548,6 +567,10 @@ fn dh_matrix(theta: f64, alpha: f64, a: f64, d: f64) -> SMatrix<f64, 4, 4> {
 
 /// Product-of-exponentials forward kinematics of the full 7R chain — mirrors
 /// `rizon{4,10}_ik.fk`. Returns the 4×4 SE(3) pose of the flange in `base_link`.
+///
+/// **Rizon-specific rationale**: This FK uses per-arm geometry from the Model
+/// (axes7, t_lefts7, t_rights7). It cannot be moved to a generic module because
+/// each arm has different kinematic parameters stored in its Model instance.
 pub fn fk(model: &Model, q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
     let mut acc = [
         [1.0, 0.0, 0.0, 0.0],
@@ -598,17 +621,15 @@ fn residual12(model: &Model, q: &[f64; 7], target: &SMatrix<f64, 4, 4>) -> [f64;
     r
 }
 
-fn norm12(r: &[f64; 12]) -> f64 {
-    let mut s = 0.0;
-    for v in r.iter() {
-        s += v * v;
-    }
-    libm::sqrt(s)
-}
-
 /// Levenberg-Marquardt polish of a 7R configuration, **holding the locked joint
 /// fixed**. Refining only the six free joints targets the isolated 6R root and
 /// keeps the redundant 7R from drifting along its self-motion manifold.
+///
+/// **Rizon-specific rationale**: This function cannot use the generic
+/// [`crate::math::kinematics::lm_refine`] because it must mask out the locked
+/// joint (joint 2) during refinement — a constraint specific to the
+/// `jointlock.seven_r` redundancy resolution strategy. The generic LM refines
+/// all DOF simultaneously.
 fn refine7(
     model: &Model,
     q_in: &[f64; 7],
@@ -692,47 +713,6 @@ fn refine7(
 // De-duplication and post-processing helpers
 // ---------------------------------------------------------------------------
 
-/// `true` if joint vectors `a` and `b` agree (mod `2π`) within `tol` per axis.
-fn q_close7(a: &[f64; 7], b: &[f64; 7], tol: f64) -> bool {
-    for i in 0..7 {
-        if libm::fabs(wrap_to_pi(a[i] - b[i])) > tol {
-            return false;
-        }
-    }
-    true
-}
-
-/// Dedup 7-vectors by wrap-to-pi closeness within `tol`, keeping the
-/// lower-residual representative on collision.
-fn dedup7(
-    q: &[[f64; 7]; CAND_CAP],
-    res: &[f64; CAND_CAP],
-    n: usize,
-    out_q: &mut [[f64; 7]; CAND_CAP],
-    out_res: &mut [f64; CAND_CAP],
-    tol: f64,
-) -> usize {
-    let mut m = 0usize;
-    for i in 0..n {
-        let mut dup = usize::MAX;
-        for j in 0..m {
-            if q_close7(&q[i], &out_q[j], tol) {
-                dup = j;
-                break;
-            }
-        }
-        if dup == usize::MAX {
-            out_q[m] = q[i];
-            out_res[m] = res[i];
-            m += 1;
-        } else if res[i] < out_res[dup] {
-            out_q[dup] = q[i];
-            out_res[dup] = res[i];
-        }
-    }
-    m
-}
-
 /// Try `q[i] ± 2π` per joint to bring the vector into the model's joint limits.
 fn wrap_to_limits7(model: &Model, q: &[f64; 7]) -> [f64; 7] {
     let mut out = *q;
@@ -762,16 +742,6 @@ fn in_limits7(model: &Model, q: &[f64; 7]) -> bool {
         }
     }
     true
-}
-
-/// Squared wrap-to-π distance between `q` and `seed`. Used for seed sorting.
-fn seed_dist7(q: &[f64; 7], seed: &[f64; 7]) -> f64 {
-    let mut s = 0.0;
-    for i in 0..7 {
-        let d = wrap_to_pi(q[i] - seed[i]);
-        s += d * d;
-    }
-    s
 }
 
 // ---------------------------------------------------------------------------

@@ -132,6 +132,63 @@ pub fn nearest_to_seed<const N: usize>(
     }
 }
 
+/// Check if two joint configurations are close within `tol` (modulo 2π per joint).
+///
+/// Returns `true` if `|wrap_to_pi(a[i] - b[i])| <= tol` for all joints.
+#[inline]
+pub fn q_close<const N: usize>(a: &[f64; N], b: &[f64; N], tol: f64) -> bool {
+    for i in 0..N {
+        if libm::fabs(wrap_to_pi(a[i] - b[i])) > tol {
+            return false;
+        }
+    }
+    true
+}
+
+/// Deduplicate solutions by wrap-to-pi closeness, keeping lower-residual representatives.
+///
+/// Takes `count` solutions from `solutions` (each paired with a residual in
+/// `residuals`) and writes the deduplicated set into `out_solutions` and
+/// `out_residuals`. Returns the count of unique solutions.
+///
+/// When two solutions are within `tol` of each other (modulo 2π), keeps the one
+/// with the smaller residual. This matches the semantics of the 7R drivers'
+/// per-arm `dedup7` functions.
+///
+/// # Generics
+/// - `N`: Number of joints (DOF)
+/// - `MAX`: Maximum capacity of the solution arrays
+pub fn dedup_solutions<const N: usize, const MAX: usize>(
+    solutions: &[[f64; N]; MAX],
+    residuals: &[f64; MAX],
+    count: usize,
+    out_solutions: &mut [[f64; N]; MAX],
+    out_residuals: &mut [f64; MAX],
+    tol: f64,
+) -> usize {
+    let mut m = 0usize;
+    for i in 0..count {
+        let mut dup = usize::MAX;
+        for j in 0..m {
+            if q_close(&solutions[i], &out_solutions[j], tol) {
+                dup = j;
+                break;
+            }
+        }
+        if dup == usize::MAX {
+            // Not a duplicate: add as new entry
+            out_solutions[m] = solutions[i];
+            out_residuals[m] = residuals[i];
+            m += 1;
+        } else if residuals[i] < out_residuals[dup] {
+            // Is a duplicate, but has lower residual: replace
+            out_solutions[dup] = solutions[i];
+            out_residuals[dup] = residuals[i];
+        }
+    }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
