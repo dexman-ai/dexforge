@@ -13,7 +13,10 @@ class ArmMetadata(NamedTuple):
 
 # Arm registry with metadata from SSIK manifest.
 # This is the canonical list of arms supported by dexforge_py.
-# Metadata (DOF, sample_q, fk_ceiling_fuzz) comes from ssik.prebuilt._manifest.
+# Metadata (DOF, sample_q, fk_ceiling_fuzz) comes from ssik.prebuilt._manifest,
+# which is available at https://github.com/personalrobotics/ssik/blob/main/src/ssik/prebuilt/_manifest.py
+# and populated from MANIFEST.toml in that repository.
+# These values are baked here to allow dexforge tests to run independently.
 ARMS_METADATA = {
     "ur5": ArmMetadata(
         name="ur5",
