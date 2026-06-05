@@ -168,6 +168,27 @@ pub fn frob_diff(a: &Transform, b: &Transform) -> f64 {
     libm::sqrt(s)
 }
 
+/// 12-vector pose residual `[vec(a.R − b.R); a.t − b.t]` between two transforms.
+///
+/// The first 9 elements are the column-major flattening of `(a.R − b.R)` and
+/// the last 3 are the translation difference `a.t − b.t`.  This is the
+/// standard residual vector consumed by [`lm_refine`] and [`dls_ik`].
+#[inline]
+pub fn pose_residual12(a: &Transform, b: &Transform) -> [f64; 12] {
+    let mut r = [0.0f64; 12];
+    let mut k = 0usize;
+    for i in 0..3 {
+        for j in 0..3 {
+            r[k] = a.r[i][j] - b.r[i][j];
+            k += 1;
+        }
+    }
+    for i in 0..3 {
+        r[9 + i] = a.t[i] - b.t[i];
+    }
+    r
+}
+
 // ---------------------------------------------------------------------------
 // Shared Levenberg-Marquardt tuning constants
 //
@@ -327,4 +348,234 @@ where
     F: Fn(&[f64; 6]) -> [f64; 12],
 {
     lm_refine::<6, F>(q_in, residual_fn, max_iters, fk_atol)
+}
+
+// ---------------------------------------------------------------------------
+// DLS (Dampened Least Squares) public refinement API
+// ---------------------------------------------------------------------------
+
+/// Default maximum LM iterations for [`dls_ik`].
+///
+/// 150 iterations is sufficient for convergence of any well-conditioned IK
+/// problem starting from an analytical seed while keeping the worst-case
+/// execution time bounded for real-time control loops.
+pub const DLS_MAX_ITERS: usize = 150;
+
+/// Default FK closure tolerance for [`dls_ik`] (Frobenius norm of the
+/// residual between the actual FK output and the goal pose).
+pub const DLS_FK_ATOL: f64 = 1e-5;
+
+/// Dampened Least Squares (DLS) IK refinement for a **calibrated** arm with
+/// **any** DOF.
+///
+/// Takes an initial joint configuration `q_init` (e.g., the analytical IK
+/// solution computed for the *idealized* arm model) and the actual arm's
+/// forward-kinematics function `fk_fn` (which may differ from the idealized
+/// model due to calibration offsets, manufacturing tolerances, or a different
+/// URDF), and iteratively refines the joint angles until the FK of the actual
+/// arm satisfies the pose goal within `fk_atol`.
+///
+/// Internally delegates to [`lm_refine`] with the standard 12-vector pose
+/// residual `[vec(R(q) − R_goal); t(q) − t_goal]`, so all coding restrictions
+/// are inherited: zero allocation, `#![no_std]`-compatible, and bounded
+/// iteration count (hard-capped at `max_iters`).
+///
+/// # Arguments
+///
+/// * `goal`      — Target end-effector pose as a [`Transform`].
+/// * `q_init`    — Initial joint configuration (radians). Typically the
+///                 analytical IK solution for the idealized arm.
+/// * `fk_fn`     — Forward kinematics of the **actual** arm.  Must be
+///                 deterministic and return a [`Transform`].
+/// * `max_iters` — Hard iteration ceiling. Use [`DLS_MAX_ITERS`] unless a
+///                 tighter real-time budget is needed.
+/// * `fk_atol`   — FK closure tolerance (Frobenius norm). Use [`DLS_FK_ATOL`]
+///                 (`1e-5`) to match the rest of the library.
+///
+/// # Returns
+///
+/// `Some(q_refined)` when `frob_diff(fk_fn(q_refined), goal) ≤ fk_atol`,
+/// `None` if the iteration budget is exhausted without convergence.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Refine a 6-DOF analytical seed onto a calibrated arm.
+/// let q_seed: [f64; 6] = analytical_ik(&idealized_model, &goal);
+/// let q_refined = dls_ik(&goal, &q_seed, |q| calibrated_fk(q), DLS_MAX_ITERS, DLS_FK_ATOL);
+///
+/// // Works for any DOF, e.g. a 7-DOF arm:
+/// let q_seed7: [f64; 7] = analytical_ik7(&idealized_model, &goal);
+/// let q_refined7 = dls_ik(&goal, &q_seed7, |q| calibrated_fk7(q), DLS_MAX_ITERS, DLS_FK_ATOL);
+/// ```
+pub fn dls_ik<const DOF: usize, F>(
+    goal: &Transform,
+    q_init: &[f64; DOF],
+    fk_fn: F,
+    max_iters: usize,
+    fk_atol: f64,
+) -> Option<[f64; DOF]>
+where
+    F: Fn(&[f64; DOF]) -> Transform,
+{
+    lm_refine::<DOF, _>(
+        q_init,
+        |q| pose_residual12(&fk_fn(q), goal),
+        max_iters,
+        fk_atol,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Minimal 2-DOF planar arm for self-contained tests
+    // -----------------------------------------------------------------------
+    //
+    // Two revolute joints in the XY-plane (both around Z), with link lengths
+    // l1 and l2.  The full SE(3) FK is:
+    //
+    //   R = Rz(q[0] + q[1])
+    //   t = [l1·cos(q[0]) + l2·cos(q[0]+q[1]),
+    //        l1·sin(q[0]) + l2·sin(q[0]+q[1]),
+    //        0]
+
+    /// Nominal 2-DOF planar arm (l1 = l2 = 1.0).
+    fn fk_2dof_nominal(q: &[f64; 2]) -> Transform {
+        let a = q[0] + q[1];
+        let (ca, sa) = (libm::cos(a), libm::sin(a));
+        let (c0, s0) = (libm::cos(q[0]), libm::sin(q[0]));
+        Transform {
+            r: [[ca, -sa, 0.0], [sa, ca, 0.0], [0.0, 0.0, 1.0]],
+            t: [c0 + ca, s0 + sa, 0.0],
+        }
+    }
+
+    /// Calibrated 2-DOF planar arm (l1 = 1.01, l2 = 0.99).
+    fn fk_2dof_calibrated(q: &[f64; 2]) -> Transform {
+        const L1: f64 = 1.01;
+        const L2: f64 = 0.99;
+        let a = q[0] + q[1];
+        let (ca, sa) = (libm::cos(a), libm::sin(a));
+        let (c0, s0) = (libm::cos(q[0]), libm::sin(q[0]));
+        Transform {
+            r: [[ca, -sa, 0.0], [sa, ca, 0.0], [0.0, 0.0, 1.0]],
+            t: [L1 * c0 + L2 * ca, L1 * s0 + L2 * sa, 0.0],
+        }
+    }
+
+    /// Nominal 3-DOF spatial arm (revolute joints around Z, Y, Y; links of
+    /// unit length).  Used to verify that `dls_ik` works for DOF > 2.
+    fn fk_3dof_nominal(q: &[f64; 3]) -> Transform {
+        // Joint 0: Rz(q[0]), translation [1,0,0] in body frame
+        // Joint 1: Ry(q[1]), translation [1,0,0] in body frame
+        // Joint 2: Ry(q[2]), no trailing translation (end-effector)
+        let rz = |a: f64| -> [[f64; 3]; 3] {
+            let (c, s) = (libm::cos(a), libm::sin(a));
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+        };
+        let ry = |a: f64| -> [[f64; 3]; 3] {
+            let (c, s) = (libm::cos(a), libm::sin(a));
+            [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
+        };
+        let t0 = Transform { r: rz(q[0]), t: [0.0, 0.0, 0.0] };
+        let l0 = Transform { r: IDENTITY.r, t: [1.0, 0.0, 0.0] };
+        let t1 = Transform { r: ry(q[1]), t: [0.0, 0.0, 0.0] };
+        let l1 = Transform { r: IDENTITY.r, t: [1.0, 0.0, 0.0] };
+        let t2 = Transform { r: ry(q[2]), t: [0.0, 0.0, 0.0] };
+        compose(&compose(&compose(&compose(&t0, &l0), &t1), &l1), &t2)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: converges immediately when q_init is already exact
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dls_ik_already_exact() {
+        let q_true = [0.5f64, -0.3f64];
+        let goal = fk_2dof_nominal(&q_true);
+        let result = dls_ik(&goal, &q_true, fk_2dof_nominal, DLS_MAX_ITERS, DLS_FK_ATOL);
+        assert!(result.is_some(), "expected Some but got None");
+        let residual = frob_diff(&fk_2dof_nominal(&result.unwrap()), &goal);
+        assert!(
+            residual <= DLS_FK_ATOL,
+            "residual {:.2e} > atol {:.2e}",
+            residual,
+            DLS_FK_ATOL
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: converges from a perturbed initial guess (same arm)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dls_ik_perturbed_initial_guess() {
+        let q_true = [1.0f64, -0.7f64];
+        let goal = fk_2dof_nominal(&q_true);
+        // Perturb the initial guess by 0.1 rad in each joint.
+        let q_init = [q_true[0] + 0.1, q_true[1] - 0.1];
+        let result = dls_ik(&goal, &q_init, fk_2dof_nominal, DLS_MAX_ITERS, DLS_FK_ATOL);
+        assert!(result.is_some(), "expected Some but got None");
+        let residual = frob_diff(&fk_2dof_nominal(&result.unwrap()), &goal);
+        assert!(
+            residual <= DLS_FK_ATOL,
+            "residual {:.2e} > atol {:.2e}",
+            residual,
+            DLS_FK_ATOL
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: calibrated-arm scenario — q_init from nominal arm, FK from
+    // calibrated arm.  This is the primary use-case described in the issue.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dls_ik_calibrated_arm() {
+        // True joint angles (valid for the calibrated arm).
+        let q_true = [0.5f64, -0.3f64];
+        // Goal: what the calibrated arm produces at q_true.
+        let goal = fk_2dof_calibrated(&q_true);
+        // q_init: analytical IK from the nominal arm would give angles close
+        // to q_true (but not exact because the arms differ).  We simulate
+        // this with a small perturbation.
+        let q_init = [q_true[0] + 0.02, q_true[1] + 0.02];
+        // DLS with the calibrated FK should converge to q_refined such that
+        // calibrated_fk(q_refined) ≈ goal.
+        let result =
+            dls_ik(&goal, &q_init, fk_2dof_calibrated, DLS_MAX_ITERS, DLS_FK_ATOL);
+        assert!(result.is_some(), "expected Some but got None");
+        let residual = frob_diff(&fk_2dof_calibrated(&result.unwrap()), &goal);
+        assert!(
+            residual <= DLS_FK_ATOL,
+            "residual {:.2e} > atol {:.2e}",
+            residual,
+            DLS_FK_ATOL
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: DOF generality — 3-DOF arm
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dls_ik_3dof() {
+        let q_true = [0.4f64, 0.6f64, -0.5f64];
+        let goal = fk_3dof_nominal(&q_true);
+        let q_init = [q_true[0] + 0.05, q_true[1] - 0.05, q_true[2] + 0.03];
+        let result = dls_ik(&goal, &q_init, fk_3dof_nominal, DLS_MAX_ITERS, DLS_FK_ATOL);
+        assert!(result.is_some(), "expected Some but got None");
+        let residual = frob_diff(&fk_3dof_nominal(&result.unwrap()), &goal);
+        assert!(
+            residual <= DLS_FK_ATOL,
+            "residual {:.2e} > atol {:.2e}",
+            residual,
+            DLS_FK_ATOL
+        );
+    }
 }
