@@ -101,7 +101,6 @@ def solve(
     
     # Call dexforge_py
     solutions_raw = dexforge_py.franka_panda_solve(
-        "franka_panda",
         T_target,
         max_solutions=max_solutions,
         q_seed=q_seed_list,
