@@ -40,8 +40,16 @@ DISPATCH_REASON = "7R revolute chain. Locking one joint reduces to 6R IK."
 # Home pose: computed at module import via FK(zeros)
 T_HOME = None
 
-# Joint limits
-_JOINT_LIMITS = [(-2.7925, 2.7925), (-2.2689, 2.2689), (-2.7925, 2.7925), (-2.2689, 2.2689), (-2.7925, 2.7925), (-2.2689, 2.2689), (-2.9671, 2.9671)]
+# Joint limits (from src/drivers/rizon4/consts.rs)
+_JOINT_LIMITS = [
+    (-2.8798, 2.8798),
+    (-2.3562, 2.3562),
+    (-3.0543, 3.0543),
+    (-1.9548, 2.7751),
+    (-3.0543, 3.0543),
+    (-1.4835, 4.6251),
+    (-3.0543, 3.0543),
+]
 
 
 def fk(q: NDArray[np.float64]) -> NDArray[np.float64]:

@@ -40,8 +40,16 @@ DISPATCH_REASON = "7R revolute chain. Locking one joint reduces to 6R IK."
 # Home pose: computed at module import via FK(zeros)
 T_HOME = None
 
-# Joint limits
-_JOINT_LIMITS = [(-6.28318530717959, 6.28318530717959), (-2.059, 2.0944), (-6.28318530717959, 6.28318530717959), (-0.19198, 3.927), (-6.28318530717959, 6.28318530717959), (-1.69297, 3.14159265358979), (-6.28318530717959, 6.28318530717959)]
+# Joint limits (from src/drivers/xarm7/ik_solver.rs)
+_JOINT_LIMITS = [
+    (-6.28318530717959, 6.28318530717959),  # q1 — full revolution
+    (-2.059, 2.0944),                        # q2
+    (-6.28318530717959, 6.28318530717959),  # q3 — full revolution
+    (-0.19198, 3.927),                       # q4 — mostly positive
+    (-6.28318530717959, 6.28318530717959),  # q5 — full revolution
+    (-1.69297, 3.14159265358979),            # q6
+    (-6.28318530717959, 6.28318530717959),  # q7 — full revolution
+]
 
 
 def fk(q: NDArray[np.float64]) -> NDArray[np.float64]:
