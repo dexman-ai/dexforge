@@ -163,6 +163,35 @@ The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4
 base→end-effector SE(3) pose, matching the existing per-arm `fk` drivers) and
 `jacobian(q: &[f64; N]) -> [[f64; N]; 6]` (the `[Jv; Jw]` geometric Jacobian).
 
+#### Inverse dynamics (gravity, mass matrix, Coriolis)
+
+The ssik artifact carries only the kinematic chain, so the manipulator
+**dynamics** are derived from the *physical* properties in a URDF. Pass
+`--urdf <file>` (whose actuated-joint order matches the artifact) and the
+generator additionally emits, via the energy (Lagrangian) method:
+
+| Function | Returns | Meaning |
+| --- | --- | --- |
+| `gravity(q)` | `[f64; N]` | holding torque `τ = ∂U/∂q` for `U = −Σ mᵢ (g·p_comᵢ)` |
+| `mass_matrix(q)` | `[[f64; N]; N]` | symmetric inertia `M = Σ (mᵢ Jvᵢᵀ Jvᵢ + Jwᵢᵀ Rᵢ Iᵢ Rᵢᵀ Jwᵢ)` |
+| `coriolis(q, qd)` | `[f64; N]` | `C(q, q̇) q̇` from the Christoffel symbols of the first kind |
+| `inverse_dynamics(q, qd, qdd)` | `[f64; N]` | MIT-mode feed-forward `τ = M q̈ + C q̇ + g` |
+
+```sh
+# Kinematics from the artifact, masses/inertias from a URDF; default gravity
+# is (0, 0, −9.81), override with --gravity GX GY GZ:
+python codegen/generate_dynamics.py --artifact ur5_ik \
+    --urdf src/drivers/ur5/ur5_inertial.urdf \
+    --gravity 0 0 -9.81 \
+    --output src/drivers/ur5/dynamics.rs
+```
+
+Like FK/Jacobian, every dynamics function is a flat `sympy.cse()` body of `libm`
+arithmetic — no heap, no branches, no loops. The derivation is validated against
+an independent closed-form planar model in
+`codegen/tests/test_generate_dynamics.py`. The path is all-revolute (every arm
+currently in the repo); prismatic joints contribute to the linear Jacobian only.
+
 
 ## Development
 

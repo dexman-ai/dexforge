@@ -41,6 +41,33 @@ Usage::
     # From a local artifact .py file, writing to a driver module:
     python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
         --output src/drivers/my_arm/dynamics.rs
+
+    # Also emit inverse-dynamics (gravity / mass-matrix / Coriolis) by sourcing
+    # the link masses + inertias from a URDF whose actuated-joint order matches
+    # the artifact (the URDF supplies the *physical* properties the kinematics
+    # artifact does not carry):
+    python codegen/generate_dynamics.py --artifact ur5_ik \
+        --urdf src/drivers/ur5/ur5_inertial.urdf \
+        --output src/drivers/ur5/dynamics.rs
+
+Dynamics (gravity, mass matrix, Coriolis, inverse dynamics)
+-----------------------------------------------------------
+When ``--urdf`` points at a URDF that carries ``<inertial>`` blocks (link
+masses, centres of mass and inertia tensors), the generator also derives the
+manipulator dynamics with the energy (Lagrangian) method and emits matching
+``#![no_std]`` Rust:
+
+* ``gravity(q) -> [f64; N]`` — holding torque ``tau = dU/dq`` from the total
+  potential energy ``U = -sum_i m_i (g . p_com_i)``.
+* ``mass_matrix(q) -> [[f64; N]; N]`` — symmetric inertia matrix
+  ``M = sum_i (m_i Jv_i^T Jv_i + Jw_i^T R_i I_i R_i^T Jw_i)``.
+* ``coriolis(q, qd) -> [f64; N]`` — ``C(q, qd) qd`` from the Christoffel symbols
+  of the first kind.
+* ``inverse_dynamics(q, qd, qdd) -> [f64; N]`` — ``M qdd + C qd + g`` for the
+  MIT-mode torque feed-forward.
+
+The dynamics path is all-revolute (every arm currently in the repo); prismatic
+joints contribute to the linear Jacobian only and carry no angular inertia term.
 """
 
 from __future__ import annotations
@@ -50,8 +77,10 @@ import importlib
 import importlib.util
 import sys
 import types
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import sympy as sp
@@ -215,6 +244,350 @@ def build_jacobian(
 
 
 # ---------------------------------------------------------------------------
+# URDF inertial properties (link masses / centres of mass / inertia tensors)
+#
+# The ssik kinematics artifact deliberately carries no physical properties, so
+# the manipulator dynamics is sourced from a URDF whose actuated-joint order
+# matches the artifact chain.  Only the ``<inertial>`` blocks are consumed here;
+# the kinematics (and hence FK/Jacobian) still come from the artifact.
+# ---------------------------------------------------------------------------
+
+_PI_MULTIPLE_TOL = 1e-9
+
+
+@dataclass
+class Inertial:
+    """Mass, centre-of-mass pose and inertia tensor of a single URDF link."""
+
+    mass: float
+    com_xyz: Tuple[float, float, float]
+    com_rpy: Tuple[float, float, float]
+    # Inertia tensor about the centre of mass, expressed in the inertial frame.
+    ixx: float
+    ixy: float
+    ixz: float
+    iyy: float
+    iyz: float
+    izz: float
+
+
+@dataclass
+class UrdfJoint:
+    """A single actuated/fixed URDF joint with its child link inertial (if any)."""
+
+    name: str
+    jtype: str
+    parent: str
+    child: str
+    axis: Tuple[float, float, float]
+    child_inertial: Optional[Inertial] = field(default=None)
+
+    @property
+    def actuated(self) -> bool:
+        return self.jtype in ("revolute", "continuous", "prismatic")
+
+
+def _parse_triple(text: Optional[str], default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    if text is None:
+        return default
+    parts = [float(v) for v in text.split()]
+    if len(parts) != 3:
+        raise ValueError(f"expected 3 values, got {text!r}")
+    return (parts[0], parts[1], parts[2])
+
+
+def _parse_inertials(root: ET.Element) -> Dict[str, Inertial]:
+    """Collect ``<inertial>`` blocks keyed by link name (links without one are skipped)."""
+    out: Dict[str, Inertial] = {}
+    for link in root.findall("link"):
+        name = link.get("name")
+        inertial = link.find("inertial")
+        if name is None or inertial is None:
+            continue
+        mass_el = inertial.find("mass")
+        inertia_el = inertial.find("inertia")
+        if mass_el is None or inertia_el is None:
+            continue
+        origin = inertial.find("origin")
+        com_xyz = _parse_triple(origin.get("xyz") if origin is not None else None, (0.0, 0.0, 0.0))
+        com_rpy = _parse_triple(origin.get("rpy") if origin is not None else None, (0.0, 0.0, 0.0))
+
+        def _i(attr: str) -> float:
+            return float(inertia_el.get(attr, "0"))
+
+        out[name] = Inertial(
+            mass=float(mass_el.get("value", "0")),
+            com_xyz=com_xyz,
+            com_rpy=com_rpy,
+            ixx=_i("ixx"),
+            ixy=_i("ixy"),
+            ixz=_i("ixz"),
+            iyy=_i("iyy"),
+            iyz=_i("iyz"),
+            izz=_i("izz"),
+        )
+    return out
+
+
+def parse_urdf_joints(path: Path) -> List[UrdfJoint]:
+    """Parse the serial joint chain plus each child link's inertial block."""
+    root = ET.parse(path).getroot()
+    inertials = _parse_inertials(root)
+    joints: List[UrdfJoint] = []
+    for j in root.findall("joint"):
+        parent = j.find("parent")
+        child = j.find("child")
+        if parent is None or child is None:
+            raise ValueError(f"joint {j.get('name')!r} missing parent/child")
+        axis_el = j.find("axis")
+        axis = _parse_triple(axis_el.get("xyz") if axis_el is not None else None, (0.0, 0.0, 1.0))
+        child_link = child.get("link")
+        joints.append(
+            UrdfJoint(
+                name=j.get("name", "?"),
+                jtype=j.get("type", "fixed"),
+                parent=parent.get("link"),
+                child=child_link,
+                axis=axis,
+                child_inertial=inertials.get(child_link),
+            )
+        )
+    return joints
+
+
+def order_urdf_chain(joints: List[UrdfJoint]) -> List[UrdfJoint]:
+    """Order URDF joints into the unique serial base->ee chain (topological walk)."""
+    by_parent: Dict[str, List[UrdfJoint]] = {}
+    for jt in joints:
+        by_parent.setdefault(jt.parent, []).append(jt)
+    children = {jt.child for jt in joints}
+    parents = {jt.parent for jt in joints}
+    roots = [p for p in parents if p not in children]
+    leaves = [c for c in children if c not in parents]
+    if len(roots) != 1 or len(leaves) != 1:
+        raise ValueError(
+            f"URDF is not a single serial chain (roots={sorted(roots)}, leaves={sorted(leaves)})"
+        )
+    chain: List[UrdfJoint] = []
+    link = roots[0]
+    ee = leaves[0]
+    while link != ee:
+        outgoing = by_parent.get(link)
+        if not outgoing or len(outgoing) != 1:
+            raise ValueError(f"URDF chain branches or breaks at link {link!r}")
+        jt = outgoing[0]
+        chain.append(jt)
+        link = jt.child
+    return chain
+
+
+def _rpy_to_rot(roll: float, pitch: float, yaw: float) -> sp.Matrix:
+    """URDF fixed-axis RPY: ``R = Rz(yaw) Ry(pitch) Rx(roll)`` (numeric, constant)."""
+
+    def rot_x(a):
+        c, s = sp.Float(np.cos(a), 17), sp.Float(np.sin(a), 17)
+        return sp.Matrix([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+    def rot_y(a):
+        c, s = sp.Float(np.cos(a), 17), sp.Float(np.sin(a), 17)
+        return sp.Matrix([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+    def rot_z(a):
+        c, s = sp.Float(np.cos(a), 17), sp.Float(np.sin(a), 17)
+        return sp.Matrix([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    return rot_z(yaw) * rot_y(pitch) * rot_x(roll)
+
+
+def _snap_matrix(m: sp.Matrix) -> sp.Matrix:
+    return sp.Matrix(m.rows, m.cols, [_snap(float(v)) for v in m])
+
+
+@dataclass
+class RigidBody:
+    """A massive link: its base->COM symbolic pose plus inertia, ready for energy terms."""
+
+    mass: sp.Expr
+    p_com: sp.Matrix          # 3x1 COM position in the base frame (function of q)
+    r_inertia: sp.Matrix      # 3x3 orientation of the inertia frame in the base frame
+    inertia_local: sp.Matrix  # 3x3 inertia about the COM in its own frame
+    n_preceding: int          # number of actuated joints that move this body
+
+
+def build_bodies(
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+    t_rights: List[sp.Matrix],
+    q_syms: List[sp.Symbol],
+    urdf_chain: List[UrdfJoint],
+) -> List[RigidBody]:
+    """Pair the artifact's per-joint link frames with the URDF inertial blocks.
+
+    The artifact joint ``i`` and URDF actuated joint ``i`` describe the same
+    revolute axis.  The child link of URDF joint ``i`` is rigidly attached to
+    that joint, so its body frame is ``frames[i] . Rot(axis_i, q_i)`` (the joint
+    frame after the joint rotates).  The URDF inertial ``<origin>`` (centre of
+    mass) is expressed in that child-link frame, hence ``T_right[i]`` — which
+    only translates on towards the *next* joint — is intentionally not applied.
+    """
+    actuated = [jt for jt in urdf_chain if jt.actuated]
+    if len(actuated) != len(axes):
+        raise ValueError(
+            f"URDF actuated joints ({len(actuated)}) != artifact DOF ({len(axes)}); "
+            "the URDF chain must match the kinematics artifact"
+        )
+
+    bodies: List[RigidBody] = []
+    for i, (axis, frame, q, jt) in enumerate(zip(axes, frames, q_syms, actuated)):
+        inertial = jt.child_inertial
+        if inertial is None or inertial.mass <= 0.0:
+            continue
+        link_t = frame * _axis_angle_rot(axis, q)
+        r_link = link_t[:3, :3]
+        p_link = link_t[:3, 3]
+        com_local = sp.Matrix([_snap(v) for v in inertial.com_xyz])
+        r_com = _snap_matrix(_rpy_to_rot(*inertial.com_rpy))
+        p_com = p_link + r_link * com_local
+        r_inertia = r_link * r_com
+        inertia_local = _snap_matrix(
+            sp.Matrix(
+                [
+                    [inertial.ixx, inertial.ixy, inertial.ixz],
+                    [inertial.ixy, inertial.iyy, inertial.iyz],
+                    [inertial.ixz, inertial.iyz, inertial.izz],
+                ]
+            )
+        )
+        bodies.append(
+            RigidBody(
+                mass=_snap(inertial.mass),
+                p_com=p_com,
+                r_inertia=r_inertia,
+                inertia_local=inertia_local,
+                n_preceding=i + 1,
+            )
+        )
+    return bodies
+
+
+def build_gravity(
+    bodies: List[RigidBody], q_syms: List[sp.Symbol], gravity: Tuple[float, float, float]
+) -> sp.Matrix:
+    """Gravity (holding) torque ``tau_j = dU/dq_j`` from total potential energy."""
+    g_vec = sp.Matrix([_snap(v) for v in gravity])
+    u = sp.Integer(0)
+    for b in bodies:
+        u -= b.mass * (g_vec.dot(b.p_com))
+    n = len(q_syms)
+    tau = sp.Matrix([sp.diff(u, q_syms[j]) for j in range(n)])
+    return tau
+
+
+def _body_jacobians(
+    body: RigidBody, q_syms: List[sp.Symbol], axes: List[sp.Matrix], frames: List[sp.Matrix]
+) -> Tuple[sp.Matrix, sp.Matrix]:
+    """Linear (COM) and angular Jacobians (3xN each) of a single rigid body."""
+    n = len(q_syms)
+    jv = body.p_com.jacobian(sp.Matrix(q_syms))
+    jw_cols = []
+    for j in range(n):
+        if j < body.n_preceding:
+            r = frames[j][:3, :3]
+            jw_cols.append(r * axes[j])  # revolute axis in the base frame
+        else:
+            jw_cols.append(sp.zeros(3, 1))
+    jw = sp.Matrix.hstack(*jw_cols)
+    return jv, jw
+
+
+def build_mass_matrix(
+    bodies: List[RigidBody],
+    q_syms: List[sp.Symbol],
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+) -> sp.Matrix:
+    """Symmetric joint-space inertia matrix ``M(q)`` (NxN) via the energy method."""
+    n = len(q_syms)
+    m = sp.zeros(n, n)
+    for b in bodies:
+        jv, jw = _body_jacobians(b, q_syms, axes, frames)
+        i_world = b.r_inertia * b.inertia_local * b.r_inertia.T
+        m += b.mass * (jv.T * jv) + jw.T * i_world * jw
+    return m
+
+
+def build_coriolis(
+    mass_matrix: sp.Matrix, q_syms: List[sp.Symbol], qd_syms: List[sp.Symbol]
+) -> sp.Matrix:
+    """Coriolis/centrifugal torque ``C(q, qd) qd`` from Christoffel symbols."""
+    n = len(q_syms)
+    tau = sp.zeros(n, 1)
+    for i in range(n):
+        acc = sp.Integer(0)
+        for j in range(n):
+            for k in range(n):
+                c_ijk = sp.Rational(1, 2) * (
+                    sp.diff(mass_matrix[i, j], q_syms[k])
+                    + sp.diff(mass_matrix[i, k], q_syms[j])
+                    - sp.diff(mass_matrix[j, k], q_syms[i])
+                )
+                acc += c_ijk * qd_syms[k] * qd_syms[j]
+        tau[i] = acc
+    return tau
+
+
+@dataclass
+class Dynamics:
+    """Symbolic dynamics terms ready for Rust emission."""
+
+    q_syms: List[sp.Symbol]
+    qd_syms: List[sp.Symbol]
+    qdd_syms: List[sp.Symbol]
+    gravity: sp.Matrix
+    mass_matrix: sp.Matrix
+    coriolis: sp.Matrix
+    inverse_dynamics: sp.Matrix
+
+
+def build_dynamics(
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+    t_rights: List[sp.Matrix],
+    q_syms: List[sp.Symbol],
+    urdf_path: Path,
+    gravity: Tuple[float, float, float],
+) -> Dynamics:
+    """Derive gravity / mass-matrix / Coriolis / inverse-dynamics symbolically."""
+    urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path))
+    bodies = build_bodies(axes, frames, t_rights, q_syms, urdf_chain)
+    if not bodies:
+        raise ValueError(
+            f"URDF {urdf_path} has no positive-mass <inertial> blocks on the chain; "
+            "cannot derive dynamics"
+        )
+
+    n = len(q_syms)
+    qd_syms = [sp.Symbol(f"qd{i}") for i in range(n)]
+    qdd_syms = [sp.Symbol(f"qdd{i}") for i in range(n)]
+
+    grav = build_gravity(bodies, q_syms, gravity)
+    mass = build_mass_matrix(bodies, q_syms, axes, frames)
+    cor = build_coriolis(mass, q_syms, qd_syms)
+    qdd_vec = sp.Matrix(qdd_syms)
+    inv_dyn = mass * qdd_vec + cor + grav
+
+    return Dynamics(
+        q_syms=q_syms,
+        qd_syms=qd_syms,
+        qdd_syms=qdd_syms,
+        gravity=grav,
+        mass_matrix=mass,
+        coriolis=cor,
+        inverse_dynamics=inv_dyn,
+    )
+
+
+# ---------------------------------------------------------------------------
 # no_std Rust printer
 # ---------------------------------------------------------------------------
 
@@ -312,8 +685,22 @@ def _emit_matrix(
     return lines
 
 
+def _emit_vector(
+    name: str,
+    vector: sp.Matrix,
+    printer: NoStdRustPrinter,
+    n: int,
+) -> List[str]:
+    exprs = [rust_literal(vector[i], printer) for i in range(n)]
+    return [f"    let {name}: [f64; {n}] = [" + ", ".join(exprs) + "];"]
+
+
+def _unpack_array(name: str, syms: List[sp.Symbol], printer: NoStdRustPrinter) -> List[str]:
+    return [f"    let {printer.doprint(s)} = {name}[{i}];" for i, s in enumerate(syms)]
+
+
 def _unpack_q(q_syms: List[sp.Symbol], printer: NoStdRustPrinter) -> List[str]:
-    return [f"    let {printer.doprint(q)} = q[{i}];" for i, q in enumerate(q_syms)]
+    return _unpack_array("q", q_syms, printer)
 
 
 def _emit_cse(replacements, printer: NoStdRustPrinter) -> List[str]:
@@ -323,6 +710,47 @@ def _emit_cse(replacements, printer: NoStdRustPrinter) -> List[str]:
     ]
 
 
+def _emit_fn_matrix(
+    out: List[str],
+    signature: str,
+    ret_name: str,
+    rows: int,
+    cols: int,
+    matrix: sp.Matrix,
+    arg_unpacks: List[str],
+    printer: NoStdRustPrinter,
+) -> None:
+    repls, reduced = sp.cse(list(matrix), optimizations="basic")
+    reduced_mat = sp.Matrix(rows, cols, reduced)
+    out.append(signature)
+    out.extend(arg_unpacks)
+    out.extend(_emit_cse(repls, printer))
+    out.extend(_emit_matrix(ret_name, reduced_mat, printer, rows, cols))
+    out.append(f"    {ret_name}")
+    out.append("}")
+    out.append("")
+
+
+def _emit_fn_vector(
+    out: List[str],
+    signature: str,
+    ret_name: str,
+    n: int,
+    vector: sp.Matrix,
+    arg_unpacks: List[str],
+    printer: NoStdRustPrinter,
+) -> None:
+    repls, reduced = sp.cse(list(vector), optimizations="basic")
+    reduced_vec = sp.Matrix(reduced)
+    out.append(signature)
+    out.extend(arg_unpacks)
+    out.extend(_emit_cse(repls, printer))
+    out.extend(_emit_vector(ret_name, reduced_vec, printer, n))
+    out.append(f"    {ret_name}")
+    out.append("}")
+    out.append("")
+
+
 def generate_rust(
     arm: str,
     n: int,
@@ -330,6 +758,7 @@ def generate_rust(
     jac: sp.Matrix,
     q_syms: List[sp.Symbol],
     script_name: str,
+    dynamics: Optional["Dynamics"] = None,
 ) -> str:
     printer = NoStdRustPrinter({"contract": False})
 
@@ -353,35 +782,97 @@ def generate_rust(
     out.append("")
 
     # --- fk ---
-    repls_fk, reduced_fk = sp.cse(list(t_ee), optimizations="basic")
-    reduced_fk_mat = sp.Matrix(4, 4, reduced_fk)
-
     out.append("/// Forward kinematics: base -> end-effector SE(3) pose.")
     out.append("///")
     out.append("/// Returns the 4x4 homogeneous transform as a row-major array.")
-    out.append(f"pub fn fk(q: &[f64; {n}]) -> [[f64; 4]; 4] {{")
-    out.extend(_unpack_q(q_syms, printer))
-    out.extend(_emit_cse(repls_fk, printer))
-    out.extend(_emit_matrix("m", reduced_fk_mat, printer, 4, 4))
-    out.append("    m")
-    out.append("}")
-    out.append("")
+    _emit_fn_matrix(
+        out,
+        f"pub fn fk(q: &[f64; {n}]) -> [[f64; 4]; 4] {{",
+        "m",
+        4,
+        4,
+        t_ee,
+        _unpack_q(q_syms, printer),
+        printer,
+    )
 
     # --- jacobian ---
-    repls_j, reduced_j = sp.cse(list(jac), optimizations="basic")
-    reduced_j_mat = sp.Matrix(6, n, reduced_j)
-
     out.append("/// Geometric Jacobian `[Jv; Jw]` (6 x DOF) of the end-effector.")
     out.append("///")
     out.append("/// Rows 0-2 are linear velocity, rows 3-5 are angular velocity.")
-    out.append(f"pub fn jacobian(q: &[f64; {n}]) -> [[f64; {n}]; 6] {{")
-    out.extend(_unpack_q(q_syms, printer))
-    out.extend(_emit_cse(repls_j, printer))
-    out.extend(_emit_matrix("j", reduced_j_mat, printer, 6, n))
-    out.append("    j")
-    out.append("}")
-    out.append("")
+    _emit_fn_matrix(
+        out,
+        f"pub fn jacobian(q: &[f64; {n}]) -> [[f64; {n}]; 6] {{",
+        "j",
+        6,
+        n,
+        jac,
+        _unpack_q(q_syms, printer),
+        printer,
+    )
+
+    if dynamics is not None:
+        _emit_dynamics(out, n, dynamics, printer)
+
     return "\n".join(out)
+
+
+def _emit_dynamics(
+    out: List[str], n: int, dyn: "Dynamics", printer: NoStdRustPrinter
+) -> None:
+    q_unpack = _unpack_q(dyn.q_syms, printer)
+    qd_unpack = _unpack_array("qd", dyn.qd_syms, printer)
+    qdd_unpack = _unpack_array("qdd", dyn.qdd_syms, printer)
+
+    out.append("/// Gravity (holding) torque `tau = dU/dq` for each joint.")
+    out.append("///")
+    out.append("/// Derived from the total potential energy of the link masses.")
+    _emit_fn_vector(
+        out,
+        f"pub fn gravity(q: &[f64; {n}]) -> [f64; {n}] {{",
+        "g",
+        n,
+        dyn.gravity,
+        q_unpack,
+        printer,
+    )
+
+    out.append("/// Joint-space inertia (mass) matrix `M(q)` (symmetric, DOF x DOF).")
+    _emit_fn_matrix(
+        out,
+        f"pub fn mass_matrix(q: &[f64; {n}]) -> [[f64; {n}]; {n}] {{",
+        "mm",
+        n,
+        n,
+        dyn.mass_matrix,
+        q_unpack,
+        printer,
+    )
+
+    out.append("/// Coriolis & centrifugal torque `C(q, qd) qd` for each joint.")
+    _emit_fn_vector(
+        out,
+        f"pub fn coriolis(q: &[f64; {n}], qd: &[f64; {n}]) -> [f64; {n}] {{",
+        "c",
+        n,
+        dyn.coriolis,
+        q_unpack + qd_unpack,
+        printer,
+    )
+
+    out.append("/// Inverse dynamics torque `tau = M(q) qdd + C(q, qd) qd + g(q)`.")
+    out.append("///")
+    out.append("/// MIT-mode feed-forward torque for a desired joint acceleration.")
+    _emit_fn_vector(
+        out,
+        f"pub fn inverse_dynamics(q: &[f64; {n}], qd: &[f64; {n}], qdd: &[f64; {n}]) "
+        f"-> [f64; {n}] {{",
+        "tau",
+        n,
+        dyn.inverse_dynamics,
+        q_unpack + qd_unpack + qdd_unpack,
+        printer,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +898,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="Destination .rs file (default: write to stdout).",
     )
+    parser.add_argument(
+        "--urdf",
+        type=Path,
+        default=None,
+        help=(
+            "Optional URDF carrying <inertial> blocks (link masses/inertias). When "
+            "given, also emit gravity/mass_matrix/coriolis/inverse_dynamics. The "
+            "URDF's actuated-joint order must match the kinematics artifact."
+        ),
+    )
+    parser.add_argument(
+        "--gravity",
+        type=float,
+        nargs=3,
+        metavar=("GX", "GY", "GZ"),
+        default=(0.0, 0.0, -9.81),
+        help="Gravitational acceleration vector in the base frame (default: 0 0 -9.81).",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -422,7 +931,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
     jac = build_jacobian(t_ee, axes, frames)
-    rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name)
+
+    dynamics = None
+    if args.urdf is not None:
+        if not args.urdf.exists():
+            print(f"[generate_dynamics] ERROR: URDF not found: {args.urdf}", file=sys.stderr)
+            return 1
+        try:
+            dynamics = build_dynamics(
+                axes, frames, t_rights, q_syms, args.urdf, tuple(args.gravity)
+            )
+        except ValueError as exc:
+            print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(
+            f"[generate_dynamics] {arm}: dynamics from {args.urdf} "
+            f"(gravity={tuple(args.gravity)})",
+            file=sys.stderr,
+        )
+
+    rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name, dynamics)
 
     if args.output is None:
         sys.stdout.write(rust)
