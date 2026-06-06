@@ -162,6 +162,10 @@ python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
 The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4
 base→end-effector SE(3) pose, matching the existing per-arm `fk` drivers) and
 `jacobian(q: &[f64; N]) -> [[f64; N]; 6]` (the `[Jv; Jw]` geometric Jacobian).
+The UR5 driver's `fk` (`src/drivers/ur5/ik_solver.rs`) delegates to the
+generated, branch-free `generated_kinematics::fk`
+(`src/drivers/ur5/generated_kinematics.rs`) instead of the old loop over the
+baked chain constants.
 
 #### Inverse dynamics (gravity, mass matrix, Coriolis)
 
