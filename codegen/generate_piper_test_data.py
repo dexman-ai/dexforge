@@ -71,9 +71,9 @@ def _rust_solutions(poses):
 
     out = []
     for t in poses:
-        # dexforge_py.piper_solve expects row-major 4x4 matrix as flat list
+        # dexforge_py.piper.solve expects row-major 4x4 matrix as flat list
         pose_flat = t.reshape(-1).tolist()
-        sols = dexforge_py.piper_solve(pose_flat)
+        sols = dexforge_py.piper.solve(pose_flat)
         # Convert to list of numpy arrays
         out.append([np.array(q, dtype=np.float64) for q in sols])
     return out

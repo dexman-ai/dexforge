@@ -65,13 +65,13 @@ def _rust_solutions(arm, poses):
     sys.path.insert(0, os.path.join(REPO_ROOT, "dexforge-py"))
     import dexforge_py
 
-    solve_fn = getattr(dexforge_py, f"{arm}_solve")
+    arm_module = getattr(dexforge_py, arm)
     
     out = []
     for t in poses:
         # dexforge_py expects row-major 4x4 matrix as flat list
         pose_flat = t.reshape(-1).tolist()
-        sols = solve_fn(pose_flat)
+        sols = arm_module.solve(pose_flat)
         # Convert to list of numpy arrays
         out.append([np.array(q, dtype=np.float64) for q in sols])
     return out
