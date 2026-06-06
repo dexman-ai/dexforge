@@ -53,6 +53,7 @@ use crate::math::ssik_core::{
     add3, dot3, mat3_mul, mat3_transpose, mat3_vec, mat3t_vec, neg3, norm3, rotate,
     rotation_matrix, sp1_solve, sp3_solve, sp4_solve, sp5_solve, sub3, wrap_to_pi,
 };
+pub use crate::math::tolerances::TolerancePolicy;
 
 use super::consts;
 
@@ -118,37 +119,6 @@ pub const T_HOME: [[f64; 4]; 4] = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
-/// Tolerance policy — mirrors `ssik.core.tolerances.TolerancePolicy`.
-///
-/// Pass [`TolerancePolicy::DEFAULT`] to match Python's
-/// `DEFAULT_TOLERANCE_POLICY` (`subproblem_numerical = 1e-5`,
-/// `subproblem_dedup = 1e-3`).
-#[derive(Clone, Copy, Debug)]
-pub struct TolerancePolicy {
-    /// FK closure tolerance (== `subproblem_numerical`). Candidates whose
-    /// Frobenius-norm FK residual exceeds this value are rejected (or polished
-    /// when `allow_refinement = true`).
-    pub fk_atol: f64,
-    /// Wrap-to-pi de-duplication tolerance (== `subproblem_dedup`). Two
-    /// configurations that agree to within this value per joint (mod `2*pi`)
-    /// are treated as the same root.
-    pub dedup_atol: f64,
-}
-
-impl TolerancePolicy {
-    /// Default policy matching Python's `DEFAULT_TOLERANCE_POLICY`.
-    pub const DEFAULT: TolerancePolicy = TolerancePolicy {
-        fk_atol: 1e-5,
-        dedup_atol: 1e-3,
-    };
-}
-
-// --- tolerances (ssik DEFAULT_TOLERANCE_POLICY) ---
-const NUM_TOL: f64 = 1e-5; // subproblem_numerical
-const DEG_TOL: f64 = 1e-12; // subproblem_degeneracy
-const FEAS_TOL: f64 = 1e-9; // subproblem_feasibility
-const DEDUP_TOL: f64 = 1e-3; // subproblem_dedup
-const FK_ATOL: f64 = 1e-5; // FK closure tolerance (== subproblem_numerical)
 
 /// Joint angle limits `(lo, hi)` in radians — baked from `_JOINT_LIMITS` in
 /// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
@@ -244,6 +214,7 @@ fn wrist_branches(
     q3: f64,
     out: &mut [[f64; 6]; INNER_MAX],
     n: &mut usize,
+    policy: TolerancePolicy,
 ) {
     let axes = &consts::SUB_AXES[sample];
     let r36 = mat3_mul(
@@ -255,7 +226,14 @@ fn wrist_branches(
     );
 
     let d = dot3(&axes[3], &mat3_vec(&r36, &axes[5]));
-    let (t5, n5) = sp4_solve(&axes[3], &axes[4], &axes[5], d, FEAS_TOL, DEG_TOL);
+    let (t5, n5) = sp4_solve(
+        &axes[3],
+        &axes[4],
+        &axes[5],
+        d,
+        policy.subproblem_feasibility,
+        policy.subproblem_degeneracy,
+    );
     for j in 0..n5 {
         let q5 = t5[j];
         let q4 = sp1_solve(
@@ -276,7 +254,12 @@ fn wrist_branches(
 }
 
 /// `ikgeo.spherical` on reversed sub-chain `sample` with target `tt`.
-fn spherical_candidates(sample: usize, tt: &Transform, out: &mut [[f64; 6]; INNER_MAX]) -> usize {
+fn spherical_candidates(
+    sample: usize,
+    tt: &Transform,
+    out: &mut [[f64; 6]; INNER_MAX],
+    policy: TolerancePolicy,
+) -> usize {
     let axes = &consts::SUB_AXES[sample];
     let tl = &consts::SUB_TL[sample];
     let p0 = tl[0];
@@ -300,21 +283,26 @@ fn spherical_candidates(sample: usize, tt: &Transform, out: &mut [[f64; 6]; INNE
         &neg3(&axes[0]),
         &axes[1],
         &axes[2],
-        NUM_TOL,
-        DEG_TOL,
-        DEDUP_TOL,
+        policy.subproblem_numerical,
+        policy.subproblem_degeneracy,
+        policy.subproblem_dedup,
     );
 
     let mut n = 0usize;
     for ti in 0..n_tri {
         let (q1, q2, q3) = (triples[ti][0], triples[ti][1], triples[ti][2]);
-        wrist_branches(sample, &r06, q1, q2, q3, out, &mut n);
+        wrist_branches(sample, &r06, q1, q2, q3, out, &mut n, policy);
     }
     n
 }
 
 /// `ikgeo.spherical_two_parallel` on reversed sub-chain `sample`, target `tt`.
-fn sph2par_candidates(sample: usize, tt: &Transform, out: &mut [[f64; 6]; INNER_MAX]) -> usize {
+fn sph2par_candidates(
+    sample: usize,
+    tt: &Transform,
+    out: &mut [[f64; 6]; INNER_MAX],
+    policy: TolerancePolicy,
+) -> usize {
     let axes = &consts::SUB_AXES[sample];
     let tl = &consts::SUB_TL[sample];
     let p0 = tl[0];
@@ -330,7 +318,14 @@ fn sph2par_candidates(sample: usize, tt: &Transform, out: &mut [[f64; 6]; INNER_
     // SP4 for q1: axes[1] . Rot(-axes0, q1)(p0t - r06 p6 - p0) = axes[1].(p1+p2+p3)
     let p_arg = sub3(&sub3(&p0t, &mat3_vec(&r06, &p6)), &p0);
     let d1 = dot3(&axes[1], &add3(&add3(&p1, &p2), &p3));
-    let (t1, n1) = sp4_solve(&axes[1], &neg3(&axes[0]), &p_arg, d1, FEAS_TOL, DEG_TOL);
+    let (t1, n1) = sp4_solve(
+        &axes[1],
+        &neg3(&axes[0]),
+        &p_arg,
+        d1,
+        policy.subproblem_feasibility,
+        policy.subproblem_degeneracy,
+    );
 
     let mut n = 0usize;
     for i1 in 0..n1 {
@@ -339,19 +334,26 @@ fn sph2par_candidates(sample: usize, tt: &Transform, out: &mut [[f64; 6]; INNER_
         let inner = add3(&add3(&neg3(&p0t), &mat3_vec(&r06, &p6)), &p0);
         let shoulder = add3(&mat3_vec(&rotation_matrix(&neg3(&axes[0]), q1), &inner), &p1);
 
-        let (t3, n3) = sp3_solve(&axes[2], &neg3(&p3), &p2, norm3(&shoulder), FEAS_TOL, DEG_TOL);
+        let (t3, n3) = sp3_solve(
+            &axes[2],
+            &neg3(&p3),
+            &p2,
+            norm3(&shoulder),
+            policy.subproblem_feasibility,
+            policy.subproblem_degeneracy,
+        );
         for i3 in 0..n3 {
             let q3 = t3[i3];
             // SP1 for q2 from the shoulder plane.
             let pp = sub3(&neg3(&p2), &mat3_vec(&rotation_matrix(&axes[2], q3), &p3));
             let q2 = sp1_solve(&axes[1], &pp, &shoulder);
-            wrist_branches(sample, &r06, q1, q2, q3, out, &mut n);
+            wrist_branches(sample, &r06, q1, q2, q3, out, &mut n, policy);
         }
     }
     n
 }
 
-/// FK-verify, keep closures `<= FK_ATOL`, and dedup-by-wrap the inner 6R
+/// FK-verify, keep closures `<= subproblem_numerical`, and dedup-by-wrap the inner 6R
 /// candidates for `sample` against target `tt`. Writes survivors to `out`
 /// (with residuals) and returns the count.
 fn verify_inner(
@@ -361,6 +363,7 @@ fn verify_inner(
     n_cands: usize,
     out: &mut [[f64; 6]; INNER_MAX],
     res: &mut [f64; INNER_MAX],
+    policy: TolerancePolicy,
 ) -> usize {
     let mut n = 0usize;
     for ci in 0..n_cands {
@@ -369,13 +372,13 @@ fn verify_inner(
             continue;
         }
         let residual = frob_diff(&fk_sub(sample, &q), tt);
-        if residual > FK_ATOL {
+        if residual > policy.subproblem_numerical {
             continue;
         }
-        // Dedup vs already-kept survivors (wrap-to-pi within DEDUP_TOL).
+        // Dedup vs already-kept survivors (wrap-to-pi within subproblem_dedup).
         let mut dup = usize::MAX;
         for j in 0..n {
-            if q_close::<6>(&q, &out[j], DEDUP_TOL) {
+            if q_close::<6>(&q, &out[j], policy.subproblem_dedup) {
                 dup = j;
                 break;
             }
@@ -476,8 +479,8 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    let fk_atol = policy.fk_atol;
-    let dedup_atol = policy.dedup_atol;
+    let fk_atol = policy.subproblem_numerical;
+    let dedup_atol = policy.subproblem_dedup;
 
     let mut solutions: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
 
@@ -529,9 +532,9 @@ pub fn solve(
 
     for &sample in sample_order.iter() {
         let n_raw = if consts::SOLVER_KIND[sample] == 0 {
-            spherical_candidates(sample, &target_rev, &mut raw)
+            spherical_candidates(sample, &target_rev, &mut raw, policy)
         } else {
-            sph2par_candidates(sample, &target_rev, &mut raw)
+            sph2par_candidates(sample, &target_rev, &mut raw, policy)
         };
         if n_raw == 0 {
             continue;
@@ -543,6 +546,7 @@ pub fn solve(
             n_raw,
             &mut inner,
             &mut inner_res,
+            policy,
         );
 
         let q_lock = consts::LOCK_SAMPLES[sample];

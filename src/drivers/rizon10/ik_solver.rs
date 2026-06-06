@@ -19,7 +19,8 @@ use nalgebra::SMatrix;
 
 use crate::drivers::rizon_common::{self, Model};
 
-pub use crate::drivers::rizon_common::{TolerancePolicy, DOF, MAX_SOLUTIONS};
+pub use crate::drivers::rizon_common::{DOF, MAX_SOLUTIONS};
+pub use crate::math::tolerances::TolerancePolicy;
 
 use super::consts;
 use super::pq;
