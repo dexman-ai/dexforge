@@ -38,7 +38,6 @@ FLOP_BUDGET = 30274
 DISPATCH_REASON = "7R revolute chain. Locking one joint reduces to 6R IK."
 
 # Home pose: computed at module import via FK(zeros)
-T_HOME = None
 
 # Joint limits (from src/drivers/rizon10/consts.rs)
 _JOINT_LIMITS = [
@@ -122,5 +121,4 @@ def solve(
     return solutions
 
 
-# Compute T_HOME at module load time
 T_HOME = fk(np.zeros(DOF))
