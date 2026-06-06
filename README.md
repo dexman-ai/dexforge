@@ -8,53 +8,35 @@ loops (e.g. a 1 kHz servo thread): there is **no heap allocation**, every data
 structure is a fixed-size stack array, and every iterative routine carries a
 hardcoded iteration ceiling so worst-case execution time is bounded.
 
-## Layout
-
-| Path | Contents |
-| --- | --- |
-| `src/math/ssik_core.rs` | Generic bounded-iteration numeric kernels: companion-matrix eigenvalues via a Francis double-shift QR (real Schur) and the `numpy.roots`-equivalent `quartic_roots`. |
-| `src/drivers/ur5/ik_solver.rs` | Universal Robots **UR5** closed-form solver (`compute_ik`), ported from `ssik/prebuilt/ur5_ik.py` (solver `ikgeo.three_parallel`). Includes the SP6 subproblem, the SP1+SP3+SP1 chain, FK verification, and the `#[cfg(test)]` reference test. |
-| `src/drivers/ur5/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution). |
-| `src/drivers/franka_panda/ik_solver.rs` | Franka Emika **Panda** (7-DOF) closed-form solver (`compute_ik`), ported from `ssik/prebuilt/franka_panda_ik.py` (solver `jointlock.seven_r`). Locks joint 4 across 16 samples, solves the residual 6R sub-chain (SP1/3/4/5 subproblems), FK-verifies, and refines each root with bounded Levenberg-Marquardt. |
-| `src/drivers/franka_panda/consts.rs` | Auto-generated baked spatial constants (lock samples, screw axes, link transforms). |
-| `src/drivers/franka_panda/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution). |
-| `src/drivers/piper/ik_solver.rs` | AgileX **Piper** (6-DOF) solver (`solve`, `fk`), ported from `ssik/prebuilt/piper_ik.py` (solver `ikgeo.general_6r`, tier 2). Numeric Raghavan-Roth elimination + Manocha-Canny `24x24` companion-eigenvalue route, back-substitution, FK verification, and the `#[cfg(test)]` reference test. |
-| `src/drivers/piper/consts.rs` | Auto-generated baked geometry (joint axes/transforms, DH parameters, frame offsets, joint limits). |
-| `src/drivers/piper/pq.rs` | Machine-generated `(P_sin, P_cos, P_one, Q)` Raghavan-Roth matrix builder. |
-| `src/drivers/piper/test_data.rs` | Auto-generated 500-pose reference dataset (poses with >1 solution; singular poses flagged for FK-residual comparison). |
-| `scripts/generate_test_data.py` | Regenerates `test_data.rs` from the reference Python solver. |
-| `scripts/generate_franka_consts.py` | Regenerates the Franka `consts.rs` from the Python artifact. |
-| `scripts/generate_franka_test_data.py` | Regenerates the Franka `test_data.rs` from the reference Python solver. |
-| `scripts/generate_piper_pq.py` | Regenerates the Piper `pq.rs` matrix builder from the Python artifact. |
-| `scripts/generate_piper_test_data.py` | Regenerates the Piper `test_data.rs` from the reference Python solver. |
-| `examples/piper_solve.rs` | Host harness that runs the Piper solver on stdin poses (used by the Piper data generator). |
-| `dexforge-py/` | Secondary crate: Python bindings (pyo3) wrapping `dexforge`. |
-
 ## Rust interface
+
+### Universal Robots UR5 (6-DOF)
 
 ```rust
 use nalgebra::SMatrix;
-use ssik_rust::drivers::ur5::ik_solver::compute_ik;
+use ssik_rust::drivers::ur5::ik_solver::{fk, solve, TolerancePolicy};
 
 let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of ee_link in base_link */;
-let solutions: [Option<[f64; 6]>; 16] = compute_ik(&target_tf);
+let solutions: [Option<[f64; 6]>; 16] =
+    solve(&target_tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
 for q in solutions.iter().flatten() {
     // q = [q1, q2, q3, q4, q5, q6]
 }
 ```
 
-`compute_ik` reproduces `ur5_ik.solve(T, respect_limits=False)`: the raw
-geometric solution set, FK-verified to `1e-5` and de-duplicated modulo `2*pi`.
-The UR5 yields at most 8 solutions; unused slots are `None`.
+`solve` mirrors `ur5_ik.solve` with the same argument list. The UR5 has a
+tier-0 closed form (SP6 + SP1+SP3+SP1 chain) and yields at most 8 solutions;
+unused slots are `None`.
 
 ### Franka Emika Panda (7-DOF)
 
 ```rust
 use nalgebra::SMatrix;
-use ssik_rust::drivers::franka_panda::ik_solver::compute_ik;
+use ssik_rust::drivers::franka_panda::ik_solver::{fk, solve, TolerancePolicy};
 
 let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of panda_hand in panda_link0 */;
-let solutions: [Option<[f64; 7]>; 128] = compute_ik(&target_tf);
+let solutions: [Option<[f64; 7]>; 128] =
+    solve(&target_tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
 for q in solutions.iter().flatten() {
     // q = [q1, q2, q3, q4, q5, q6, q7]
 }
@@ -82,40 +64,79 @@ for q in solutions.iter().flatten() {
 The Piper is a generic (non-Pieper) 6R arm, so it is solved with the numeric
 Raghavan-Roth elimination followed by the Manocha-Canny `24x24` companion
 eigenvalue route in [`math::ssik_core::rr_real_roots`], then back-substitution.
-For deterministic, bounded real-time execution the randomised Möbius /
-generalised-eigenvalue fallback used by the Python reference for ill-conditioned
-poses is intentionally omitted; equilibration covers the reachable workspace.
+
+The Python reference falls back to a randomised Möbius reparameterisation +
+generalised eigenvalue solve when the equilibrated leading matrix is
+ill-conditioned. That path is non-deterministic (RNG) and is not ported.
+Instead, ill-conditioned targets are handled by a *deterministic spatial
+bypass*: the target pose is nudged 10 µm along a small set of pre-defined
+perturbation directions (`PERTURBATIONS`), re-solved through the standard
+bounded algebraic route, and the resulting roots are snapped back onto the
+original target with bounded Levenberg-Marquardt. This keeps worst-case
+execution time bounded and reproducible across the entire reachable workspace.
 
 ## Python interface
+
+`dexforge-py` wraps the Rust solvers via [pyo3](https://pyo3.rs). Each arm is
+exposed as a submodule, mirroring the `ssik.prebuilt.<arm>_ik` module
+structure:
 
 ```python
 import numpy as np
 import dexforge_py
 
-T = np.eye(4)  # 4x4 SE(3) target pose
-solutions = dexforge_py.solve("ur5", T, respect_limits=False)
-for q in solutions:
-    # q = [q1, q2, q3, q4, q5, q6]  (radians)
+T = np.eye(4)   # 4×4 SE(3) target pose (numpy array or list-of-lists)
+q = [0.0] * 6  # joint angles in radians
+
+solutions = dexforge_py.ur5.solve(T, respect_limits=False)
+for q_sol in solutions:
+    # q_sol is a list of floats, one per joint
     pass
+
+T_fk = dexforge_py.ur5.fk(q)  # returns a 4×4 list-of-lists
 ```
 
-### Building the Python extension
+Supported arm submodules: `dexforge_py.ur5`, `dexforge_py.piper`,
+`dexforge_py.franka_panda`, `dexforge_py.xarm7`, `dexforge_py.rizon4`,
+`dexforge_py.rizon10`.
+
+Each `solve` accepts the same optional keyword arguments as the Python ssik
+artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
+`fk_atol`, `dedup_atol`, and `refinement_max_iters`.
+
+## Adding a new arm
+
+The `codegen/ik_generator.py` script automates translation of a `ssik`
+prebuilt artifact into a `#![no_std]` Rust driver, including the
+machine-generated auxiliary files (`consts.rs`, `pq.rs`, `test_data.rs`). It
+calls an LLM API, builds the crate, runs the tests, and feeds any failures
+back to the LLM for self-correction.
 
 ```sh
-cd dexforge-py
-pip install maturin
-maturin build --release          # produces a wheel in ../target/wheels/
-pip install ../target/wheels/dexforge_py-*.whl
+# From a ssik prebuilt artifact name (looks up ssik.prebuilt):
+python codegen/ik_generator.py --artifact ur5_ik --output-dir out/
+
+# From a local artifact .py file:
+python codegen/ik_generator.py --artifact /path/to/my_arm_ik.py --output-dir out/
+
+# Generate a fresh artifact from a URDF, then translate:
+python codegen/ik_generator.py --urdf robot.urdf --base base_link --ee ee_link \
+    --output-dir out/
 ```
 
-### Running the Python tests
+Set `DEXFORGE_LLM_KEY`, `DEXFORGE_LLM_BASE_URL`, and `DEXFORGE_LLM_MODEL` for
+your LLM backend (defaults work with local OpenAI-compatible servers).
 
-```sh
-pip install pytest scipy numpy
-pytest dexforge-py/tests/
-```
+After the Rust driver is accepted:
 
-## Dependencies
+1. In `dexforge-py/src/lib.rs`, add `#[pyfunction]` + `#[pyo3(name = "fk")]` /
+   `#[pyo3(name = "solve")]` wrappers (copying an existing arm as a template),
+   then create a submodule block in `dexforge_py()` and call `m.add_submodule`.
+2. Add the arm to the `ARMS_METADATA` registry in `dexforge-py/tests/conftest.py`.
+
+## Development
+
+### Dependencies
 
 Only [`nalgebra`](https://nalgebra.org) (with `serde` and `macros` disabled, in
 `no_std` + `libm` mode) and [`libm`](https://crates.io/crates/libm) for `f64`
@@ -124,42 +145,65 @@ transcendentals.
 The Python bindings add [`pyo3`](https://pyo3.rs) as a dependency, isolated to
 the `dexforge-py` crate.
 
-## Building and testing
+### Building and testing
 
 ```sh
 cargo test                                             # host tests, incl. 500-pose dataset
 cargo build --release --target thumbv7em-none-eabihf   # embedded no_std build
 ```
 
-## Regenerating the test data
+To build and install the Python extension:
 
 ```sh
-pip install ssik
+cd dexforge-py
+pip install maturin
+maturin build --release          # produces a wheel in ../target/wheels/
+pip install ../target/wheels/dexforge_py-*.whl
+```
+
+### Python tests
+
+The `dexforge-py/tests/` directory contains three test layers:
+
+- **`test_dexforge_py.py`** — cross-validates the native `dexforge_py`
+  functions against the reference `ssik.prebuilt` artifacts side by side,
+  using random FK-seeded poses. This is the primary correctness gate for
+  dexforge.
+
+- **`test_prebuilt_sanity.py`** and **`test_prebuilt_uniform_fuzz.py`** — these
+  are verbatim copies from the `ssik` test suite (referenced from
+  `dexforge-py/tests/README.md`). They run the ssik reference solver and serve
+  as a baseline: if they fail, the reference is broken, not dexforge. The
+  Hypothesis strategies in `_hypothesis_strategies.py` are also copied verbatim
+  from ssik; `_hypothesis_strategies_dexforge.py` contains dexforge-specific
+  variants.
+
+```sh
+pip install pytest scipy numpy ssik hypothesis
+pytest dexforge-py/tests/
+```
+
+### Regenerating the test data
+
+```sh
+pip install $(grep ssik SSIK_VERSION.txt)
 python scripts/generate_test_data.py
 ```
 
-## ssik Version Locking
+### ssik Version Locking
 
 dexforge uses a **locked version** of the `ssik` library (`personalrobotics/ssik`)
 to ensure that newly translated artifacts are compatible with the already-translated
 core math functions in `src/math/ssik_core.rs` and `src/math/kinematics.rs`.
 
-### Checking the locked version
-
 ```sh
+# Check the pinned version:
 cat SSIK_VERSION.txt
-```
 
-### Installing the locked version for development
-
-Before running the IK generator or regenerating test data:
-
-```sh
+# Install it before running the IK generator or regenerating test data:
 pip install $(grep ssik SSIK_VERSION.txt)
 ```
 
-### Upgrading the ssik version
-
 Upgrading to a new ssik version requires careful inspection of changes and
-regeneration of affected artifacts. See `codegen/upgrade_ssik_version.md` for
+regeneration of affected artifacts. See [codegen/upgrade_ssik_version.md](codegen/upgrade_ssik_version.md) for
 detailed instructions.

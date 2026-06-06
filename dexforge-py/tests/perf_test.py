@@ -31,17 +31,14 @@ import numpy as np
 import dexforge_py
 
 # ---------------------------------------------------------------------------
-# Arm registry: canonical name -> ssik.prebuilt module name.
-# Add new arms here once their Rust drivers are implemented.
+# Canonical arm names to benchmark.
+# The ssik artifact module name is derived as ssik.prebuilt.<arm>_ik.
 # ---------------------------------------------------------------------------
-ARMS = {
-    "ur5": "ssik.prebuilt.ur5_ik",
-    "franka_panda": "ssik.prebuilt.franka_panda_ik",
-}
+ARMS = ("ur5", "piper", "franka_panda", "xarm7", "rizon4", "rizon10")
 
 
 def _load_artifact(arm: str):
-    module_name = ARMS[arm]
+    module_name = f"ssik.prebuilt.{arm}_ik"
     return importlib.import_module(module_name)
 
 
@@ -65,7 +62,9 @@ def bench(arm: str, n: int) -> None:
 
     # Warm up JIT / module import overhead with one call each.
     artifact.solve(poses[0], respect_limits=False, allow_refinement=False)
-    dexforge_py.solve(arm, poses[0], respect_limits=False, allow_refinement=False)
+    getattr(dexforge_py, arm).solve(
+        poses[0], respect_limits=False, allow_refinement=False
+    )
 
     # ── Python artifact ───────────────────────────────────────────────────
     t0 = time.perf_counter()
@@ -76,7 +75,9 @@ def bench(arm: str, n: int) -> None:
     # ── Rust via dexforge_py ──────────────────────────────────────────────────
     t0 = time.perf_counter()
     for T in poses:
-        dexforge_py.solve(arm, T, respect_limits=False, allow_refinement=False)
+        getattr(dexforge_py, arm).solve(
+            T, respect_limits=False, allow_refinement=False
+        )
     t_rust = time.perf_counter() - t0
 
     sep = "-" * 50

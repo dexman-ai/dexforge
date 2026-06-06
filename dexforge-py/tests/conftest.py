@@ -41,6 +41,21 @@ ARMS_METADATA = {
         sample_q=[0.2, 0.3, -0.4, -1.2, 0.3, 1.4, 0.5],
         fk_ceiling_fuzz=1e-4,
     ),
+    "xarm7": ArmMetadata(
+        dof=7,
+        sample_q=[0.0, -0.6, 0.4, 0.8, -0.5, 0.9, -0.2],
+        fk_ceiling_fuzz=1e-4,
+    ),
+    "rizon4": ArmMetadata(
+        dof=7,
+        sample_q=[0.0, -0.4, 0.6, -0.9, 0.5, 1.0, -0.3],
+        fk_ceiling_fuzz=1e-4,
+    ),
+    "rizon10": ArmMetadata(
+        dof=7,
+        sample_q=[0.0, -0.5, 0.5, -0.8, 0.4, 1.1, -0.2],
+        fk_ceiling_fuzz=1e-4,
+    ),
 }
 
 

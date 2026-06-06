@@ -1,36 +1,23 @@
 """dexforge_py Python package structure.
 
-This allows dexforge_py to be imported as a package with submodules.
-The actual compiled extension is loaded when this package is imported.
+The compiled extension exposes per-arm submodules, so the public API is
+available as ``dexforge_py.ur5.solve``, ``dexforge_py.ur5.fk``, and so on.
 """
 
-# Import all per-arm functions from the Rust extension
-from .dexforge_py import (
-    ur5_fk,
-    ur5_solve,
-    piper_fk,
-    piper_solve,
-    franka_panda_fk,
-    franka_panda_solve,
-    xarm7_fk,
-    xarm7_solve,
-    rizon4_fk,
-    rizon4_solve,
-    rizon10_fk,
-    rizon10_solve,
-)
+from . import dexforge_py as _ext
+
+ur5 = _ext.ur5
+piper = _ext.piper
+franka_panda = _ext.franka_panda
+xarm7 = _ext.xarm7
+rizon4 = _ext.rizon4
+rizon10 = _ext.rizon10
 
 __all__ = [
-    "ur5_fk",
-    "ur5_solve",
-    "piper_fk",
-    "piper_solve",
-    "franka_panda_fk",
-    "franka_panda_solve",
-    "xarm7_fk",
-    "xarm7_solve",
-    "rizon4_fk",
-    "rizon4_solve",
-    "rizon10_fk",
-    "rizon10_solve",
+    "ur5",
+    "piper",
+    "franka_panda",
+    "xarm7",
+    "rizon4",
+    "rizon10",
 ]

@@ -31,18 +31,9 @@ import dexforge_py
 # ---------------------------------------------------------------------------
 # Arm registry
 # ---------------------------------------------------------------------------
-# Map canonical arm name -> (prebuilt module name, native fk, native solve).
-# To add a new arm once its Rust driver is implemented:
-#   1. Add an entry here with the native function names.
-#   2. Make sure ssik.prebuilt has a matching module.
-ARMS = {
-    "ur5": ("ur5_ik", dexforge_py.ur5_fk, dexforge_py.ur5_solve),
-    "piper": ("piper_ik", dexforge_py.piper_fk, dexforge_py.piper_solve),
-    "franka_panda": ("franka_panda_ik", dexforge_py.franka_panda_fk, dexforge_py.franka_panda_solve),
-    "xarm7": ("xarm7_ik", dexforge_py.xarm7_fk, dexforge_py.xarm7_solve),
-    "rizon4": ("rizon4_ik", dexforge_py.rizon4_fk, dexforge_py.rizon4_solve),
-    "rizon10": ("rizon10_ik", dexforge_py.rizon10_fk, dexforge_py.rizon10_solve),
-}
+# Canonical arm names to test.
+# The ssik module name is derived as ssik.prebuilt.<arm>_ik.
+ARMS = ("ur5", "piper", "franka_panda", "xarm7", "rizon4", "rizon10")
 
 TWO_PI = 2.0 * math.pi
 # Tolerance for wrap-to-pi joint comparison (matches ssik DEFAULT_TOLERANCE_POLICY).
@@ -69,13 +60,12 @@ def _load_ssik_artifact(arm: str):
     Returns:
         The imported ssik.prebuilt module with solve() and fk() functions
     """
-    module_name, _, _ = ARMS.get(arm, (None, None, None))
-    if module_name is None:
+    if arm not in ARMS:
         pytest.skip(f"arm '{arm}' is not in the ARMS registry; skipping")
     try:
-        return importlib.import_module(f"ssik.prebuilt.{module_name}")
+        return importlib.import_module(f"ssik.prebuilt.{arm}_ik")
     except ImportError as e:
-        pytest.skip(f"ssik.prebuilt.{module_name} not available for arm '{arm}': {e}")
+        pytest.skip(f"ssik.prebuilt.{arm}_ik not available for arm '{arm}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +100,7 @@ def test_cross_validate_solve(arm, request):
     """
     n = request.config.getoption("--n")
     ssik_artifact = _load_ssik_artifact(arm)
-    _, _, native_solve = ARMS[arm]
+    native_solve = getattr(dexforge_py, arm).solve
     poses = _random_poses(ssik_artifact, n)
 
     mismatches = 0
@@ -145,7 +135,7 @@ def test_cross_validate_fk(arm, request):
     """dexforge_py native fk must return the same FK matrix as the Python artifact's fk."""
     n = request.config.getoption("--n")
     ssik_artifact = _load_ssik_artifact(arm)
-    _, native_fk, _ = ARMS[arm]
+    native_fk = getattr(dexforge_py, arm).fk
     dof = ssik_artifact.DOF
     rng = np.random.default_rng(99)
     lims = ssik_artifact._JOINT_LIMITS
@@ -166,7 +156,7 @@ def test_cross_validate_fk(arm, request):
 
 def test_unreachable_pose_returns_empty():
     """A pose far outside the workspace should return no solutions."""
-    _, _, native_solve = ARMS["ur5"]
+    native_solve = getattr(dexforge_py, "ur5").solve
     T = np.eye(4)
     T[:3, 3] = [100.0, 100.0, 100.0]
     solutions = native_solve(T, respect_limits=False)
@@ -175,7 +165,7 @@ def test_unreachable_pose_returns_empty():
 
 def test_solve_accepts_list_of_lists():
     """solve() must accept a plain Python list-of-lists for T_target."""
-    _, _, native_solve = ARMS["ur5"]
+    native_solve = getattr(dexforge_py, "ur5").solve
     T = [
         [1.0, 0.0, 0.0, 0.3],
         [0.0, 1.0, 0.0, 0.1],
@@ -188,8 +178,8 @@ def test_solve_accepts_list_of_lists():
 
 def test_fk_wrong_dof_raises():
     """fk() must raise ValueError when q has the wrong length."""
-    _, ur5_fk, _ = ARMS["ur5"]
-    _, franka_fk, _ = ARMS["franka_panda"]
+    ur5_fk = getattr(dexforge_py, "ur5").fk
+    franka_fk = getattr(dexforge_py, "franka_panda").fk
     with pytest.raises(ValueError, match="requires"):
         ur5_fk([0.0] * 7)
     with pytest.raises(ValueError, match="requires"):
@@ -198,7 +188,7 @@ def test_fk_wrong_dof_raises():
 
 def test_fk_returns_valid_se3():
     """fk() must return a 4×4 matrix with a valid rotation block and [0,0,0,1] bottom row."""
-    _, ur5_fk, _ = ARMS["ur5"]
+    ur5_fk = getattr(dexforge_py, "ur5").fk
     q = [0.0] * 6
     T = np.array(ur5_fk(q), dtype=np.float64)
     assert T.shape == (4, 4)
@@ -210,7 +200,7 @@ def test_fk_returns_valid_se3():
 def test_q_seed_accepted():
     """q_seed keyword argument must be accepted without error."""
     ssik_artifact = _load_ssik_artifact("ur5")
-    _, _, native_solve = ARMS["ur5"]
+    native_solve = getattr(dexforge_py, "ur5").solve
     T = ssik_artifact.T_HOME.copy()
     T[0, 3] = 0.3
     seed = [0.0] * 6
@@ -221,7 +211,7 @@ def test_q_seed_accepted():
 def test_max_solutions_caps_output():
     """max_solutions must limit the number of returned solutions."""
     ssik_artifact = _load_ssik_artifact("ur5")
-    _, _, native_solve = ARMS["ur5"]
+    native_solve = getattr(dexforge_py, "ur5").solve
     T = ssik_artifact.T_HOME.copy()
     T[0, 3] = 0.3
     result = native_solve(T, max_solutions=2, respect_limits=False)
@@ -242,7 +232,7 @@ def test_perf_solve(arm, request):
     n = max(request.config.getoption("--n"), 100)
     do_perf = request.config.getoption("--perf")
     ssik_artifact = _load_ssik_artifact(arm)
-    _, _, native_solve = ARMS[arm]
+    native_solve = getattr(dexforge_py, arm).solve
     poses = _random_poses(ssik_artifact, n)
 
     # ── Python ssik artifact ──────────────────────────────────────────────
