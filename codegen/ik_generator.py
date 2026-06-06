@@ -25,6 +25,9 @@ Usage examples::
     # From a local artifact .py file:
     python codegen/ik_generator.py --artifact /path/to/my_arm_ik.py --output-dir out/
 
+    # Use an existing artifact and copy a source URDF alongside it:
+    python codegen/ik_generator.py --artifact ur5_ik --urdf robot.urdf --output-dir out/
+
     # Generate a fresh artifact from a URDF, then translate:
     python codegen/ik_generator.py --urdf robot.urdf --base base_link --ee ee_link \\
         --output-dir out/
@@ -48,6 +51,7 @@ from typing import Optional
 
 from ik_build import (
     build_rust_crate,
+    copy_driver_provenance,
     parse_llm_output,
     run_py_scripts,
     test_rust_crate,
@@ -73,8 +77,6 @@ _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 # Default for the --max-retries CLI flag (number of *retry* attempts after the
 # initial attempt, so total LLM calls = max_retries + 1).
 _MAX_RETRIES = 3
-
-
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -85,15 +87,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         prog="ik_generator",
         description=(
             "Generate a #![no_std] Rust IK driver from a ssik Python artifact using "
-            "an LLM.  Provide either --artifact (prebuilt name or file path) or "
-            "--urdf (with --base and --ee)."
+            "an LLM.  Provide --artifact, --urdf (with --base and --ee), or both."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument(
+    parser.add_argument(
         "--artifact",
         metavar="NAME_OR_PATH",
         help=(
@@ -101,11 +101,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "*_ik.py artifact file."
         ),
     )
-    source.add_argument(
+    parser.add_argument(
         "--urdf",
         metavar="URDF_PATH",
         type=Path,
-        help="Path to a URDF file.  Requires --base and --ee.",
+        help="Path to a URDF file.  Copies the URDF into the target driver dir.",
     )
 
     parser.add_argument(
@@ -181,17 +181,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # --- Validate --urdf requires --base and --ee ---
-    if args.urdf is not None:
-        if not args.base or not args.ee:
-            parser.error("--urdf requires both --base and --ee to be specified.")
-        if not args.urdf.exists():
-            parser.error(f"URDF file not found: {args.urdf}")
+    if args.artifact is None and args.urdf is None:
+        parser.error("Either --artifact or --urdf must be specified.")
+    if args.urdf is not None and not args.urdf.exists():
+        parser.error(f"URDF file not found: {args.urdf}")
 
     # --- Step 0: Obtain source Python artifact ---
     print("[ik_generator] Step 0: Loading Python artifact …")
     try:
-        if args.urdf is not None:
+        if args.artifact is None:
+            if not args.base or not args.ee:
+                parser.error("--urdf requires both --base and --ee to be specified.")
             target_py_code, artifact_stem = generate_artifact_from_urdf(
                 args.urdf, args.base, args.ee, args.output_dir
             )
@@ -204,6 +204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     arm_name = artifact_stem.removesuffix("_ik")
+    source_urdf = args.urdf
 
     # --- Step 1: Detect kinematic family ---
     print("[ik_generator] Step 1: Detecting kinematic family …")
@@ -252,6 +253,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         ctx_path.write_text(context, encoding="utf-8")
         py_path = args.output_dir / f"{arm_name}_ik.py"
         py_path.write_text(target_py_code, encoding="utf-8")
+        copy_driver_provenance(
+            _REPO_ROOT / "src" / "drivers" / arm_name,
+            arm_name,
+            target_py_code,
+            source_urdf,
+        )
         print(f"[ik_generator] ✓ Context dump : {ctx_path}")
         print(f"[ik_generator] ✓ Python artifact : {py_path}")
         return 0
@@ -320,7 +327,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         # --- Step 6: Write generated files ---
         print("[ik_generator] Step 6: Writing generated files …")
         written = write_generated_files(
-            args.output_dir, arm_name, files, target_py_code, context
+            args.output_dir,
+            arm_name,
+            files,
+            target_py_code,
+            context,
+            source_urdf,
         )
 
         # --- Step 7: Run Python helper scripts ---

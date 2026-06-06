@@ -9,6 +9,7 @@ This module handles:
 
 from __future__ import annotations
 
+import shutil
 import re
 import subprocess
 import sys
@@ -110,16 +111,42 @@ def _ensure_arm_mod_rs(arm_name: str, rust_files: list[str]) -> None:
     )
 
 
+def copy_driver_provenance(
+    dest_dir: Path,
+    arm_name: str,
+    target_py_code: str,
+    source_urdf: Path | None = None,
+) -> dict[str, Path]:
+    """Copy the Python artifact and optional URDF into a driver directory."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    written: dict[str, Path] = {}
+
+    py_path = dest_dir / f"{arm_name}_ik.py"
+    py_path.write_text(target_py_code, encoding="utf-8")
+    written["driver_py"] = py_path
+
+    if source_urdf is not None:
+        urdf_path = dest_dir / f"{arm_name}.urdf"
+        if source_urdf.resolve() != urdf_path.resolve():
+            shutil.copyfile(source_urdf, urdf_path)
+        written["driver_urdf"] = urdf_path
+
+    return written
+
+
 def write_generated_files(
     output_dir: Path,
     arm_name: str,
     files: dict[str, str],
     target_py_code: str,
     context: str,
+    source_urdf: Path | None = None,
 ) -> dict[str, Path]:
     """Write all LLM-generated files to the appropriate locations.
 
     * ``*.rs`` files → ``src/drivers/{arm_name}/``
+    * The original Python artifact (and URDF, when available) → the driver dir
     * ``generate_*.py`` files → ``codegen/``
     * The original Python artifact and context dump → *output_dir*
 
@@ -144,6 +171,11 @@ def write_generated_files(
     ctx_path.write_text(context, encoding="utf-8")
     written["py"] = py_path
     written["ctx"] = ctx_path
+
+    provenance_written = copy_driver_provenance(
+        driver_dir, arm_name, target_py_code, source_urdf
+    )
+    written.update(provenance_written)
 
     rust_files_written: list[str] = []
     for filename, content in files.items():
