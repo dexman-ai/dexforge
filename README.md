@@ -187,7 +187,7 @@ pytest dexforge-py/tests/
 
 ```sh
 pip install $(grep ssik SSIK_VERSION.txt)
-python scripts/generate_test_data.py
+python codegen/generate_test_data.py
 ```
 
 ### ssik Version Locking

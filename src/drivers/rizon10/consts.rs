@@ -1,6 +1,6 @@
 //! AUTO-GENERATED baked constants for the Flexiv Rizon10.
 //! Do not edit by hand. Regenerate with
-//! `python scripts/generate_rizon_codegen.py rizon10`.
+//! `python codegen/generate_rizon_codegen.py rizon10`.
 //!
 //! The arm is solved by `jointlock.seven_r` (lock joint 2,
 //! no chain reversal) wrapping a deterministic Raghavan-Roth 6R inner

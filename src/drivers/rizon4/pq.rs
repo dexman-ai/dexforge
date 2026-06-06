@@ -3,9 +3,9 @@
 //!
 //! Machine-generated (sympy `cse`) and reproduced without manual edits so
 //! the floating-point accumulation order matches the Python reference
-//! bit-for-bit. Regenerate with `scripts/generate_rizon_codegen.py`.
+//! bit-for-bit. Regenerate with `codegen/generate_rizon_codegen.py`.
 
-// Do not edit by hand. See scripts/generate_rizon_codegen.py.
+// Do not edit by hand. See codegen/generate_rizon_codegen.py.
 
 /// Signature of a per-sample PQ builder.
 pub(crate) type PqBuilder = fn(

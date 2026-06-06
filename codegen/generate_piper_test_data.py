@@ -38,7 +38,7 @@ source module (``src/drivers/piper/test_data.rs``) consumed by the
 Run from the repository root:
 
     pip install "ssik==1.2.3" numpy
-    python scripts/generate_piper_test_data.py
+    python codegen/generate_piper_test_data.py
 """
 
 from __future__ import annotations
@@ -61,37 +61,21 @@ DEST = os.path.join(REPO_ROOT, "src", "drivers", "piper", "test_data.rs")
 
 
 def _rust_solutions(poses):
-    """Run every pose through the Rust `piper_solve` example harness.
+    """Run every pose through dexforge_py Python bindings.
 
     Returns a list (one per input pose) of lists of 6-vectors.
     """
-    subprocess.run(
-        ["cargo", "build", "--release", "--example", "piper_solve"],
-        cwd=REPO_ROOT,
-        check=True,
-    )
-    stdin = "\n".join(" ".join(repr(float(v)) for v in t.reshape(-1)) for t in poses)
-    proc = subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--example", "piper_solve"],
-        cwd=REPO_ROOT,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    import sys
+    sys.path.insert(0, os.path.join(REPO_ROOT, "dexforge-py"))
+    import dexforge_py
+
     out = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            out.append([])
-            continue
-        sols = []
-        for chunk in line.split(";"):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            sols.append(np.array([float(x) for x in chunk.split()], dtype=np.float64))
-        out.append(sols)
+    for t in poses:
+        # dexforge_py.piper_solve expects row-major 4x4 matrix as flat list
+        pose_flat = t.reshape(-1).tolist()
+        sols = dexforge_py.piper_solve(pose_flat)
+        # Convert to list of numpy arrays
+        out.append([np.array(q, dtype=np.float64) for q in sols])
     return out
 
 
@@ -149,7 +133,7 @@ def _fmt(x: float) -> str:
 def _write_rust(cases) -> None:
     lines = [
         "//! Auto-generated Piper IK regression data. Regenerate with",
-        "//! `python scripts/generate_piper_test_data.py`.",
+        "//! `python codegen/generate_piper_test_data.py`.",
         "//!",
         "//! Each entry is `(row-major 4x4 pose, &[expected joint solutions],",
         "//! singular)`, captured by running the reference Piper solver and",
