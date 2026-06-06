@@ -134,6 +134,69 @@ After the Rust driver is accepted:
    then create a submodule block in `dexforge_py()` and call `m.add_submodule`.
 2. Add the arm to the `ARMS_METADATA` registry in `dexforge-py/tests/conftest.py`.
 
+### Symbolic dynamics & kinematics code generation
+
+`codegen/generate_dynamics.py` is a one-time symbolic compiler: it sources the
+kinematic chain **directly from the ssik artifact** (the same `*_ik.py` prebuilt
+the IK pipeline produces — no URDF parsing), derives **exact** closed-form
+forward kinematics and the geometric Jacobian with SymPy, and emits pure,
+zero-dependency `#![no_std]` Rust. The ssik artifact encodes the chain as a
+product-of-exponentials (`_JOINT_T_LEFTS` / `_JOINT_AXES` / `_JOINT_T_RIGHTS`),
+so — like `generate_<arm>_consts.py` — this generator must run **after** the ssik
+artifact is available. The degrees of freedom `N` are read from the artifact and
+used to size the generated fixed arrays — there is no heap allocation, no
+branching, and no loops (the body is a flat list of `sympy.cse()` temporaries).
+Every transcendental is rewritten as a `libm::*` call and `pi` maps to
+`core::f64::consts::PI`, so the output cross-compiles cleanly for any ARM target.
+
+```sh
+pip install ssik sympy numpy
+# From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
+python codegen/generate_dynamics.py --artifact ur5_ik
+
+# From a local artifact .py file, writing to a driver module:
+python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
+    --output src/drivers/<arm>/dynamics.rs
+```
+
+The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4
+base→end-effector SE(3) pose, matching the existing per-arm `fk` drivers) and
+`jacobian(q: &[f64; N]) -> [[f64; N]; 6]` (the `[Jv; Jw]` geometric Jacobian).
+The UR5 driver's `fk` (`src/drivers/ur5/ik_solver.rs`) delegates to the
+generated, branch-free `generated_kinematics::fk`
+(`src/drivers/ur5/generated_kinematics.rs`) instead of the old loop over the
+baked chain constants.
+
+#### Inverse dynamics (gravity, mass matrix, Coriolis)
+
+The ssik artifact carries only the kinematic chain, so the manipulator
+**dynamics** are derived from the *physical* properties in a URDF. Pass
+`--urdf <file>` (whose actuated-joint order matches the artifact) and the
+generator additionally emits, via the energy (Lagrangian) method:
+
+| Function | Returns | Meaning |
+| --- | --- | --- |
+| `gravity(q)` | `[f64; N]` | holding torque `τ = ∂U/∂q` for `U = −Σ mᵢ (g·p_comᵢ)` |
+| `mass_matrix(q)` | `[[f64; N]; N]` | symmetric inertia `M = Σ (mᵢ Jvᵢᵀ Jvᵢ + Jwᵢᵀ Rᵢ Iᵢ Rᵢᵀ Jwᵢ)` |
+| `coriolis(q, qd)` | `[f64; N]` | `C(q, q̇) q̇` from the Christoffel symbols of the first kind |
+| `inverse_dynamics(q, qd, qdd)` | `[f64; N]` | MIT-mode feed-forward `τ = M q̈ + C q̇ + g` |
+
+```sh
+# Kinematics from the artifact, masses/inertias from a URDF; default gravity
+# is (0, 0, −9.81), override with --gravity GX GY GZ:
+python codegen/generate_dynamics.py --artifact ur5_ik \
+    --urdf src/drivers/ur5/ur5_inertial.urdf \
+    --gravity 0 0 -9.81 \
+    --output src/drivers/ur5/dynamics.rs
+```
+
+Like FK/Jacobian, every dynamics function is a flat `sympy.cse()` body of `libm`
+arithmetic — no heap, no branches, no loops. The derivation is validated against
+an independent closed-form planar model in
+`codegen/tests/test_generate_dynamics.py`. The path is all-revolute (every arm
+currently in the repo); prismatic joints contribute to the linear Jacobian only.
+
+
 ## Development
 
 ### Dependencies

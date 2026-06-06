@@ -22,9 +22,7 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::kinematics::{
-    eye_with, lm_refine6, mat4_frob_diff, mat4_mul, rot_homogeneous,
-};
+use crate::math::kinematics::{lm_refine6, mat4_frob_diff};
 use crate::math::ssik_core::{sp6_solve, wrap_to_pi};
 pub use crate::math::tolerances::TolerancePolicy;
 
@@ -42,39 +40,6 @@ pub const DOF: usize = 6;
 
 // --- algebraic-block degeneracy constants from ur5_ik.py ---
 const TWO_PI: f64 = 2.0 * PI;
-
-// --- baked KinBody constants (for FK verification) ---
-const JOINT_AXES: [[f64; 3]; 6] = [
-    [0.0, 0.0, 1.0],
-    [0.0, -1.0, 6.123233995736766e-17],
-    [0.0, -1.0, 6.123233995736766e-17],
-    [0.0, -1.0, 6.123233995736766e-17],
-    [0.0, -1.2246467991473532e-16, -1.0],
-    [0.0, -1.0, 6.123233995736766e-17],
-];
-
-const T_LEFTS: [[[f64; 4]; 4]; 6] = [
-    eye_with(0.0, 0.0, 0.0),
-    eye_with(0.0, 0.0, 0.089159),
-    eye_with(-0.425, 0.0, 0.0),
-    eye_with(-0.39225000000000004, 0.0, 0.0),
-    eye_with(0.0, -0.10915, 0.0),
-    eye_with(0.0, -1.3877787807814457e-17, -0.09465),
-];
-
-const T_RIGHTS: [[[f64; 4]; 4]; 6] = [
-    eye_with(0.0, 0.0, 0.0),
-    eye_with(0.0, 0.0, 0.0),
-    eye_with(0.0, 0.0, 0.0),
-    eye_with(0.0, 0.0, 0.0),
-    eye_with(0.0, 0.0, 0.0),
-    [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 6.123233995736766e-17, -1.0, -0.0823],
-        [0.0, 1.0, 6.123233995736766e-17, 5.204170427930421e-18],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-];
 
 /// Joint angle limits (lo, hi) in radians — baked from `_JOINT_LIMITS` in
 /// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
@@ -512,19 +477,11 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8], policy: Tole
 ///
 /// `q` is a 6-element joint-angle vector in radians. Returns the 4x4 SE(3)
 /// pose of `ee_link` in `base_link`.
+///
+/// Delegates to the SymPy-generated, branch-free symbolic FK in
+/// [`generated_kinematics::fk`] (regenerate with `codegen/generate_dynamics.py`).
 pub fn fk(q: &[f64; 6]) -> SMatrix<f64, 4, 4> {
-    let mut acc = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    for i in 0..6 {
-        let rot = rot_homogeneous(&JOINT_AXES[i], q[i]);
-        let m = mat4_mul(&T_LEFTS[i], &rot);
-        let n = mat4_mul(&m, &T_RIGHTS[i]);
-        acc = mat4_mul(&acc, &n);
-    }
+    let acc = super::generated_kinematics::fk(q);
     let mut out = SMatrix::<f64, 4, 4>::zeros();
     for i in 0..4 {
         for j in 0..4 {
