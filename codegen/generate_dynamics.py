@@ -434,7 +434,9 @@ def build_bodies(
     if len(actuated) != len(axes):
         raise ValueError(
             f"URDF actuated joints ({len(actuated)}) != artifact DOF ({len(axes)}); "
-            "the URDF chain must match the kinematics artifact"
+            "the URDF chain must match the kinematics artifact. Check that all "
+            "revolute/continuous/prismatic joints in the URDF correspond to joints "
+            "in the artifact chain."
         )
 
     bodies: List[RigidBody] = []
@@ -563,7 +565,8 @@ def build_dynamics(
     if not bodies:
         raise ValueError(
             f"URDF {urdf_path} has no positive-mass <inertial> blocks on the chain; "
-            "cannot derive dynamics"
+            "cannot derive dynamics. Ensure each link in the URDF has an <inertial> "
+            "block with a positive mass value."
         )
 
     n = len(q_syms)
@@ -763,9 +766,14 @@ def generate_rust(
     printer = NoStdRustPrinter({"contract": False})
 
     out: List[str] = []
-    out.append(f"//! Auto-generated symbolic dynamics for the {arm} ({n}-DOF).")
+    kind = "dynamics" if dynamics is not None else "kinematics"
+    out.append(f"//! Auto-generated symbolic {kind} for the {arm} ({n}-DOF).")
     out.append("//!")
-    out.append("//! Forward kinematics and the geometric Jacobian, derived")
+    if dynamics is not None:
+        out.append("//! Forward kinematics, the geometric Jacobian and the inverse")
+        out.append("//! dynamics (gravity, mass matrix, Coriolis), derived")
+    else:
+        out.append("//! Forward kinematics and the geometric Jacobian, derived")
     out.append("//! symbolically from the ssik artifact with SymPy and emitted as")
     out.append(f"//! pure `#![no_std]` Rust. Regenerate with `codegen/{script_name}`.")
     out.append("//!")

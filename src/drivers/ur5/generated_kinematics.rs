@@ -1,4 +1,4 @@
-//! Auto-generated symbolic dynamics for the UR5 (6-DOF).
+//! Auto-generated symbolic kinematics for the UR5 (6-DOF).
 //!
 //! Forward kinematics and the geometric Jacobian, derived
 //! symbolically from the ssik artifact with SymPy and emitted as

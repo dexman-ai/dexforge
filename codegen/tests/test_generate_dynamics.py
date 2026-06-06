@@ -32,7 +32,7 @@ import generate_dynamics as G  # noqa: E402
 
 # Planar RR geometry shared between the generator fixtures and the reference.
 L1, LC1, M1, IZ1 = 0.5, 0.25, 2.0, 0.03
-LC2, M2, IZ2 = 0.2, 1.5, 0.007
+L2, LC2, M2, IZ2 = 0.4, 0.2, 1.5, 0.007
 GRAVITY = (0.0, -9.81, 0.0)
 
 
@@ -45,7 +45,7 @@ def _write_fixtures(tmp_path: Path):
         "    m = np.eye(4); m[0, 3] = d; return m\n"
         "_JOINT_AXES = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 1.0])]\n"
         "_JOINT_T_LEFTS = [np.eye(4), np.eye(4)]\n"
-        f"_JOINT_T_RIGHTS = [_tx({L1}), _tx(0.4)]\n"
+        f"_JOINT_T_RIGHTS = [_tx({L1}), _tx({L2})]\n"
     )
     urdf = tmp_path / "synth.urdf"
     urdf.write_text(
