@@ -48,6 +48,7 @@ from typing import Optional
 
 from ik_build import (
     build_rust_crate,
+    copy_driver_provenance,
     parse_llm_output,
     run_py_scripts,
     test_rust_crate,
@@ -252,6 +253,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         ctx_path.write_text(context, encoding="utf-8")
         py_path = args.output_dir / f"{arm_name}_ik.py"
         py_path.write_text(target_py_code, encoding="utf-8")
+        copy_driver_provenance(
+            _REPO_ROOT / "src" / "drivers" / arm_name,
+            arm_name,
+            target_py_code,
+            args.urdf,
+        )
         print(f"[ik_generator] ✓ Context dump : {ctx_path}")
         print(f"[ik_generator] ✓ Python artifact : {py_path}")
         return 0
@@ -320,7 +327,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         # --- Step 6: Write generated files ---
         print("[ik_generator] Step 6: Writing generated files …")
         written = write_generated_files(
-            args.output_dir, arm_name, files, target_py_code, context
+            args.output_dir,
+            arm_name,
+            files,
+            target_py_code,
+            context,
+            args.urdf,
         )
 
         # --- Step 7: Run Python helper scripts ---

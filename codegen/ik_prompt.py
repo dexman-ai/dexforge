@@ -15,6 +15,7 @@ import inspect
 import re
 import subprocess
 import sys
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -123,7 +124,7 @@ def generate_artifact_from_urdf(
     :param base_link: Name of the base link in the URDF.
     :param ee_link: Name of the end-effector link in the URDF.
     :param output_dir: Directory where the generated ``*_ik.py`` artifact is
-        written.
+        written; the input URDF is copied there as ``<stem>.urdf``.
     :returns: ``(source_code, module_stem)``.
     :raises RuntimeError: If ``ssik build`` exits with a non-zero status.
     :raises ImportError: If the installed ssik version does not match the locked version.
@@ -171,6 +172,9 @@ def generate_artifact_from_urdf(
         raise RuntimeError(
             f"ssik build reported success but the output file '{out_path}' was not created."
         )
+    urdf_copy = output_dir / f"{stem}.urdf"
+    if urdf_path.resolve() != urdf_copy.resolve():
+        shutil.copyfile(urdf_path, urdf_copy)
     source_code = out_path.read_text(encoding="utf-8")
     return source_code, f"{stem}_ik"
 
