@@ -296,8 +296,8 @@ def _load_example_rust_source(example_arm: str) -> str:
 
 
 def _load_example_scripts(example_arm: str) -> str:
-    """Load the Python helper scripts for *example_arm* from scripts/, if present."""
-    scripts_dir = _REPO_ROOT / "scripts"
+    """Load the Python helper scripts for *example_arm* from codegen/, if present."""
+    scripts_dir = _REPO_ROOT / "codegen"
     arm_scripts: list[str] = []
     for pattern in (
         f"generate_{example_arm}_consts.py",
@@ -308,7 +308,7 @@ def _load_example_scripts(example_arm: str) -> str:
         if path.exists():
             arm_scripts.append(f"--- {pattern} ---\n" + path.read_text(encoding="utf-8"))
     if not arm_scripts:
-        return f"# No Python helper scripts found for '{example_arm}' in scripts/ — skipped.\n"
+        return f"# No Python helper scripts found for '{example_arm}' in codegen/ — skipped.\n"
     return "\n\n".join(arm_scripts)
 
 

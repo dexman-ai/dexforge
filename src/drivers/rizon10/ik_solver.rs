@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn matches_ssik_reference_dataset() {
         // The Rizon driver is validated against the Python `ssik` reference
-        // dataset (scripts/generate_rizon_test_data.py) with the two-tier
+        // dataset (codegen/generate_rizon_test_data.py) with the two-tier
         // tolerance mandated by the issue:
         //
         //  * Soundness (all poses): every returned configuration solves the

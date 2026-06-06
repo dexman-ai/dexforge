@@ -61,7 +61,7 @@ Generate a `#[cfg(test)]` module at the bottom of `ik_solver.rs`.
 
 ### **6. Python Helper Scripts**
 
-You must also generate one or more Python helper scripts that regenerate the auxiliary Rust files. Model them directly on the reference arm's existing scripts in `scripts/`. Provide whichever of the following apply to the target arm:
+You must also generate one or more Python helper scripts that regenerate the auxiliary Rust files. Model them directly on the reference arm's existing scripts in `codegen/`. Provide whichever of the following apply to the target arm:
 
 * `generate_<arm>_consts.py` — regenerates `consts.rs` (required for arms with precomputed sub-chain geometry, e.g. jointlock 7-DOF arms).
 * `generate_<arm>_pq.py` — regenerates `pq.rs` (required for arms that use Raghavan-Roth PQ matrices, e.g. general 6R arms).
@@ -69,7 +69,7 @@ You must also generate one or more Python helper scripts that regenerate the aux
 
 Each generated script must:
 1. Import the relevant `ssik.prebuilt.<arm>_ik` artifact.
-2. Produce a Rust source file written to `src/drivers/<arm>/<filename>.rs`, computing the path with `os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "<arm>", "<filename>.rs")` so it works when run from the `scripts/` directory.
+2. Produce a Rust source file written to `src/drivers/<arm>/<filename>.rs`, computing the path with `os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "<arm>", "<filename>.rs")` so it works when run from the `codegen/` directory.
 3. Print a confirmation line such as `"wrote src/drivers/<arm>/<filename>.rs"`.
 
 ### **7. Output Format (CRITICAL)**

@@ -125,17 +125,17 @@ If the prebuilt artifacts changed significantly:
 1. Regenerate the test data for each arm:
    ```bash
    pip install ssik==<NEW_VERSION>  # Ensure new version is active
-   python scripts/generate_ur5_test_data.py
-   python scripts/generate_franka_test_data.py
-   python scripts/generate_xarm7_test_data.py
-   python scripts/generate_piper_test_data.py
+   python codegen/generate_ur5_test_data.py
+   python codegen/generate_franka_test_data.py
+   python codegen/generate_xarm7_test_data.py
+   python codegen/generate_piper_test_data.py
    ```
 
 2. Regenerate constants for arms that use them (7-DOF jointlock arms):
    ```bash
-   python scripts/generate_franka_consts.py
-   python scripts/generate_xarm7_consts.py
-   python scripts/generate_piper_pq.py
+   python codegen/generate_franka_consts.py
+   python codegen/generate_xarm7_consts.py
+   python codegen/generate_piper_pq.py
    ```
 
 3. If the Rust drivers must be regenerated due to major algorithmic changes, use the ik_generator with the LLM:
@@ -154,18 +154,18 @@ pip install numpy scipy
 
 # Generate fresh test data
 cd /path/to/dexforge
-python scripts/generate_ur5_test_data.py
-python scripts/generate_franka_test_data.py
-python scripts/generate_xarm7_test_data.py
-python scripts/generate_piper_test_data.py
+python codegen/generate_ur5_test_data.py
+python codegen/generate_franka_test_data.py
+python codegen/generate_xarm7_test_data.py
+python codegen/generate_piper_test_data.py
 ```
 
 ### 5.2 Regenerate constants (if applicable)
 For arms that use precomputed constants (7-DOF jointlock arms):
 ```bash
-python scripts/generate_franka_consts.py
-python scripts/generate_xarm7_consts.py
-python scripts/generate_piper_pq.py
+python codegen/generate_franka_consts.py
+python codegen/generate_xarm7_consts.py
+python codegen/generate_piper_pq.py
 ```
 
 ### 5.3 Verify test data integrity

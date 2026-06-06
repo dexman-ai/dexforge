@@ -2,7 +2,7 @@
 """Generate the Flexiv Rizon IK regression datasets for the Rust drivers.
 
 Multi-arm generator (Rizon 4 and Rizon 10) modelled on
-``scripts/generate_piper_test_data.py``. The Rizon arms are 7R ``jointlock``
+``codegen/generate_piper_test_data.py``. The Rizon arms are 7R ``jointlock``
 solvers, so the strategy is the same two-tier scheme already used by the Piper
 and xArm7 regression sets:
 
@@ -32,8 +32,8 @@ source module (``src/drivers/<arm>/test_data.rs``).
 Run from the repository root:
 
     pip install "ssik==1.2.4" numpy
-    python scripts/generate_rizon_test_data.py            # both arms
-    python scripts/generate_rizon_test_data.py rizon4     # one arm
+    python codegen/generate_rizon_test_data.py            # both arms
+    python codegen/generate_rizon_test_data.py rizon4     # one arm
 """
 
 from __future__ import annotations
@@ -57,38 +57,22 @@ ARMS = ("rizon4", "rizon10")
 
 
 def _rust_solutions(arm, poses):
-    """Run every pose through the Rust `<arm>_solve` example harness.
+    """Run every pose through dexforge_py Python bindings for the specified arm.
 
     Returns a list (one per input pose) of lists of 7-vectors.
     """
-    example = f"{arm}_solve"
-    subprocess.run(
-        ["cargo", "build", "--release", "--example", example],
-        cwd=REPO_ROOT,
-        check=True,
-    )
-    stdin = "\n".join(" ".join(repr(float(v)) for v in t.reshape(-1)) for t in poses)
-    proc = subprocess.run(
-        ["cargo", "run", "--quiet", "--release", "--example", example],
-        cwd=REPO_ROOT,
-        input=stdin,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    import sys
+    sys.path.insert(0, os.path.join(REPO_ROOT, "dexforge-py"))
+    import dexforge_py
+
+    arm_module = getattr(dexforge_py, arm)
+    
     out = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            out.append([])
-            continue
-        sols = []
-        for chunk in line.split(";"):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            sols.append(np.array([float(x) for x in chunk.split()], dtype=np.float64))
-        out.append(sols)
+    for t in poses:
+        # dexforge_py expects 4x4 matrix (numpy array or list of lists)
+        sols = arm_module.solve(t)
+        # Convert to list of numpy arrays
+        out.append([np.array(q, dtype=np.float64) for q in sols])
     return out
 
 
@@ -150,7 +134,7 @@ def _write_rust(arm, dest, cases) -> None:
     pretty = "Rizon 4" if arm == "rizon4" else "Rizon 10"
     lines = [
         f"//! Auto-generated {pretty} IK regression data. Regenerate with",
-        "//! `python scripts/generate_rizon_test_data.py`.",
+        "//! `python codegen/generate_rizon_test_data.py`.",
         "//!",
         "//! Each entry is `(row-major 4x4 pose, &[expected joint solutions],",
         "//! singular)`, captured by running the reference solver and retaining",

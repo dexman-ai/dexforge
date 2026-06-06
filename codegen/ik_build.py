@@ -120,7 +120,7 @@ def write_generated_files(
     """Write all LLM-generated files to the appropriate locations.
 
     * ``*.rs`` files → ``src/drivers/{arm_name}/``
-    * ``generate_*.py`` files → ``scripts/``
+    * ``generate_*.py`` files → ``codegen/``
     * The original Python artifact and context dump → *output_dir*
 
     :param output_dir: Working output directory for the artifact and context.
@@ -154,7 +154,7 @@ def write_generated_files(
             rust_files_written.append(filename)
             print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
         elif filename.endswith(".py"):
-            dest = _REPO_ROOT / "scripts" / filename
+            dest = _REPO_ROOT / "codegen" / filename
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
             print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
@@ -175,7 +175,7 @@ def write_generated_files(
 
 
 def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
-    """Run all ``generate_*.py`` files that were written to ``scripts/``.
+    """Run all ``generate_*.py`` files that were written to ``codegen/``.
 
     Each script is executed with the current Python interpreter from the
     repository root so that relative paths inside the scripts resolve correctly.
