@@ -4,37 +4,30 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ik_generator  # noqa: E402
 
 
-class ResolveSourceUrdfTests(unittest.TestCase):
-    def test_uses_fixture_when_urdf_not_provided(self) -> None:
+class BuildArgParserTests(unittest.TestCase):
+    def test_allows_artifact_and_urdf_together(self) -> None:
+        parser = ik_generator._build_arg_parser()
         with tempfile.TemporaryDirectory() as tmp:
-            codegen_dir = Path(tmp)
-            fixture_dir = codegen_dir / "fixtures"
-            fixture_dir.mkdir()
-            fixture_path = fixture_dir / "demo.urdf"
-            fixture_path.write_text("<robot name='demo'/>\n", encoding="utf-8")
+            urdf_path = Path(tmp) / "robot.urdf"
+            urdf_path.write_text("<robot name='demo'/>\n", encoding="utf-8")
 
-            with patch.object(ik_generator, "_CODEGEN_DIR", codegen_dir):
-                resolved = ik_generator._resolve_source_urdf("demo", None)
+            args = parser.parse_args(
+                [
+                    "--artifact",
+                    "demo_ik",
+                    "--urdf",
+                    str(urdf_path),
+                ]
+            )
 
-        self.assertEqual(resolved, fixture_path)
-
-    def test_prefers_explicit_urdf(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            explicit = tmp_path / "explicit.urdf"
-            explicit.write_text("<robot name='explicit'/>\n", encoding="utf-8")
-
-            with patch.object(ik_generator, "_CODEGEN_DIR", tmp_path / "codegen"):
-                resolved = ik_generator._resolve_source_urdf("demo", explicit)
-
-        self.assertEqual(resolved, explicit)
+        self.assertEqual(args.artifact, "demo_ik")
+        self.assertEqual(args.urdf, urdf_path)
 
 
 if __name__ == "__main__":
