@@ -134,6 +134,32 @@ After the Rust driver is accepted:
    then create a submodule block in `dexforge_py()` and call `m.add_submodule`.
 2. Add the arm to the `ARMS_METADATA` registry in `dexforge-py/tests/conftest.py`.
 
+### Symbolic dynamics & kinematics code generation
+
+`codegen/generate_dynamics.py` is a one-time symbolic compiler: it parses a
+URDF, derives **exact** closed-form forward kinematics and the geometric
+Jacobian with SymPy, and emits pure, zero-dependency `#![no_std]` Rust. The
+degrees of freedom `N` are extracted dynamically from the URDF and used to size
+the generated fixed arrays — there is no heap allocation, no branching, and no
+loops (the body is a flat list of `sympy.cse()` temporaries). Every
+transcendental is rewritten as a `libm::*` call and `pi` maps to
+`core::f64::consts::PI`, so the output cross-compiles cleanly for any ARM target.
+
+```sh
+pip install sympy
+# Defaults to the checked-in UR5 fixture; prints to stdout:
+python codegen/generate_dynamics.py
+
+# Explicit URDF, links, and output file:
+python codegen/generate_dynamics.py --urdf robot.urdf \
+    --base base_link --ee ee_link --output src/drivers/<arm>/dynamics.rs
+```
+
+The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4
+base→end-effector SE(3) pose, matching the existing per-arm `fk` drivers) and
+`jacobian(q: &[f64; N]) -> [[f64; N]; 6]` (the `[Jv; Jw]` geometric Jacobian).
+
+
 ## Development
 
 ### Dependencies
