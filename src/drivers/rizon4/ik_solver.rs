@@ -90,8 +90,14 @@ pub fn solve(
 }
 
 /// Forward kinematics — mirrors `rizon4_ik.fk`.
+///
+/// Delegates to the SymPy-generated, branch-free symbolic FK in
+/// [`generated_kinematics::fk`] (regenerate with `codegen/generate_dynamics.py`).
+/// The shared [`rizon_common`] solver keeps using its `Model`-based FK so the
+/// algebraic root refinement reproduces the reference dataset bit-for-bit.
 pub fn fk(q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
-    rizon_common::fk(&MODEL, q)
+    let acc = super::generated_kinematics::fk(q);
+    SMatrix::<f64, 4, 4>::from_fn(|i, j| acc[i][j])
 }
 
 // ---------------------------------------------------------------------------

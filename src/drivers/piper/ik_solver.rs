@@ -43,7 +43,7 @@
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::kinematics::{lm_refine6, mat4_frob_diff, mat4_mul, rot_homogeneous};
+use crate::math::kinematics::{lm_refine6, mat4_frob_diff};
 use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
 pub use crate::math::tolerances::TolerancePolicy;
 
@@ -641,19 +641,11 @@ fn refine6(
 ///
 /// `q` is a 6-element joint-angle vector in radians. Returns the 4x4 SE(3)
 /// pose of `link6` in `base_link`.
+///
+/// Delegates to the SymPy-generated, branch-free symbolic FK in
+/// [`generated_kinematics::fk`] (regenerate with `codegen/generate_dynamics.py`).
 pub fn fk(q: &[f64; 6]) -> SMatrix<f64, 4, 4> {
-    let mut acc = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    for i in 0..6 {
-        let rot = rot_homogeneous(&consts::JOINT_AXES[i], q[i]);
-        let m = mat4_mul(&consts::T_LEFTS[i], &rot);
-        let n = mat4_mul(&m, &consts::T_RIGHTS[i]);
-        acc = mat4_mul(&acc, &n);
-    }
+    let acc = super::generated_kinematics::fk(q);
     SMatrix::<f64, 4, 4>::from_fn(|i, j| acc[i][j])
 }
 
