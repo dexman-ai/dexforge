@@ -43,7 +43,7 @@
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::kinematics::{lm_refine6, mat4_mul, rot_homogeneous};
+use crate::math::kinematics::{lm_refine6, mat4_frob_diff, mat4_mul, rot_homogeneous};
 use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
 pub use crate::math::tolerances::TolerancePolicy;
 
@@ -659,15 +659,7 @@ pub fn fk(q: &[f64; 6]) -> SMatrix<f64, 4, 4> {
 
 /// Frobenius-norm residual between FK(q) and the target pose.
 fn fk_residual(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> f64 {
-    let t = fk(q);
-    let mut s = 0.0;
-    for i in 0..4 {
-        for j in 0..4 {
-            let d = t[(i, j)] - target[(i, j)];
-            s += d * d;
-        }
-    }
-    libm::sqrt(s)
+    mat4_frob_diff(&fk(q), target)
 }
 
 // ---------------------------------------------------------------------------

@@ -56,26 +56,24 @@
 //! * **DH-based FK** ([`fk`], [`dh_matrix`]) — product-of-exponentials FK using
 //!   the per-arm Model's axes and transforms. Cannot be moved to kinematics
 //!   because it depends on per-arm geometry stored in the Model.
-//! * **Joint-masked LM refinement** ([`refine7`]) — LM loop that holds the locked
-//!   joint (joint 2) fixed while refining the other 6 DOF. This strategy is
-//!   specific to the `jointlock.seven_r` redundancy resolution and differs from
-//!   the generic [`crate::math::kinematics::lm_refine`] which refines all DOF.
+//! * **Joint-masked LM refinement** ([`refine7`]) — thin wrapper that builds the
+//!   free-joint index set (all DOF except the locked joint) and delegates to the
+//!   shared [`crate::math::kinematics::lm_refine_masked`] loop. The masking
+//!   strategy is specific to the `jointlock.seven_r` redundancy resolution; the
+//!   shared loop refines exactly the supplied free joints.
 //! * **Model-aware limit helpers** ([`wrap_to_limits7`], [`in_limits7`]) —
 //!   operate on the per-arm Model's joint_limits array.
 //! * **Sample-level solver** ([`solve_sample`], [`pad_locked`]) — orchestrates
 //!   the per-sample RR solve and result padding specific to the jointlock sweep.
 //!
 //! Generic utilities that were previously duplicated here have been moved to:
-//! * [`crate::math::kinematics`]: `norm12`, LM constants (`REFINE_EPS`, etc.)
+//! * [`crate::math::kinematics`]: `norm12`, LM constants, and the shared LM
+//!   loops (`lm_refine`, `lm_refine_masked`)
 //! * [`crate::math::postprocess`]: `q_close`, `dedup_solutions`, `wrap_distance`
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::kinematics::{
-    mat4_mul, norm12, rot_homogeneous, LM_BACKTRACK_MAX, LM_CONVERGENCE_THRESHOLD,
-    LM_INITIAL_LAMBDA, LM_LAMBDA_DECAY, LM_LAMBDA_GROWTH, LM_LAMBDA_MAX, LM_LAMBDA_MIN,
-    REFINE_EPS,
-};
+use crate::math::kinematics::{lm_refine_masked, mat4_frob_diff, mat4_mul, rot_homogeneous};
 use crate::math::postprocess::{dedup_solutions, wrap_distance};
 use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
 pub use crate::math::tolerances::TolerancePolicy;
@@ -569,15 +567,7 @@ pub fn fk(model: &Model, q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
 
 /// Frobenius-norm residual between FK(q) and the target pose.
 fn fk_residual(model: &Model, q: &[f64; 7], target: &SMatrix<f64, 4, 4>) -> f64 {
-    let t = fk(model, q);
-    let mut s = 0.0;
-    for i in 0..4 {
-        for j in 0..4 {
-            let d = t[(i, j)] - target[(i, j)];
-            s += d * d;
-        }
-    }
-    libm::sqrt(s)
+    mat4_frob_diff(&fk(model, q), target)
 }
 
 // ---------------------------------------------------------------------------
@@ -605,11 +595,12 @@ fn residual12(model: &Model, q: &[f64; 7], target: &SMatrix<f64, 4, 4>) -> [f64;
 /// fixed**. Refining only the six free joints targets the isolated 6R root and
 /// keeps the redundant 7R from drifting along its self-motion manifold.
 ///
-/// **Rizon-specific rationale**: This function cannot use the generic
-/// [`crate::math::kinematics::lm_refine`] because it must mask out the locked
-/// joint (joint 2) during refinement — a constraint specific to the
-/// `jointlock.seven_r` redundancy resolution strategy. The generic LM refines
-/// all DOF simultaneously.
+/// **Rizon-specific rationale**: the locked joint (`model.lock_idx`) must be
+/// masked out during refinement — a constraint specific to the
+/// `jointlock.seven_r` redundancy resolution strategy. This is expressed by
+/// passing the free-joint index set to the shared joint-masked LM loop
+/// [`crate::math::kinematics::lm_refine_masked`]; the locked joint is simply
+/// the index absent from that set.
 fn refine7(
     model: &Model,
     q_in: &[f64; 7],
@@ -626,67 +617,7 @@ fn refine7(
         }
     }
 
-    let mut q = *q_in;
-    let mut lambda = LM_INITIAL_LAMBDA;
-    let mut r = residual12(model, &q, target);
-    let mut rn = norm12(&r);
-
-    for _ in 0..max_iters {
-        if rn < LM_CONVERGENCE_THRESHOLD {
-            break;
-        }
-        let mut jac = SMatrix::<f64, 12, 6>::zeros();
-        for (c, &jidx) in free.iter().enumerate() {
-            let mut qp = q;
-            qp[jidx] += REFINE_EPS;
-            let rp = residual12(model, &qp, target);
-            for row in 0..12 {
-                jac[(row, c)] = (rp[row] - r[row]) / REFINE_EPS;
-            }
-        }
-        let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
-        let jt = jac.transpose();
-        let jtj = jt * jac; // 6x6
-        let jtr = jt * rv; // 6x1
-
-        let mut accepted = false;
-        for _ in 0..LM_BACKTRACK_MAX {
-            let mut damped = jtj;
-            for d in 0..6 {
-                damped[(d, d)] += lambda;
-            }
-            let inv = match damped.try_inverse() {
-                Some(m) => m,
-                None => {
-                    lambda *= LM_LAMBDA_GROWTH;
-                    continue;
-                }
-            };
-            let dq = inv * jtr;
-            let mut q_trial = q;
-            for (c, &jidx) in free.iter().enumerate() {
-                q_trial[jidx] -= dq[(c, 0)];
-            }
-            let r_trial = residual12(model, &q_trial, target);
-            let rn_trial = norm12(&r_trial);
-            if rn_trial < rn {
-                q = q_trial;
-                r = r_trial;
-                rn = rn_trial;
-                lambda = (lambda * LM_LAMBDA_DECAY).max(LM_LAMBDA_MIN);
-                accepted = true;
-                break;
-            }
-            lambda *= LM_LAMBDA_GROWTH;
-            if lambda > LM_LAMBDA_MAX {
-                break;
-            }
-        }
-        if !accepted {
-            break;
-        }
-    }
-    q
+    lm_refine_masked::<7, 6, _>(q_in, &free, |q| residual12(model, q, target), max_iters)
 }
 
 // ---------------------------------------------------------------------------

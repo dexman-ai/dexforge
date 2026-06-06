@@ -11,15 +11,17 @@
 //! * **Pose residual norm**: [`norm12`]
 //! * **Rigid-transform type**: [`Transform`], [`IDENTITY`], [`compose`],
 //!   [`se3_inv`], [`frob_diff`]
-//! * **Shared LM tuning constants** and **generic const-DOF refinement loop**:
-//!   [`lm_refine`], [`lm_refine6`]
+//! * **Shared LM tuning constants** and **generic const-DOF refinement loops**:
+//!   [`lm_refine`], [`lm_refine6`] (refine all DOF) and [`lm_refine_masked`]
+//!   (refine a subset of joints, holding the rest fixed)
 //!
 //! # What stays in each driver
 //!
 //! * Arm-specific FK (`fk`, `fk7`, `fk_sub`, …) and the pose-residual
 //!   functions that call them — they encode per-arm kinematics constants.
-//! * Franka `refine7` — its joint-masking strategy is specific to the
-//!   `jointlock.seven_r` redundancy resolution and lives only there.
+//! * Each 7R `jointlock.seven_r` driver's `refine7` is now a thin wrapper that
+//!   selects the free-joint set (excluding the locked joint) and delegates to
+//!   the shared [`lm_refine_masked`] loop.
 //! * Piper `spatial_bypass` and perturbation constants — the 10 µm
 //!   deterministic singularity escape is specific to the Raghavan-Roth
 //!   polynomial-system condition check of that driver.
@@ -168,6 +170,25 @@ pub fn frob_diff(a: &Transform, b: &Transform) -> f64 {
     libm::sqrt(s)
 }
 
+/// Frobenius norm of the difference between two 4×4 homogeneous matrices.
+///
+/// This is the `[f64; 12]`-free counterpart of [`frob_diff`] for callers that
+/// already hold their pose as an `SMatrix<f64, 4, 4>` (the per-arm FK output
+/// type). It sums the squared difference over **all 16 entries** — including
+/// the bottom row — exactly reproducing each driver's former local
+/// `fk_residual` kernel.
+#[inline]
+pub fn mat4_frob_diff(a: &SMatrix<f64, 4, 4>, b: &SMatrix<f64, 4, 4>) -> f64 {
+    let mut s = 0.0;
+    for i in 0..4 {
+        for j in 0..4 {
+            let d = a[(i, j)] - b[(i, j)];
+            s += d * d;
+        }
+    }
+    libm::sqrt(s)
+}
+
 /// 12-vector pose residual `[vec(a.R − b.R); a.t − b.t]` between two transforms.
 ///
 /// The first 9 elements are the column-major flattening of `(a.R − b.R)` and
@@ -258,6 +279,78 @@ pub fn lm_refine<const DOF: usize, F>(
 where
     F: Fn(&[f64; DOF]) -> [f64; 12],
 {
+    // Refine all DOF joints (free = [0, 1, …, DOF−1]).
+    let free: [usize; DOF] = core::array::from_fn(|i| i);
+    let (q, rn) = lm_refine_core::<DOF, DOF, F>(q_in, &free, residual_fn, max_iters);
+    if rn <= fk_atol {
+        Some(q)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Joint-masked Levenberg-Marquardt refinement
+// ---------------------------------------------------------------------------
+
+/// Bounded Levenberg-Marquardt polish that refines **only a subset of joints**.
+///
+/// This is the universal masked LM loop shared by every redundant 7R
+/// `jointlock.seven_r` driver (Franka, xArm7, Rizon).  Those solvers collapse
+/// a redundant arm to a 6R sub-problem by locking one joint to a sample value;
+/// the polish must then refine the remaining free joints while **holding the
+/// locked joint fixed**, otherwise the redundant arm would drift along its
+/// self-motion manifold instead of converging onto the isolated root.
+///
+/// The set of free joints is supplied as `free` (a `[usize; FREE]` array of
+/// joint indices into the `DOF`-vector); the locked joint is simply any index
+/// absent from `free`.  Both the full joint count `DOF` and the free-joint
+/// count `FREE` are const generic parameters, so every matrix
+/// (Jacobian `J : 12×FREE`, normal equations `JᵀJ : FREE×FREE`, step
+/// `dq : FREE×1`) lives entirely on the stack — no heap, `#![no_std]`-safe,
+/// and hard-bounded by `max_iters`.
+///
+/// `residual_fn(q)` must return the standard 12-vector pose residual
+/// `[vec(R(q) − R_t); t(q) − t_t]` of the **full** `DOF`-joint FK.
+///
+/// Unlike [`lm_refine`], this returns the refined joint vector unconditionally
+/// (the redundant-arm drivers FK-verify and de-duplicate the result
+/// downstream, so there is no convergence/`fk_atol` gate here).
+///
+/// # Examples
+///
+/// ```ignore
+/// // 7R arm with joint 4 locked: refine joints {0,1,2,3,5,6}.
+/// const FREE: [usize; 6] = [0, 1, 2, 3, 5, 6];
+/// let q = lm_refine_masked::<7, 6, _>(&q7, &FREE, |q| residual12(q, &target), max_iters);
+/// ```
+pub fn lm_refine_masked<const DOF: usize, const FREE: usize, F>(
+    q_in: &[f64; DOF],
+    free: &[usize; FREE],
+    residual_fn: F,
+    max_iters: usize,
+) -> [f64; DOF]
+where
+    F: Fn(&[f64; DOF]) -> [f64; 12],
+{
+    lm_refine_core::<DOF, FREE, F>(q_in, free, residual_fn, max_iters).0
+}
+
+/// Shared accept/reject LM core driving both [`lm_refine`] and
+/// [`lm_refine_masked`].
+///
+/// Refines the joints listed in `free` and returns the refined joint vector
+/// together with the final 12-vector residual norm so callers can apply their
+/// own convergence gate (or ignore it).
+fn lm_refine_core<const DOF: usize, const FREE: usize, F>(
+    q_in: &[f64; DOF],
+    free: &[usize; FREE],
+    residual_fn: F,
+    max_iters: usize,
+) -> ([f64; DOF], f64)
+where
+    F: Fn(&[f64; DOF]) -> [f64; 12],
+{
     let mut q = *q_in;
     let mut lambda = LM_INITIAL_LAMBDA;
     let mut r = residual_fn(&q);
@@ -267,26 +360,26 @@ where
         if rn < LM_CONVERGENCE_THRESHOLD {
             break;
         }
-        // Finite-difference Jacobian J (12×DOF) over all DOF joints.
-        let mut jac = SMatrix::<f64, 12, DOF>::zeros();
-        for col in 0..DOF {
+        // Finite-difference Jacobian J (12×FREE) over the free joints.
+        let mut jac = SMatrix::<f64, 12, FREE>::zeros();
+        for (c, &jidx) in free.iter().enumerate() {
             let mut qp = q;
-            qp[col] += REFINE_EPS;
+            qp[jidx] += REFINE_EPS;
             let rp = residual_fn(&qp);
             for row in 0..12 {
-                jac[(row, col)] = (rp[row] - r[row]) / REFINE_EPS;
+                jac[(row, c)] = (rp[row] - r[row]) / REFINE_EPS;
             }
         }
         let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
         let jt = jac.transpose();
-        let jtj = jt * jac; // DOF×DOF
-        let jtr = jt * rv; // DOF×1
+        let jtj = jt * jac; // FREE×FREE
+        let jtr = jt * rv; // FREE×1
 
         // Adaptive LM damping with accept/reject backtrack.
         let mut accepted = false;
         for _ in 0..LM_BACKTRACK_MAX {
             let mut damped = jtj;
-            for d in 0..DOF {
+            for d in 0..FREE {
                 damped[(d, d)] += lambda;
             }
             let inv = match damped.try_inverse() {
@@ -298,8 +391,8 @@ where
             };
             let dq = inv * jtr;
             let mut q_trial = q;
-            for col in 0..DOF {
-                q_trial[col] -= dq[(col, 0)];
+            for (c, &jidx) in free.iter().enumerate() {
+                q_trial[jidx] -= dq[(c, 0)];
             }
             let r_trial = residual_fn(&q_trial);
             let rn_trial = norm12(&r_trial);
@@ -321,11 +414,7 @@ where
         }
     }
 
-    if rn <= fk_atol {
-        Some(q)
-    } else {
-        None
-    }
+    (q, rn)
 }
 
 /// Bounded Levenberg-Marquardt polish for a **6-DOF** joint vector.
@@ -577,5 +666,76 @@ mod tests {
             residual,
             DLS_FK_ATOL
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: mat4_frob_diff matches a hand-rolled 16-entry Frobenius distance
+    // -----------------------------------------------------------------------
+    #[test]
+    fn mat4_frob_diff_matches_manual() {
+        let a = SMatrix::<f64, 4, 4>::from_fn(|i, j| (i * 4 + j) as f64);
+        let b = SMatrix::<f64, 4, 4>::from_fn(|i, j| (i * 4 + j) as f64 + 0.5 * (i as f64));
+        // Reference: explicit sum over all 16 entries, exactly the kernel the
+        // per-arm `fk_residual` helpers used before delegating here.
+        let mut s = 0.0;
+        for i in 0..4 {
+            for j in 0..4 {
+                let d = a[(i, j)] - b[(i, j)];
+                s += d * d;
+            }
+        }
+        let expected = libm::sqrt(s);
+        let got = mat4_frob_diff(&a, &b);
+        assert_eq!(got, expected, "mat4_frob_diff diverged from manual kernel");
+        // Identical matrices yield exactly zero.
+        assert_eq!(mat4_frob_diff(&a, &a), 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: lm_refine_masked refines only the free joints, leaving the locked
+    // joint bit-for-bit unchanged while converging the free joint onto target.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn lm_refine_masked_holds_locked_joint() {
+        let q_true = [0.5f64, -0.3f64];
+        let goal = fk_2dof_nominal(&q_true);
+        // Perturb only joint 0; joint 1 starts at its true (locked) value.
+        let q_init = [q_true[0] + 0.1, q_true[1]];
+        // Free set = {0}; joint 1 is locked.
+        let free = [0usize];
+        let q = lm_refine_masked::<2, 1, _>(
+            &q_init,
+            &free,
+            |q| pose_residual12(&fk_2dof_nominal(q), &goal),
+            DLS_MAX_ITERS,
+        );
+        // Locked joint must be untouched (bit-for-bit).
+        assert_eq!(q[1], q_init[1], "locked joint 1 was modified");
+        // Free joint converged onto the pose goal.
+        let residual = frob_diff(&fk_2dof_nominal(&q), &goal);
+        assert!(
+            residual <= DLS_FK_ATOL,
+            "residual {:.2e} > atol {:.2e}",
+            residual,
+            DLS_FK_ATOL
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: lm_refine (full DOF) and lm_refine_masked with every joint free
+    // produce identical results — the two share a single core loop.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn lm_refine_equals_masked_all_free() {
+        let q_true = [1.0f64, -0.7f64];
+        let goal = fk_2dof_nominal(&q_true);
+        let q_init = [q_true[0] + 0.1, q_true[1] - 0.1];
+        let residual_fn = |q: &[f64; 2]| pose_residual12(&fk_2dof_nominal(q), &goal);
+
+        let full = lm_refine::<2, _>(&q_init, residual_fn, DLS_MAX_ITERS, DLS_FK_ATOL)
+            .expect("lm_refine should converge");
+        let masked =
+            lm_refine_masked::<2, 2, _>(&q_init, &[0, 1], residual_fn, DLS_MAX_ITERS);
+        assert_eq!(full, masked, "full and all-free masked refine diverged");
     }
 }

@@ -118,15 +118,7 @@ mod tests {
     }
 
     fn fk_residual(q: &[f64; 7], tf: &SMatrix<f64, 4, 4>) -> f64 {
-        let m = fk(q);
-        let mut s = 0.0;
-        for i in 0..4 {
-            for j in 0..4 {
-                let d = m[(i, j)] - tf[(i, j)];
-                s += d * d;
-            }
-        }
-        libm::sqrt(s)
+        crate::math::kinematics::mat4_frob_diff(&fk(q), tf)
     }
 
     #[test]
