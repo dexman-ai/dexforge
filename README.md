@@ -162,10 +162,12 @@ python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
 The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4
 base→end-effector SE(3) pose, matching the existing per-arm `fk` drivers) and
 `jacobian(q: &[f64; N]) -> [[f64; N]; 6]` (the `[Jv; Jw]` geometric Jacobian).
-The UR5 driver's `fk` (`src/drivers/ur5/ik_solver.rs`) delegates to the
-generated, branch-free `generated_kinematics::fk`
-(`src/drivers/ur5/generated_kinematics.rs`) instead of the old loop over the
-baked chain constants.
+Every arm driver's public `fk` (`src/drivers/<arm>/ik_solver.rs`) delegates to
+its generated, branch-free `generated_kinematics::fk`
+(`src/drivers/<arm>/generated_kinematics.rs`) instead of the old loop over the
+baked chain constants. The arms whose algebraic solver still needs a chain FK on
+its bit-exact hot path (the `jointlock.seven_r` 7R arms reuse it for refinement)
+keep that internal FK; only the public `fk` is rerouted to the generated module.
 
 #### Inverse dynamics (gravity, mass matrix, Coriolis)
 
@@ -195,6 +197,14 @@ arithmetic — no heap, no branches, no loops. The derivation is validated again
 an independent closed-form planar model in
 `codegen/tests/test_generate_dynamics.py`. The path is all-revolute (every arm
 currently in the repo); prismatic joints contribute to the linear Jacobian only.
+
+The dynamics path is wired and tested but **not yet baked into a driver**: it
+needs a URDF that is a single serial chain of exactly `N` actuated joints, each
+carrying an `<inertial>` block. None of the URDFs currently in `src/drivers/`
+qualify — `rizon4`/`rizon10` carry no `<inertial>` blocks, and the
+`franka_panda`/`piper`/`xarm7` URDFs branch into gripper joints — so only the
+FK/Jacobian `generated_kinematics.rs` is baked per arm. Drop in an arm-only
+inertial URDF to emit the inverse-dynamics suite.
 
 
 ## Development

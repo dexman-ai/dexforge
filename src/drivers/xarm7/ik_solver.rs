@@ -434,17 +434,14 @@ fn refine7(q_in: &[f64; 7], target: &Transform, max_iters: usize) -> [f64; 7] {
 ///
 /// `q` is a 7-element joint-angle vector in radians. Returns the 4×4 SE(3)
 /// pose of `ee_link` in `base_link`.
+///
+/// Delegates to the SymPy-generated, branch-free symbolic FK in
+/// [`generated_kinematics::fk`] (regenerate with `codegen/generate_dynamics.py`).
+/// The solver's internal hot path keeps using [`fk7`] so the algebraic root
+/// refinement reproduces the reference dataset bit-for-bit.
 pub fn fk(q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
-    let tf = fk7(q);
-    let mut out = SMatrix::<f64, 4, 4>::zeros();
-    for i in 0..3 {
-        for j in 0..3 {
-            out[(i, j)] = tf.r[i][j];
-        }
-        out[(i, 3)] = tf.t[i];
-    }
-    out[(3, 3)] = 1.0;
-    out
+    let acc = super::generated_kinematics::fk(q);
+    SMatrix::<f64, 4, 4>::from_fn(|i, j| acc[i][j])
 }
 
 /// Inverse kinematics — mirrors `xarm7_ik.solve`.
