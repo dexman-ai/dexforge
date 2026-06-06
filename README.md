@@ -136,23 +136,27 @@ After the Rust driver is accepted:
 
 ### Symbolic dynamics & kinematics code generation
 
-`codegen/generate_dynamics.py` is a one-time symbolic compiler: it parses a
-URDF, derives **exact** closed-form forward kinematics and the geometric
-Jacobian with SymPy, and emits pure, zero-dependency `#![no_std]` Rust. The
-degrees of freedom `N` are extracted dynamically from the URDF and used to size
-the generated fixed arrays — there is no heap allocation, no branching, and no
-loops (the body is a flat list of `sympy.cse()` temporaries). Every
-transcendental is rewritten as a `libm::*` call and `pi` maps to
+`codegen/generate_dynamics.py` is a one-time symbolic compiler: it sources the
+kinematic chain **directly from the ssik artifact** (the same `*_ik.py` prebuilt
+the IK pipeline produces — no URDF parsing), derives **exact** closed-form
+forward kinematics and the geometric Jacobian with SymPy, and emits pure,
+zero-dependency `#![no_std]` Rust. The ssik artifact encodes the chain as a
+product-of-exponentials (`_JOINT_T_LEFTS` / `_JOINT_AXES` / `_JOINT_T_RIGHTS`),
+so — like `generate_<arm>_consts.py` — this generator must run **after** the ssik
+artifact is available. The degrees of freedom `N` are read from the artifact and
+used to size the generated fixed arrays — there is no heap allocation, no
+branching, and no loops (the body is a flat list of `sympy.cse()` temporaries).
+Every transcendental is rewritten as a `libm::*` call and `pi` maps to
 `core::f64::consts::PI`, so the output cross-compiles cleanly for any ARM target.
 
 ```sh
-pip install sympy
-# Defaults to the checked-in UR5 fixture; prints to stdout:
-python codegen/generate_dynamics.py
+pip install ssik sympy numpy
+# From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
+python codegen/generate_dynamics.py --artifact ur5_ik
 
-# Explicit URDF, links, and output file:
-python codegen/generate_dynamics.py --urdf robot.urdf \
-    --base base_link --ee ee_link --output src/drivers/<arm>/dynamics.rs
+# From a local artifact .py file, writing to a driver module:
+python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
+    --output src/drivers/<arm>/dynamics.rs
 ```
 
 The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4

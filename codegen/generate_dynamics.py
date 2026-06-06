@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""One-time symbolic compiler: URDF -> SymPy -> zero-dependency ``#![no_std]`` Rust.
+"""One-time symbolic compiler: ssik artifact -> SymPy -> zero-dependency Rust.
 
-This script acts as an offline code generator.  It parses a robot URDF, derives
-**exact** closed-form Forward Kinematics (FK) and the geometric Jacobian
-symbolically with SymPy, and emits pure, allocation-free Rust suitable for the
-dexforge hard-real-time kernel.
+This script acts as an offline code generator.  It sources the robot's
+kinematics **directly from the ssik Python artifact** (the same ``*_ik.py``
+prebuilt the IK pipeline produces — no URDF parsing required), derives **exact**
+closed-form Forward Kinematics (FK) and the geometric Jacobian symbolically with
+SymPy, and emits pure, allocation-free Rust for the dexforge hard-real-time
+kernel.
+
+Because the ssik artifact already encodes the full kinematic chain as a
+product-of-exponentials — ``T = prod_i  T_left[i] . Rot(axis[i], q_i) . T_right[i]``
+via the ``_JOINT_T_LEFTS`` / ``_JOINT_AXES`` / ``_JOINT_T_RIGHTS`` constants (the
+same data the ``consts.rs`` generators bake) — this generator must run **after**
+the ssik artifact is available, exactly like ``generate_<arm>_consts.py``.
 
 Why generate Rust instead of linking a C/C++ dynamics library?  The generated
 kernel has **zero dependencies** beyond ``libm`` (for ``sin``/``cos``/``sqrt``),
-so it cross-compiles instantly and cleanly for any ARM target / Raspberry Pi
-through a plain ``pip install`` of this script's own deps (``sympy``) — no Eigen,
-no Boost, no toolchain surgery.
+so it cross-compiles instantly and cleanly for any ARM target / Raspberry Pi.
 
 Real-time kernel constraints honoured by the emitted Rust
 ---------------------------------------------------------
 * **Zero heap allocation.** No ``Vec``/``Box``/``DMatrix``; every output is a
   fixed-size primitive array (``[[f64; 4]; 4]`` for FK, ``[[f64; N]; 6]`` for the
-  Jacobian) whose dimensions are baked from the URDF's degrees of freedom ``N``.
+  Jacobian) whose dimensions are baked from the artifact's degrees of freedom
+  ``N``.
 * **``#![no_std]`` math.** ``core`` has no ``f64::sin``/``cos``/``sqrt`` and no
   ``powi``; the custom printer below rewrites every transcendental as a free
   ``libm::*`` call and expands integer powers into multiplications.  ``pi`` maps
@@ -27,266 +34,182 @@ Real-time kernel constraints honoured by the emitted Rust
 
 Usage::
 
-    pip install sympy
-    # Defaults to the checked-in UR5 fixture and prints to stdout:
-    python codegen/generate_dynamics.py
+    pip install ssik sympy numpy
+    # From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
+    python codegen/generate_dynamics.py --artifact ur5_ik
 
-    # Explicit URDF, base/end-effector links, and output file:
-    python codegen/generate_dynamics.py \
-        --urdf src/drivers/ur5/ur5.urdf \
-        --base base_link --ee ee_link \
-        --output src/drivers/ur5/dynamics.rs
+    # From a local artifact .py file, writing to a driver module:
+    python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
+        --output src/drivers/my_arm/dynamics.rs
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import sys
-import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+import types
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import numpy as np
 import sympy as sp
 from sympy.printing.rust import RustCodePrinter
 
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
-_DEFAULT_URDF = _REPO_ROOT / "src" / "drivers" / "ur5" / "ur5.urdf"
 
-# Joint types that contribute a controllable degree of freedom.
-_ACTUATED = ("revolute", "continuous", "prismatic")
+# Tolerance for snapping a baked constant to the nearest integer (0, +/-1).  The
+# artifact matrices carry rounding noise like ``6.12e-17`` for an exact ``0`` and
+# ``1.0`` for an exact axis component; snapping keeps the emitted FK compact and
+# numerically faithful to the reference.
+_SNAP_TOL = 1e-12
 
 
 # ---------------------------------------------------------------------------
-# URDF parsing
+# ssik artifact loading
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class Joint:
-    """A single URDF joint along the kinematic chain."""
+def load_artifact(artifact: str) -> types.ModuleType:
+    """Import a ssik artifact by prebuilt name or by path to a ``*_ik.py`` file.
 
-    name: str
-    jtype: str
-    parent: str
-    child: str
-    xyz: Tuple[float, float, float]
-    rpy: Tuple[float, float, float]
-    axis: Tuple[float, float, float]
-
-    @property
-    def actuated(self) -> bool:
-        return self.jtype in _ACTUATED
-
-
-def _parse_triple(text: Optional[str], default: Tuple[float, float, float]) -> Tuple[float, float, float]:
-    if text is None:
-        return default
-    parts = [float(v) for v in text.split()]
-    if len(parts) != 3:
-        raise ValueError(f"expected 3 values, got {text!r}")
-    return (parts[0], parts[1], parts[2])
-
-
-def parse_urdf(path: Path) -> List[Joint]:
-    """Parse every joint from a URDF into a flat list (declaration order)."""
-    root = ET.parse(path).getroot()
-    joints: List[Joint] = []
-    for j in root.findall("joint"):
-        jtype = j.get("type", "fixed")
-        parent = j.find("parent")
-        child = j.find("child")
-        if parent is None or child is None:
-            raise ValueError(f"joint {j.get('name')!r} missing parent/child")
-        origin = j.find("origin")
-        xyz = _parse_triple(origin.get("xyz") if origin is not None else None, (0.0, 0.0, 0.0))
-        rpy = _parse_triple(origin.get("rpy") if origin is not None else None, (0.0, 0.0, 0.0))
-        axis_el = j.find("axis")
-        axis = _parse_triple(axis_el.get("xyz") if axis_el is not None else None, (0.0, 0.0, 1.0))
-        joints.append(
-            Joint(
-                name=j.get("name", "?"),
-                jtype=jtype,
-                parent=parent.get("link"),
-                child=child.get("link"),
-                xyz=xyz,
-                rpy=rpy,
-                axis=axis,
-            )
-        )
-    return joints
-
-
-def order_chain(joints: List[Joint], base: Optional[str], ee: Optional[str]) -> List[Joint]:
-    """Order joints into the serial chain that connects ``base`` to ``ee``.
-
-    When ``base``/``ee`` are omitted they are inferred from the tree topology:
-    the base is the unique link that is never a child, and the end-effector is a
-    leaf link that is never a parent.
+    :param artifact: Either a bare module name (e.g. ``"ur5_ik"``) resolved
+        against ``ssik.prebuilt``, or a filesystem path to an artifact module.
+    :returns: The imported module exposing ``_JOINT_AXES``, ``_JOINT_T_LEFTS``
+        and ``_JOINT_T_RIGHTS`` (and usually ``DOF``).
+    :raises ImportError: If neither resolution strategy succeeds.
     """
-    by_parent = {}
-    for jt in joints:
-        by_parent.setdefault(jt.parent, []).append(jt)
+    candidate = Path(artifact)
+    if candidate.exists():
+        spec = importlib.util.spec_from_file_location(candidate.stem, candidate)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load artifact module from {candidate}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
 
-    children = {jt.child for jt in joints}
-    parents = {jt.parent for jt in joints}
+    name = artifact[:-3] if artifact.endswith(".py") else artifact
+    try:
+        return importlib.import_module(f"ssik.prebuilt.{name}")
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            f"Cannot find {artifact!r} as a file or as ssik.prebuilt.{name}. "
+            "Install ssik (`pip install ssik`) or pass a path to the artifact file."
+        ) from exc
 
-    if base is None:
-        roots = [p for p in parents if p not in children]
-        if len(roots) != 1:
-            raise ValueError(
-                f"cannot infer base link (candidates: {sorted(roots)}); pass --base"
-            )
-        base = roots[0]
-    if ee is None:
-        leaves = [c for c in children if c not in parents]
-        if len(leaves) != 1:
-            raise ValueError(
-                f"cannot infer ee link (candidates: {sorted(leaves)}); pass --ee"
-            )
-        ee = leaves[0]
 
-    chain: List[Joint] = []
-    link = base
-    while link != ee:
-        outgoing = by_parent.get(link)
-        if not outgoing:
-            raise ValueError(f"no joint leaves link {link!r}; chain to {ee!r} is broken")
-        if len(outgoing) != 1:
-            raise ValueError(
-                f"link {link!r} branches into {[j.name for j in outgoing]}; "
-                "URDF is not a serial chain"
-            )
-        jt = outgoing[0]
-        chain.append(jt)
-        link = jt.child
-    return chain
+def _snap(value: float) -> sp.Expr:
+    """Snap a baked float to an exact integer when within ``_SNAP_TOL``."""
+    rounded = round(value)
+    if abs(value - rounded) < _SNAP_TOL:
+        return sp.Integer(rounded)
+    # 17 significant digits round-trip an IEEE-754 f64 exactly, so the emitted
+    # literal reproduces the artifact constant bit-for-bit.
+    return sp.Float(value, 17)
+
+
+def _to_matrix(arr) -> sp.Matrix:
+    a = np.asarray(arr, dtype=np.float64)
+    return sp.Matrix([[_snap(a[i, j]) for j in range(a.shape[1])] for i in range(a.shape[0])])
+
+
+def _to_vector(arr) -> sp.Matrix:
+    a = np.asarray(arr, dtype=np.float64).reshape(-1)
+    return sp.Matrix([_snap(x) for x in a])
+
+
+def extract_chain(
+    mod: types.ModuleType,
+) -> Tuple[List[sp.Matrix], List[sp.Matrix], List[sp.Matrix], int]:
+    """Pull the product-of-exponentials chain out of a ssik artifact.
+
+    :returns: ``(t_lefts, axes, t_rights, dof)`` as cleaned SymPy objects.
+    """
+    try:
+        axes_raw = mod._JOINT_AXES
+        tl_raw = mod._JOINT_T_LEFTS
+        tr_raw = mod._JOINT_T_RIGHTS
+    except AttributeError as exc:
+        raise ValueError(
+            f"artifact {mod.__name__!r} does not expose the expected "
+            "_JOINT_AXES / _JOINT_T_LEFTS / _JOINT_T_RIGHTS constants"
+        ) from exc
+
+    axes = [_to_vector(a) for a in axes_raw]
+    t_lefts = [_to_matrix(m) for m in tl_raw]
+    t_rights = [_to_matrix(m) for m in tr_raw]
+    dof = int(getattr(mod, "DOF", len(axes)))
+    if not (len(axes) == len(t_lefts) == len(t_rights) == dof):
+        raise ValueError(
+            f"inconsistent chain lengths: axes={len(axes)}, T_left={len(t_lefts)}, "
+            f"T_right={len(t_rights)}, DOF={dof}"
+        )
+    return t_lefts, axes, t_rights, dof
 
 
 # ---------------------------------------------------------------------------
 # Symbolic SE(3) construction
 # ---------------------------------------------------------------------------
 
-_PI_MULTIPLE_TOL = 1e-9
-
-
-def _num(value: float) -> sp.Expr:
-    """Convert a URDF float into a clean SymPy expression.
-
-    Angles that are integer multiples of ``pi/2`` (the overwhelmingly common
-    URDF case) collapse to exact symbolic constants so that, e.g.,
-    ``cos(pi/2)`` folds to ``0`` and the generated FK stays compact and exact.
-    """
-    if value == 0.0:
-        return sp.Integer(0)
-    ratio = value / float(sp.pi)
-    nearest = round(ratio * 2) / 2  # nearest multiple of 1/2
-    if nearest != 0 and abs(ratio - nearest) < _PI_MULTIPLE_TOL:
-        return sp.nsimplify(nearest) * sp.pi
-    return sp.Float(value, 17)
-
-
-def _rot_x(a: sp.Expr) -> sp.Matrix:
-    c, s = sp.cos(a), sp.sin(a)
-    return sp.Matrix([[1, 0, 0], [0, c, -s], [0, s, c]])
-
-
-def _rot_y(a: sp.Expr) -> sp.Matrix:
-    c, s = sp.cos(a), sp.sin(a)
-    return sp.Matrix([[c, 0, s], [0, 1, 0], [-s, 0, c]])
-
-
-def _rot_z(a: sp.Expr) -> sp.Matrix:
-    c, s = sp.cos(a), sp.sin(a)
-    return sp.Matrix([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-
-
-def _rpy_to_rot(roll: sp.Expr, pitch: sp.Expr, yaw: sp.Expr) -> sp.Matrix:
-    # URDF fixed-axis convention: R = Rz(yaw) * Ry(pitch) * Rx(roll).
-    return _rot_z(yaw) * _rot_y(pitch) * _rot_x(roll)
-
-
-def _homogeneous(rot: sp.Matrix, trans: sp.Matrix) -> sp.Matrix:
-    m = sp.eye(4)
-    m[:3, :3] = rot
-    m[:3, 3] = trans
-    return m
-
 
 def _axis_angle_rot(axis: sp.Matrix, angle: sp.Expr) -> sp.Matrix:
-    """Rodrigues rotation about a (constant) unit ``axis`` by symbolic ``angle``."""
+    """Homogeneous Rodrigues rotation about a (constant) ``axis`` by ``angle``.
+
+    Mirrors the Rust ``rot_homogeneous`` kernel so the symbolic FK reproduces
+    the ssik product-of-exponentials bit-compatibly.
+    """
     x, y, z = axis
     c, s = sp.cos(angle), sp.sin(angle)
     oc = 1 - c
-    return sp.Matrix(
+    r = sp.Matrix(
         [
             [c + x * x * oc, x * y * oc - z * s, x * z * oc + y * s],
             [y * x * oc + z * s, c + y * y * oc, y * z * oc - x * s],
             [z * x * oc - y * s, z * y * oc + x * s, c + z * z * oc],
         ]
     )
+    m = sp.eye(4)
+    m[:3, :3] = r
+    return m
 
 
-def _num_axis(value: float) -> sp.Expr:
-    # Joint axes are unit vectors with components in {-1, 0, 1} for virtually all
-    # URDFs; keep them exact when possible, otherwise carry the literal.
-    rounded = round(value)
-    if abs(value - rounded) < _PI_MULTIPLE_TOL:
-        return sp.Integer(rounded)
-    return sp.Float(value, 17)
-
-
-def build_fk(chain: List[Joint]) -> Tuple[sp.Matrix, List[sp.Symbol], List[sp.Matrix]]:
-    """Build the symbolic base->ee transform and the per-joint frame transforms.
+def build_fk(
+    t_lefts: List[sp.Matrix], axes: List[sp.Matrix], t_rights: List[sp.Matrix]
+) -> Tuple[sp.Matrix, List[sp.Symbol], List[sp.Matrix]]:
+    """Build the symbolic base->ee transform from the ssik chain.
 
     Returns ``(T_ee, q_syms, frames)`` where ``frames[i]`` is the base->joint-i
-    *frame* transform (after the joint origin, before applying the joint motion)
-    aligned with ``q_syms[i]`` — exactly the data the geometric Jacobian needs.
+    *axis frame* transform (after ``T_left[i]``, before the joint rotation) —
+    exactly the data the geometric Jacobian needs.
     """
     q_syms: List[sp.Symbol] = []
     frames: List[sp.Matrix] = []
     t_cum = sp.eye(4)
-    dof = 0
-    for jt in chain:
-        roll, pitch, yaw = (_num(v) for v in jt.rpy)
-        origin = _homogeneous(_rpy_to_rot(roll, pitch, yaw), sp.Matrix(jt.xyz))
-        t_frame = t_cum * origin
-        if jt.actuated:
-            q = sp.Symbol(f"q{dof}")
-            q_syms.append(q)
-            frames.append(t_frame)
-            dof += 1
-            axis = sp.Matrix([_num_axis(v) for v in jt.axis])
-            if jt.jtype == "prismatic":
-                motion = _homogeneous(sp.eye(3), axis * q)
-            else:  # revolute / continuous
-                motion = _homogeneous(_axis_angle_rot(axis, q), sp.zeros(3, 1))
-            t_cum = t_frame * motion
-        else:  # fixed joint: pure static transform
-            t_cum = t_frame
+    for i, (tl, axis, tr) in enumerate(zip(t_lefts, axes, t_rights)):
+        q = sp.Symbol(f"q{i}")
+        q_syms.append(q)
+        frame = t_cum * tl
+        frames.append(frame)
+        t_cum = frame * _axis_angle_rot(axis, q) * tr
     return t_cum, q_syms, frames
 
 
 def build_jacobian(
-    t_ee: sp.Matrix, chain: List[Joint], q_syms: List[sp.Symbol], frames: List[sp.Matrix]
+    t_ee: sp.Matrix, axes: List[sp.Matrix], frames: List[sp.Matrix]
 ) -> sp.Matrix:
-    """Geometric Jacobian ``[Jv; Jw]`` (6 x N) of the end-effector pose."""
+    """Geometric Jacobian ``[Jv; Jw]`` (6 x N) for the all-revolute ssik chain."""
     p_e = t_ee[:3, 3]
-    actuated = [jt for jt in chain if jt.actuated]
     cols = []
-    for jt, frame in zip(actuated, frames):
+    for axis, frame in zip(axes, frames):
         r = frame[:3, :3]
         p_i = frame[:3, 3]
-        axis = sp.Matrix([_num_axis(v) for v in jt.axis])
         z_i = r * axis  # joint axis expressed in the base frame
-        if jt.jtype == "prismatic":
-            jv = z_i
-            jw = sp.zeros(3, 1)
-        else:  # revolute / continuous
-            jv = z_i.cross(p_e - p_i)
-            jw = z_i
+        jv = z_i.cross(p_e - p_i)
+        jw = z_i
         cols.append(sp.Matrix.vstack(jv, jw))
     return sp.Matrix.hstack(*cols)
 
@@ -389,6 +312,17 @@ def _emit_matrix(
     return lines
 
 
+def _unpack_q(q_syms: List[sp.Symbol], printer: NoStdRustPrinter) -> List[str]:
+    return [f"    let {printer.doprint(q)} = q[{i}];" for i, q in enumerate(q_syms)]
+
+
+def _emit_cse(replacements, printer: NoStdRustPrinter) -> List[str]:
+    return [
+        f"    let {printer.doprint(sym)} = {rust_literal(sub, printer)};"
+        for sym, sub in replacements
+    ]
+
+
 def generate_rust(
     arm: str,
     n: int,
@@ -399,17 +333,12 @@ def generate_rust(
 ) -> str:
     printer = NoStdRustPrinter({"contract": False})
 
-    # Shared common-subexpression elimination across FK and Jacobian so the two
-    # functions stay compact; each function only re-binds the temporaries it uses.
-    fk_flat = list(t_ee)
-    jac_flat = list(jac)
-
     out: List[str] = []
     out.append(f"//! Auto-generated symbolic dynamics for the {arm} ({n}-DOF).")
     out.append("//!")
     out.append("//! Forward kinematics and the geometric Jacobian, derived")
-    out.append("//! symbolically from the URDF with SymPy and emitted as pure")
-    out.append(f"//! `#![no_std]` Rust. Regenerate with `codegen/{script_name}`.")
+    out.append("//! symbolically from the ssik artifact with SymPy and emitted as")
+    out.append(f"//! pure `#![no_std]` Rust. Regenerate with `codegen/{script_name}`.")
     out.append("//!")
     out.append("//! Do not edit by hand. Every transcendental is a `libm` call and")
     out.append("//! every output is a fixed-size array: no heap, no branches, no loops.")
@@ -424,7 +353,7 @@ def generate_rust(
     out.append("")
 
     # --- fk ---
-    repls_fk, reduced_fk = sp.cse(fk_flat, optimizations="basic")
+    repls_fk, reduced_fk = sp.cse(list(t_ee), optimizations="basic")
     reduced_fk_mat = sp.Matrix(4, 4, reduced_fk)
 
     out.append("/// Forward kinematics: base -> end-effector SE(3) pose.")
@@ -439,7 +368,7 @@ def generate_rust(
     out.append("")
 
     # --- jacobian ---
-    repls_j, reduced_j = sp.cse(jac_flat, optimizations="basic")
+    repls_j, reduced_j = sp.cse(list(jac), optimizations="basic")
     reduced_j_mat = sp.Matrix(6, n, reduced_j)
 
     out.append("/// Geometric Jacobian `[Jv; Jw]` (6 x DOF) of the end-effector.")
@@ -455,20 +384,6 @@ def generate_rust(
     return "\n".join(out)
 
 
-def _unpack_q(q_syms: List[sp.Symbol], printer: NoStdRustPrinter) -> List[str]:
-    lines = []
-    for i, q in enumerate(q_syms):
-        lines.append(f"    let {printer.doprint(q)} = q[{i}];")
-    return lines
-
-
-def _emit_cse(replacements, printer: NoStdRustPrinter) -> List[str]:
-    lines = []
-    for sym, sub in replacements:
-        lines.append(f"    let {printer.doprint(sym)} = {rust_literal(sub, printer)};")
-    return lines
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -477,17 +392,14 @@ def _emit_cse(replacements, printer: NoStdRustPrinter) -> List[str]:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
-        "--urdf",
-        type=Path,
-        default=_DEFAULT_URDF,
-        help="Path to the robot URDF (default: checked-in UR5 fixture).",
+        "--artifact",
+        required=True,
+        help="ssik artifact name (e.g. 'ur5_ik') or path to a *_ik.py file.",
     )
-    parser.add_argument("--base", default=None, help="Base link name (default: inferred).")
-    parser.add_argument("--ee", default=None, help="End-effector link name (default: inferred).")
     parser.add_argument(
         "--arm",
         default=None,
-        help="Human-readable arm name for the doc comment (default: URDF stem).",
+        help="Human-readable arm name for the doc comment (default: artifact stem).",
     )
     parser.add_argument(
         "--output",
@@ -497,20 +409,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if not args.urdf.exists():
-        parser.error(f"URDF file not found: {args.urdf}")
+    try:
+        mod = load_artifact(args.artifact)
+        t_lefts, axes, t_rights, n = extract_chain(mod)
+    except (ImportError, ValueError) as exc:
+        print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
+        return 1
 
-    arm = args.arm or args.urdf.stem
-    joints = parse_urdf(args.urdf)
-    chain = order_chain(joints, args.base, args.ee)
-    n = sum(1 for jt in chain if jt.actuated)
-    if n == 0:
-        parser.error("chain has zero actuated joints; nothing to generate")
+    stem = Path(args.artifact).stem
+    arm = args.arm or stem.removesuffix("_ik")
+    print(f"[generate_dynamics] {arm}: {n} DOF from ssik artifact {stem!r}", file=sys.stderr)
 
-    print(f"[generate_dynamics] {arm}: {n} DOF over {len(chain)} chain joints", file=sys.stderr)
-
-    t_ee, q_syms, frames = build_fk(chain)
-    jac = build_jacobian(t_ee, chain, q_syms, frames)
+    t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
+    jac = build_jacobian(t_ee, axes, frames)
     rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name)
 
     if args.output is None:
