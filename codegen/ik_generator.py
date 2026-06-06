@@ -76,6 +76,14 @@ _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 _MAX_RETRIES = 3
 
 
+def _resolve_source_urdf(arm_name: str, provided_urdf: Path | None) -> Path | None:
+    """Return the explicit URDF or the matching fixture URDF, if present."""
+    if provided_urdf is not None:
+        return provided_urdf
+    fixture_urdf = _CODEGEN_DIR / "fixtures" / f"{arm_name}.urdf"
+    return fixture_urdf if fixture_urdf.exists() else None
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -205,6 +213,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     arm_name = artifact_stem.removesuffix("_ik")
+    source_urdf = _resolve_source_urdf(arm_name, args.urdf)
 
     # --- Step 1: Detect kinematic family ---
     print("[ik_generator] Step 1: Detecting kinematic family …")
@@ -257,7 +266,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             _REPO_ROOT / "src" / "drivers" / arm_name,
             arm_name,
             target_py_code,
-            args.urdf,
+            source_urdf,
         )
         print(f"[ik_generator] ✓ Context dump : {ctx_path}")
         print(f"[ik_generator] ✓ Python artifact : {py_path}")
@@ -332,7 +341,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             files,
             target_py_code,
             context,
-            args.urdf,
+            source_urdf,
         )
 
         # --- Step 7: Run Python helper scripts ---
