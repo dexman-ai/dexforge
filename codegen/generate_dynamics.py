@@ -386,20 +386,20 @@ def order_urdf_chain(
 
     chain: List[UrdfJoint] = []
     link = base_link
-    if link is None or ee_link is None:
+    if ee_link is None:
         raise ValueError("base_link and ee_link are required to order the URDF chain")
 
-    visited = {link}
+    visited = set()
     while link != ee_link:
+        if link in visited:
+            raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+        visited.add(link)
         outgoing = by_parent.get(link)
         if not outgoing or len(outgoing) != 1:
             raise ValueError(f"URDF chain branches or breaks at link {link!r}")
         jt = outgoing[0]
         chain.append(jt)
         link = jt.child
-        if link in visited:
-            raise ValueError(f"URDF chain contains a cycle at link {link!r}")
-        visited.add(link)
     return chain
 
 
