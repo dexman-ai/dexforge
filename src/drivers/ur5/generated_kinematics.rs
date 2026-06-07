@@ -1,4 +1,4 @@
-//! Auto-generated symbolic kinematics for the ur5 (6-DOF).
+//! Auto-generated symbolic kinematics for the UR5 (6-DOF).
 //!
 //! Forward kinematics and the geometric Jacobian, derived
 //! symbolically from the ssik artifact with SymPy and emitted as
@@ -12,7 +12,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 
-/// Degrees of freedom of the ur5.
+/// Degrees of freedom of the UR5.
 pub const DOF: usize = 6;
 
 /// Forward kinematics: base -> end-effector SE(3) pose.
