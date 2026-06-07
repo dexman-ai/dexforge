@@ -386,8 +386,6 @@ def order_urdf_chain(
 
     chain: List[UrdfJoint] = []
     link = base_link
-    if ee_link is None:
-        raise ValueError("base_link and ee_link are required to order the URDF chain")
 
     visited = set()
     while link != ee_link:
