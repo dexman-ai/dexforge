@@ -107,50 +107,49 @@ def _is_within(path: Path, parent: Path) -> bool:
 
 def _cargo_toml(crate_name: str, arm: str) -> str:
     """Render the stand-alone crate's ``Cargo.toml``."""
-    return (
-        f"[package]\n"
-        f'name = "{crate_name}"\n'
-        f'version = "0.1.0"\n'
-        f'edition = "2021"\n'
-        f'description = "Stand-alone analytical IK driver for the {arm} arm, '
-        f'compiled by dexforge."\n'
-        f'license = "BSD-3-Clause"\n'
-        f"\n"
-        f"# Self-contained: depends only on libm + nalgebra (no_std), never on\n"
-        f"# the dexforge repository or the dexforge Python package.\n"
-        f"[dependencies]\n"
-        f'libm = "0.2"\n'
-        f"\n"
-        f"[dependencies.nalgebra]\n"
-        f'version = "0.33"\n'
-        f"default-features = false\n"
-        f'features = ["libm"]\n'
-        f"\n"
-        f"[profile.release]\n"
-        f"lto = true\n"
-        f"codegen-units = 1\n"
-        f'panic = "abort"\n'
-    )
+    return f"""\
+[package]
+name = "{crate_name}"
+version = "0.1.0"
+edition = "2021"
+description = "Stand-alone analytical IK driver for the {arm} arm, compiled by dexforge."
+license = "BSD-3-Clause"
+
+# Self-contained: depends only on libm + nalgebra (no_std), never on the
+# dexforge repository or the dexforge Python package.
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+"""
 
 
 def _lib_rs(crate_name: str, arm: str) -> str:
     """Render the stand-alone crate's ``src/lib.rs``."""
-    return (
-        f"//! Stand-alone `{arm}` analytical inverse-kinematics driver,\n"
-        f"//! compiled by `dexforge build`.\n"
-        f"//!\n"
-        f"//! This crate is fully self-contained: it does not depend on the\n"
-        f"//! dexforge repository or the `dexforge` Python package. It exposes the\n"
-        f"//! arm's `fk` and `solve` entry points (re-exported at the crate root)\n"
-        f"//! and is `#![no_std]`, heap-free, and bounded-iteration throughout.\n"
-        f"#![no_std]\n"
-        f"#![forbid(unsafe_code)]\n"
-        f"\n"
-        f"pub mod drivers;\n"
-        f"pub mod math;\n"
-        f"\n"
-        f"pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};\n"
-    )
+    return f"""\
+//! Stand-alone `{arm}` analytical inverse-kinematics driver,
+//! compiled by `dexforge build`.
+//!
+//! This crate is fully self-contained: it does not depend on the dexforge
+//! repository or the `dexforge` Python package. It exposes the arm's `fk` and
+//! `solve` entry points (re-exported at the crate root) and is `#![no_std]`,
+//! heap-free, and bounded-iteration throughout.
+#![no_std]
+#![forbid(unsafe_code)]
+
+pub mod drivers;
+pub mod math;
+
+pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};
+"""
 
 
 def _drivers_mod_rs(arm: str) -> str:
