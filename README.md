@@ -104,32 +104,43 @@ Each `solve` accepts the same optional keyword arguments as the Python ssik
 artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
 `fk_atol`, `dedup_atol`, and `refinement_max_iters`.
 
-## Code generation CLI
+## Driver compiler CLI (`dexforge build`)
 
-The whole inverse-kinematics and dynamics code-generation pipeline is wrapped by
-a single `dexforge` command:
+`dexforge` is a **driver compiler**: it compiles an arm's analytical IK driver
+into a *stand-alone* Rust crate written **outside** this repository. The emitted
+crate is fully self-contained — it copies the shared math kernels and the
+per-arm driver sources into the target directory and generates its own
+`Cargo.toml` + `lib.rs` — so it builds and runs **without** the dexforge
+repository or the `dexforge` Python package. This lets an OEM use dexforge as a
+one-shot URDF/IK compiler for their hardware and vendor the resulting minimal,
+zero-allocation `#![no_std]` driver straight into firmware.
 
 ```sh
 pip install dexforge
-dexforge build
+dexforge build --arm ur5 --output ~/ur5_ik_driver
+cd ~/ur5_ik_driver && cargo build --release
 ```
 
-`dexforge build` regenerates every committed Rust driver under
-`src/drivers/<arm>/` by running the `codegen/` generators in dependency order
-(baked constants → symbolic FK/Jacobian → regression datasets) for all supported
-arms. Useful flags:
+The generated crate re-exports the arm's entry points at its root, so a consumer
+just calls `ur5_ik_driver::fk(&q)` / `ur5_ik_driver::solve(&tf, …)`. Useful
+flags:
 
 ```sh
-dexforge build --list            # print the plan without running anything
-dexforge build --arm ur5         # regenerate a single arm (repeatable)
-dexforge build --stage kinematics  # only re-run one stage (repeatable)
+dexforge build --arm ur5 -o ~/ur5 --list   # preview the file list, write nothing
+dexforge build --arm ur5 -o ~/ur5 --no-verify   # skip the standalone cargo build check
+dexforge build -o ~/dexforge_drivers       # all arms, one crate per arm subdir
 ```
 
-The generators require the *locked* `ssik` version plus `sympy`/`numpy`
-(`pip install $(grep ssik SSIK_VERSION.txt) sympy numpy`) and write back into the
-checked-out source tree, so run the command from a dexforge clone (install with
-`pip install -e .` when iterating). The individual generators are documented
-below.
+By default each crate is verified by running `cargo build --release` inside it.
+`--output` must be outside the dexforge repository (the whole point is a
+self-contained driver). Supported arms: `ur5`, `piper`, `franka_panda`, `xarm7`,
+`rizon4`, `rizon10`.
+
+> The drivers `dexforge build` compiles are the committed, verified sources
+> under `src/drivers/<arm>/`. Producing a driver for *new* hardware from a raw
+> URDF is the job of the LLM-assisted generator in `codegen/ik_generator.py`
+> (below); once that has produced `src/drivers/<arm>/`, `dexforge build` exports
+> it as a stand-alone crate.
 
 ## Adding a new arm
 

@@ -1,9 +1,11 @@
-"""dexforge — command-line tooling for the dexforge code generators.
+"""dexforge — a stand-alone IK *driver compiler*.
 
-The package currently exposes a single entry point, :mod:`dexforge.cli`, whose
-``dexforge build`` command runs the inverse-kinematics and dynamics code
-generation pipeline that turns the locked ``ssik`` prebuilt artifacts into the
-committed ``#![no_std]`` Rust drivers under ``src/drivers/<arm>/``.
+The package exposes a single entry point, :mod:`dexforge.cli`, whose
+``dexforge build`` command compiles an arm's analytical inverse-kinematics
+driver into a self-contained Rust crate written *outside* the dexforge
+repository. The emitted crate copies the shared math kernels and per-arm driver
+sources and generates its own ``Cargo.toml``/``lib.rs``, so it builds and runs
+without the dexforge repository or this package.
 """
 
 from __future__ import annotations

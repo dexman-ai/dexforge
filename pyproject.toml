@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dexforge"
 version = "0.1.0"
-description = "Command-line orchestrator for the dexforge IK and dynamics code generators."
+description = "Compile stand-alone analytical IK driver crates from dexforge."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "BSD-3-Clause" }
