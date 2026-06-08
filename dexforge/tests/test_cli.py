@@ -71,6 +71,11 @@ class PlanExportTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             cli.plan_export("nope", Path("/tmp"), _REPO_ROOT)
 
+    def test_missing_driver_error_points_at_urdf(self) -> None:
+        with self.assertRaises(FileNotFoundError) as ctx:
+            cli.plan_export("nope", Path("/tmp"), _REPO_ROOT)
+        self.assertIn("--urdf", str(ctx.exception))
+
     def test_shared_modules_recorded_for_rizon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             export = cli.plan_export("rizon4", Path(tmp), _REPO_ROOT)
