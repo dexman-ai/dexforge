@@ -75,6 +75,49 @@ bounded algebraic route, and the resulting roots are snapped back onto the
 original target with bounded Levenberg-Marquardt. This keeps worst-case
 execution time bounded and reproducible across the entire reachable workspace.
 
+### Runtime TCP & grasped payload
+
+The end-effector frame (TCP) and the inertial properties of a grasped tool can
+be changed **at runtime**, without regenerating any per-arm FK / Jacobian /
+dynamics code. Both attach rigidly to the flange (the last actuated link), so a
+single constant transform plus the already-generated geometric Jacobian is all
+that is needed. The helpers in [`math::tcp`] are `#![no_std]`, allocate
+nothing, run in bounded time and are fully deterministic — the same constraints
+as the rest of the crate.
+
+```rust
+use nalgebra::SMatrix;
+use ssik_rust::drivers::xarm7::ik_solver::{fk, solve, TolerancePolicy};
+use ssik_rust::drivers::xarm7::generated_kinematics::jacobian;
+use ssik_rust::math::tcp::{fk_with_tcp, flange_target_for_tcp, payload_gravity_torque, Payload};
+
+// A tool whose control point sits 12 cm along the flange z axis.
+let mut tcp: SMatrix<f64, 4, 4> = SMatrix::identity();
+tcp[(2, 3)] = 0.12;
+
+// Forward kinematics of the *TCP* (instead of the flange):
+let q = [0.0; 7];
+let tcp_pose = fk_with_tcp(&fk(&q), &tcp);
+
+// Inverse kinematics for a desired *TCP* pose — retarget, then solve as usual:
+let tcp_target: SMatrix<f64, 4, 4> = /* desired SE(3) pose of the TCP */;
+let flange_target = flange_target_for_tcp(&tcp_target, &tcp);
+let solutions = solve(&flange_target, None, None, false, true, TolerancePolicy::DEFAULT, 15);
+
+// Gravity-compensate while holding a 2.5 kg tool (centre of mass in the flange
+// frame). Add this to the arm's baked `gravity(q, g)` torque.
+let payload = Payload::new(2.5, [0.0, 0.0, 0.06]);
+let tau_tool = payload_gravity_torque(&fk(&q), &jacobian(&q), &payload, &[0.0, 0.0, -9.81]);
+```
+
+`fk_with_tcp` post-multiplies the flange FK by the TCP transform;
+`flange_target_for_tcp` divides it back out so the existing solver is reused
+unchanged. `payload_gravity_torque` returns the exact additional holding torque
+`tau_j = -m (g · ∂p_com/∂q_j)` (the same convention the offline dynamics codegen
+uses), and `payload_inertia_matrix` returns the payload's point-mass
+contribution to the joint-space inertia `M(q)`. Because a runtime tool is
+scoped to *mass* and *centre of mass*, no rotational inertia tensor is required.
+
 ## Python interface
 
 `dexforge-py` wraps the Rust solvers via [pyo3](https://pyo3.rs). Each arm is

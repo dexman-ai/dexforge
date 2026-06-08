@@ -11,6 +11,9 @@
 //!   UR5 ([`drivers::ur5`]), the Franka Emika Panda ([`drivers::franka_panda`]),
 //!   the AgileX Piper ([`drivers::piper`]), and the UFactory xArm7
 //!   ([`drivers::xarm7`]).
+//! * [`math::tcp`] adds runtime tool-center-point (TCP) retargeting and
+//!   grasped-payload (mass + centre-of-mass) gravity/inertia terms, so the TCP
+//!   and a held tool can change at runtime without regenerating any arm code.
 //!
 //! Every numeric loop in this crate carries a hardcoded iteration ceiling and
 //! every data structure is a fixed-size, stack-allocated array, so the code
