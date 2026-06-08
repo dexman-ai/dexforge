@@ -1,2 +1,1 @@
-"""dexforge command-line helpers."""
-
+"""dexforge CLI package."""

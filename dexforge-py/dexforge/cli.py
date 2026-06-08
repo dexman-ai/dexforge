@@ -40,7 +40,7 @@ def _find_repo_root(start: Path) -> Path:
     )
 
 
-def _iter_build_commands(repo_root: Path, python_executable: str) -> list[list[str]]:
+def _collect_build_commands(repo_root: Path, python_executable: str) -> list[list[str]]:
     commands: list[list[str]] = []
     codegen_dir = repo_root / "codegen"
     drivers_dir = repo_root / "src" / "drivers"
@@ -107,7 +107,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         repo_root = _find_repo_root(args.repo_root)
-        commands = _iter_build_commands(repo_root, args.python)
+        commands = _collect_build_commands(repo_root, args.python)
     except FileNotFoundError as exc:
         print(f"dexforge: {exc}", file=sys.stderr)
         return 1
@@ -122,4 +122,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
