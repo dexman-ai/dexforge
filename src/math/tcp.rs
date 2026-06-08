@@ -133,26 +133,31 @@ impl Payload {
     }
 }
 
-/// Translational Jacobian of the payload centre of mass (3 × DOF), in base
-/// frame, derived from the flange pose and the baked geometric Jacobian.
+/// Translational Jacobian (3 × DOF, base frame) of a point rigidly fixed to the
+/// flange, given as `local` in the flange frame.
 ///
-/// The centre of mass is rigidly attached to the flange, so the velocity of
-/// that point is `v_O + ω × r`, with `r = R_flange · com` the COM offset from
-/// the flange origin in base frame. Column `j` is therefore
-/// `Jv[:,j] + Jw[:,j] × r`, where `Jv`/`Jw` are the translational/angular
-/// blocks (rows 0–2 / 3–5) of the geometric Jacobian.
+/// The point is carried by the flange, so its velocity is `v_O + ω × r`, with
+/// `r = R_flange · local` the point's offset from the flange origin in base
+/// frame. Column `j` of the returned `[[f64; 3]; DOF]` (column-major: `out[j]`
+/// is column `j`) is `Jv[:,j] + Jw[:,j] × r`, where `Jv`/`Jw` are the
+/// translational/angular blocks (rows 0–2 / 3–5) of the baked geometric
+/// Jacobian.
+///
+/// This is the shared kernel behind both the TCP-point geometric Jacobian and
+/// the grasped-payload centre-of-mass dynamics: pass the TCP translation for
+/// the former and the payload centre of mass for the latter.
 #[inline]
-fn com_translational_jacobian<const DOF: usize>(
+pub fn flange_point_jacobian<const DOF: usize>(
     flange_pose: &Pose,
     jacobian: &[[f64; DOF]; 6],
-    com: &[f64; 3],
+    local: &[f64; 3],
 ) -> [[f64; 3]; DOF] {
-    // r = R_flange · com (COM offset from flange origin, in base frame).
+    // r = R_flange · local (point offset from flange origin, in base frame).
     let mut r = [0.0f64; 3];
     for i in 0..3 {
         let mut s = 0.0;
         for k in 0..3 {
-            s += flange_pose[(i, k)] * com[k];
+            s += flange_pose[(i, k)] * local[k];
         }
         r[i] = s;
     }
@@ -190,7 +195,7 @@ pub fn payload_gravity_torque<const DOF: usize>(
     if payload.mass == 0.0 {
         return tau;
     }
-    let jvp = com_translational_jacobian(flange_pose, jacobian, &payload.com);
+    let jvp = flange_point_jacobian(flange_pose, jacobian, &payload.com);
     for j in 0..DOF {
         tau[j] = -payload.mass * dot3(gravity, &jvp[j]);
     }
@@ -215,7 +220,7 @@ pub fn payload_inertia_matrix<const DOF: usize>(
     if payload.mass == 0.0 {
         return mm;
     }
-    let jvp = com_translational_jacobian(flange_pose, jacobian, &payload.com);
+    let jvp = flange_point_jacobian(flange_pose, jacobian, &payload.com);
     for i in 0..DOF {
         for j in 0..DOF {
             mm[i][j] = payload.mass * dot3(&jvp[i], &jvp[j]);

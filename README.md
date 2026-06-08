@@ -81,42 +81,59 @@ The end-effector frame (TCP) and the inertial properties of a grasped tool can
 be changed **at runtime**, without regenerating any per-arm FK / Jacobian /
 dynamics code. Both attach rigidly to the flange (the last actuated link), so a
 single constant transform plus the already-generated geometric Jacobian is all
-that is needed. The helpers in [`math::tcp`] are `#![no_std]`, allocate
-nothing, run in bounded time and are fully deterministic — the same constraints
-as the rest of the crate.
+that is needed. The helpers are `#![no_std]`, allocate nothing, run in bounded
+time and are fully deterministic — the same constraints as the rest of the
+crate.
+
+The recommended entry point is the generic [`math::arm`] facade: every arm is a
+zero-sized marker (`Ur5`, `Piper`, `FrankaPanda`, `Xarm7`, `Rizon4`, `Rizon10`)
+implementing the [`Arm`] trait, so a single call shape — `fk`, `ik`, `jacobian`,
+`inverse_jacobian`, `gravity`, `mass_matrix`, `coriolis` — works for every arm
+and takes the runtime TCP / payload as plain arguments.
 
 ```rust
-use nalgebra::SMatrix;
-use ssik_rust::drivers::xarm7::ik_solver::{fk, solve, TolerancePolicy};
-use ssik_rust::drivers::xarm7::generated_kinematics::jacobian;
-use ssik_rust::math::tcp::{fk_with_tcp, flange_target_for_tcp, payload_gravity_torque, Payload};
+use ssik_rust::math::arm::{Arm, Xarm7, Payload};
+use ssik_rust::math::tcp::Pose;
+use ssik_rust::math::tolerances::TolerancePolicy;
 
 // A tool whose control point sits 12 cm along the flange z axis.
-let mut tcp: SMatrix<f64, 4, 4> = SMatrix::identity();
+let mut tcp = Pose::identity();
 tcp[(2, 3)] = 0.12;
 
-// Forward kinematics of the *TCP* (instead of the flange):
 let q = [0.0; 7];
-let tcp_pose = fk_with_tcp(&fk(&q), &tcp);
+let tcp_pose = Xarm7::fk(&q, &tcp);        // base -> TCP forward kinematics
+let j = Xarm7::jacobian(&q, &tcp);         // geometric Jacobian at the TCP
+let jinv = Xarm7::inverse_jacobian(&q, &tcp); // Option<DOF×6 pseudo-inverse>
 
-// Inverse kinematics for a desired *TCP* pose — retarget, then solve as usual:
-let tcp_target: SMatrix<f64, 4, 4> = /* desired SE(3) pose of the TCP */;
-let flange_target = flange_target_for_tcp(&tcp_target, &tcp);
-let solutions = solve(&flange_target, None, None, false, true, TolerancePolicy::DEFAULT, 15);
+// Inverse kinematics for a desired *TCP* pose (retargeted to the flange):
+let tcp_target = Pose::identity();
+let solutions = Xarm7::ik(&tcp_target, &tcp, None, None, false, true,
+                          TolerancePolicy::DEFAULT, 15);
 
-// Gravity-compensate while holding a 2.5 kg tool (centre of mass in the flange
-// frame). Add this to the arm's baked `gravity(q, g)` torque.
+// Dynamics of a 2.5 kg grasped tool (mass + centre of mass in the flange
+// frame). Add each elementwise to the arm's own torque / inertia.
 let payload = Payload::new(2.5, [0.0, 0.0, 0.06]);
-let tau_tool = payload_gravity_torque(&fk(&q), &jacobian(&q), &payload, &[0.0, 0.0, -9.81]);
+let qd = [0.1; 7];
+let tau_g = Xarm7::gravity(&q, &payload, &[0.0, 0.0, -9.81]); // holding torque
+let m_add = Xarm7::mass_matrix(&q, &payload);                 // ΔM(q)
+let tau_c = Xarm7::coriolis(&q, &qd, &payload);              // C(q,qd) qd
 ```
 
-`fk_with_tcp` post-multiplies the flange FK by the TCP transform;
-`flange_target_for_tcp` divides it back out so the existing solver is reused
-unchanged. `payload_gravity_torque` returns the exact additional holding torque
+`gravity` returns the exact additional holding torque
 `tau_j = -m (g · ∂p_com/∂q_j)` (the same convention the offline dynamics codegen
-uses), and `payload_inertia_matrix` returns the payload's point-mass
-contribution to the joint-space inertia `M(q)`. Because a runtime tool is
-scoped to *mass* and *centre of mass*, no rotational inertia tensor is required.
+uses), `mass_matrix` returns the payload's point-mass contribution to the
+joint-space inertia `M(q)`, and `coriolis` returns its velocity-product torque
+`C(q, qd) qd`. The Coriolis term is required because a grasped tool makes `M(q)`
+configuration-dependent — in particular **when the tool centre of mass is off
+the end-effector axis**, where the coupling is strongest. Because a runtime tool
+is scoped to *mass* and *centre of mass*, no rotational inertia tensor is
+required.
+
+The lower-level primitives the facade is built on live in [`math::tcp`]
+(`fk_with_tcp`, `flange_target_for_tcp`, `payload_gravity_torque`,
+`payload_inertia_matrix`, `flange_point_jacobian`) and can be used directly with
+the per-arm `ik_solver`/`generated_kinematics` functions when finer control is
+needed.
 
 ## Python interface
 
