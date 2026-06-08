@@ -180,6 +180,13 @@ def extract_chain(
     return t_lefts, axes, t_rights, dof
 
 
+def extract_base_ee_links(mod: types.ModuleType) -> Tuple[Optional[str], Optional[str]]:
+    """Read the optional base and end-effector link names from an artifact."""
+    base = getattr(mod, "BASE_LINK", None)
+    ee = getattr(mod, "EE_LINK", None)
+    return (base if isinstance(base, str) else None, ee if isinstance(ee, str) else None)
+
+
 # ---------------------------------------------------------------------------
 # Symbolic SE(3) construction
 # ---------------------------------------------------------------------------
@@ -355,23 +362,36 @@ def parse_urdf_joints(path: Path) -> List[UrdfJoint]:
     return joints
 
 
-def order_urdf_chain(joints: List[UrdfJoint]) -> List[UrdfJoint]:
-    """Order URDF joints into the unique serial base->ee chain (topological walk)."""
+def order_urdf_chain(
+    joints: List[UrdfJoint],
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+) -> List[UrdfJoint]:
+    """Order URDF joints into the serial base->ee chain (topological walk)."""
     by_parent: Dict[str, List[UrdfJoint]] = {}
     for jt in joints:
         by_parent.setdefault(jt.parent, []).append(jt)
-    children = {jt.child for jt in joints}
-    parents = {jt.parent for jt in joints}
-    roots = [p for p in parents if p not in children]
-    leaves = [c for c in children if c not in parents]
-    if len(roots) != 1 or len(leaves) != 1:
-        raise ValueError(
-            f"URDF is not a single serial chain (roots={sorted(roots)}, leaves={sorted(leaves)})"
-        )
+
+    if base_link is None or ee_link is None:
+        children = {jt.child for jt in joints}
+        parents = {jt.parent for jt in joints}
+        roots = [p for p in parents if p not in children]
+        leaves = [c for c in children if c not in parents]
+        if len(roots) != 1 or len(leaves) != 1:
+            raise ValueError(
+                f"URDF is not a single serial chain (roots={sorted(roots)}, leaves={sorted(leaves)})"
+            )
+        base_link = base_link or roots[0]
+        ee_link = ee_link or leaves[0]
+
     chain: List[UrdfJoint] = []
-    link = roots[0]
-    ee = leaves[0]
-    while link != ee:
+    link = base_link
+
+    visited = set()
+    while link != ee_link:
+        if link in visited:
+            raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+        visited.add(link)
         outgoing = by_parent.get(link)
         if not outgoing or len(outgoing) != 1:
             raise ValueError(f"URDF chain branches or breaks at link {link!r}")
@@ -558,9 +578,11 @@ def build_dynamics(
     t_rights: List[sp.Matrix],
     q_syms: List[sp.Symbol],
     urdf_path: Path,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
 ) -> Dynamics:
     """Derive gravity / mass-matrix / Coriolis / inverse-dynamics symbolically."""
-    urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path))
+    urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path), base_link, ee_link)
     bodies = build_bodies(axes, frames, t_rights, q_syms, urdf_chain)
     if not bodies:
         raise ValueError(
@@ -930,6 +952,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     stem = Path(args.artifact).stem
     arm = args.arm or stem.removesuffix("_ik")
+    base_link, ee_link = extract_base_ee_links(mod)
     print(f"[generate_dynamics] {arm}: {n} DOF from ssik artifact {stem!r}", file=sys.stderr)
 
     t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
@@ -941,11 +964,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[generate_dynamics] ERROR: URDF not found: {args.urdf}", file=sys.stderr)
             return 1
         try:
-            dynamics = build_dynamics(axes, frames, t_rights, q_syms, args.urdf)
+            dynamics = build_dynamics(
+                axes,
+                frames,
+                t_rights,
+                q_syms,
+                args.urdf,
+                base_link,
+                ee_link,
+            )
         except ValueError as exc:
             print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
             return 1
-        print(f"[generate_dynamics] {arm}: dynamics from {args.urdf} (runtime gravity)", file=sys.stderr)
+        print(
+            f"[generate_dynamics] {arm}: dynamics from {args.urdf} "
+            f"(runtime gravity, base={base_link!r}, ee={ee_link!r})",
+            file=sys.stderr,
+        )
 
     rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name, dynamics)
 
