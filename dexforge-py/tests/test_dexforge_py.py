@@ -146,8 +146,8 @@ def test_cross_validate_solve(arm, request):
             continue
 
         # Relaxed-arm policy (singular-tolerant): every returned Rust solution
-        # must both (a) close the pose in FK space and (b) correspond to a
-        # reference solution, with strict 1e-5 preferred and 1e-3 tolerated.
+        # must close the pose in FK space. For non-Rizon arms we additionally
+        # require a reference-set match (strict 1e-5 preferred, 1e-3 tolerated).
         pose_failed = False
         for r_q in rust_qs:
             fk_residual = np.max(
