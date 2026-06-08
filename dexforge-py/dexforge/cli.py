@@ -92,7 +92,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--repo-root",
         type=Path,
         default=Path.cwd(),
-        help="Path inside the dexforge repository (default: current working directory).",
+        help="Path to or inside the dexforge repository (default: current working directory).",
     )
     build_parser.add_argument(
         "--python",
