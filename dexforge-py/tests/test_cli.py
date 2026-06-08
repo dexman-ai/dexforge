@@ -28,6 +28,7 @@ def test_build_runs_full_codegen_pipeline(monkeypatch, tmp_path):
     calls: list[list[str]] = []
 
     def _fake_run(command, cwd):
+        assert cwd == repo
         calls.append(command)
         return 0
 
@@ -54,6 +55,7 @@ def test_build_stops_after_first_failure(monkeypatch, tmp_path):
     calls: list[list[str]] = []
 
     def _fake_run(command, cwd):
+        assert cwd == repo
         calls.append(command)
         return 9 if len(calls) == 2 else 0
 
