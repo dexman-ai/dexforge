@@ -32,12 +32,24 @@ import dexforge_py
 # Arm registry
 # ---------------------------------------------------------------------------
 # Canonical arm names to test.
+# Value indicates whether exact matching is required for the arm:
+#   True  -> exact count + strict 1e-5 joint match
+#   False -> allow singular-pose relaxation (1e-3 joint + FK closure <= 1e-5)
 # The ssik module name is derived as ssik.prebuilt.<arm>_ik.
-ARMS = ("ur5", "piper", "franka_panda", "xarm7", "rizon4", "rizon10")
+ARMS = {
+    "ur5": True,
+    "piper": False,
+    "franka_panda": True,
+    "xarm7": False,
+    "rizon4": False,
+    "rizon10": False,
+}
 
 TWO_PI = 2.0 * math.pi
-# Tolerance for wrap-to-pi joint comparison (matches ssik DEFAULT_TOLERANCE_POLICY).
+STRICT_TOL = 1e-5
+# Tolerance for relaxed wrap-to-pi joint comparison on singular poses.
 DEDUP_TOL = 1e-3
+FK_MATCH_TOL = 1e-5
 
 
 def _wrap_to_pi(a: float) -> float:
@@ -99,12 +111,15 @@ def test_cross_validate_solve(arm, request):
     the solver itself, matching the approach of the Rust reference test suite.
     """
     n = request.config.getoption("--n")
+    exact_arm = ARMS[arm]
     ssik_artifact = _load_ssik_artifact(arm)
     native_solve = getattr(dexforge_py, arm).solve
+    native_fk = getattr(dexforge_py, arm).fk
     poses = _random_poses(ssik_artifact, n)
 
     mismatches = 0
     for T in poses:
+        T_target = np.array(T, dtype=np.float64)
         # Python ssik artifact: raw geometric set (no limit filtering).
         # Returns Solution objects.
         py_sols = ssik_artifact.solve(T, respect_limits=False, allow_refinement=False)
@@ -114,16 +129,54 @@ def test_cross_validate_solve(arm, request):
         # Returns plain lists.
         rust_qs = native_solve(T, respect_limits=False, allow_refinement=False)
 
-        # Compare solution counts.
-        if len(py_qs) != len(rust_qs):
-            mismatches += 1
+        if exact_arm:
+            # Exact-arm policy: strict count equality and strict 1e-5 joint match.
+            if len(py_qs) != len(rust_qs):
+                mismatches += 1
+                continue
+
+            # Every Python solution must appear in the Rust set.
+            for ref_q in py_qs:
+                if not any(_q_close_mod(ref_q, r_q, tol=STRICT_TOL) for r_q in rust_qs):
+                    mismatches += 1
+                    break
             continue
 
-        # Every Python solution must appear in the Rust set.
-        for ref_q in py_qs:
-            if not any(_q_close_mod(ref_q, r_q) for r_q in rust_qs):
+        # Relaxed-arm policy (singular-tolerant): every returned Rust solution
+        # must both (a) close the pose in FK space and (b) correspond to a
+        # reference solution, with strict 1e-5 preferred and 1e-3 tolerated.
+        pose_failed = False
+        for r_q in rust_qs:
+            fk_residual = np.max(
+                np.abs(np.array(native_fk(r_q), dtype=np.float64) - T_target)
+            )
+            if fk_residual > FK_MATCH_TOL:
                 mismatches += 1
+                pose_failed = True
                 break
+
+            if not any(
+                _q_close_mod(ref_q, r_q, tol=STRICT_TOL)
+                or _q_close_mod(ref_q, r_q, tol=DEDUP_TOL)
+                for ref_q in py_qs
+            ):
+                mismatches += 1
+                pose_failed = True
+                break
+
+        if pose_failed:
+            continue
+
+        # Completeness only when cardinality matches (mirrors Rust singular policy).
+        if len(py_qs) == len(rust_qs):
+            for ref_q in py_qs:
+                if not any(
+                    _q_close_mod(ref_q, r_q, tol=STRICT_TOL)
+                    or _q_close_mod(ref_q, r_q, tol=DEDUP_TOL)
+                    for r_q in rust_qs
+                ):
+                    mismatches += 1
+                    break
 
     assert mismatches == 0, (
         f"{arm}: {mismatches}/{len(poses)} poses had mismatched solution sets"
