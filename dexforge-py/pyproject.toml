@@ -3,15 +3,18 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "dexforge-py"
+name = "dexforge"
 version = "0.1.0"
 description = "Python bindings for dexforge analytical inverse kinematics."
 requires-python = ">=3.8"
 license = { text = "BSD-3-Clause" }
-dependencies = ["scipy", "numpy"]
+dependencies = ["scipy", "numpy", "sympy", "ssik"]
+
+[project.scripts]
+dexforge = "dexforge.cli:main"
 
 [tool.maturin]
 module-name = "dexforge_py"
 manifest-path = "Cargo.toml"
 # Include Python-only ssik compatibility layer
-python-packages = ["ssik"]
+python-packages = ["dexforge", "ssik"]

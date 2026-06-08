@@ -230,7 +230,14 @@ To build and install the Python extension:
 cd dexforge-py
 pip install maturin
 maturin build --release          # produces a wheel in ../target/wheels/
-pip install ../target/wheels/dexforge_py-*.whl
+pip install ../target/wheels/dexforge-*.whl
+```
+
+To install the packaged CLI and run the full IK + dynamics codegen pipeline:
+
+```sh
+pip install dexforge
+dexforge build
 ```
 
 ### Python tests
