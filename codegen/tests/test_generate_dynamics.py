@@ -135,13 +135,15 @@ def test_dynamics_matches_planar_rr_reference(tmp_path):
     mod = G.load_artifact(str(artifact))
     t_lefts, axes, t_rights, _ = G.extract_chain(mod)
     _, q_syms, frames = G.build_fk(t_lefts, axes, t_rights)
-    dyn = G.build_dynamics(axes, frames, t_rights, q_syms, urdf, GRAVITY)
+    dyn = G.build_dynamics(axes, frames, t_rights, q_syms, urdf)
 
-    grav_f = sp.lambdify(q_syms, dyn.gravity, "numpy")
+    grav_f = sp.lambdify(q_syms + dyn.gravity_syms, dyn.gravity, "numpy")
     mass_f = sp.lambdify(q_syms, dyn.mass_matrix, "numpy")
     cor_f = sp.lambdify(q_syms + dyn.qd_syms, dyn.coriolis, "numpy")
     invd_f = sp.lambdify(
-        q_syms + dyn.qd_syms + dyn.qdd_syms, dyn.inverse_dynamics, "numpy"
+    q_syms + dyn.qd_syms + dyn.qdd_syms + dyn.gravity_syms,
+    dyn.inverse_dynamics,
+    "numpy",
     )
 
     rng = np.random.default_rng(0)
@@ -150,7 +152,7 @@ def test_dynamics_matches_planar_rr_reference(tmp_path):
         qd = rng.uniform(-2.0, 2.0, 2)
         qdd = rng.uniform(-2.0, 2.0, 2)
 
-        g_sym = np.asarray(grav_f(*q), float).reshape(-1)
+        g_sym = np.asarray(grav_f(*q, *GRAVITY), float).reshape(-1)
         assert np.allclose(g_sym, _gravity_ref(q), atol=1e-6)
 
         m_sym = np.asarray(mass_f(*q), float)
@@ -158,7 +160,7 @@ def test_dynamics_matches_planar_rr_reference(tmp_path):
         assert np.allclose(m_sym, _mass_ref(q), atol=1e-6)
 
         c_sym = np.asarray(cor_f(*q, *qd), float).reshape(-1)
-        id_sym = np.asarray(invd_f(*q, *qd, *qdd), float).reshape(-1)
+        id_sym = np.asarray(invd_f(*q, *qd, *qdd, *GRAVITY), float).reshape(-1)
         assert np.allclose(id_sym, m_sym @ qdd + c_sym + g_sym, atol=1e-9)
 
         # Passivity: qd^T Mdot qd == 2 qd^T (C qd) for Christoffel-form Coriolis.

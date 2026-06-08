@@ -2,9 +2,9 @@
 """Pinocchio ground-truth generator for the dexforge dynamics kernels.
 
 The dexforge codegen (``codegen/generate_dynamics.py``) emits the manipulator
-dynamics — ``gravity(q)`` and ``inverse_dynamics(q, qd, qdd)`` — as pure
-``#![no_std]`` Rust derived symbolically (energy/Lagrangian method) from the
-arm's kinematic chain and the link inertials in its URDF.
+dynamics — ``gravity(q, gravity)`` and ``inverse_dynamics(q, qd, qdd, gravity)``
+— as pure ``#![no_std]`` Rust derived symbolically (energy/Lagrangian method)
+from the arm's kinematic chain and the link inertials in its URDF.
 
 To *prove* that generated Rust is correct, this script computes an independent
 ground truth with the reference rigid-body-dynamics library **Pinocchio**
@@ -14,8 +14,8 @@ ground truth with the reference rigid-body-dynamics library **Pinocchio**
   ``(q, qd, qdd)`` with ``q`` drawn inside the arm's mechanical joint limits and
   ``qd``/``qdd`` inside symmetric velocity/acceleration envelopes.
 * For each state, evaluate the exact required gravity-compensation torque
-  ``g(q) = pin.computeGeneralizedGravity`` and the inverse-dynamics torque
-  ``tau = pin.rnea(q, qd, qdd)`` (recursive Newton-Euler).
+    ``g(q) = pin.computeGeneralizedGravity`` and the inverse-dynamics torque
+    ``tau = pin.rnea(q, qd, qdd)`` (recursive Newton-Euler).
 * Emit the input/output pairs as a ``#![no_std]``-friendly Rust table
   (``dynamics_test_data.rs``) consumed by the driver's dynamics parity test,
   which asserts the generated Rust reproduces this golden reference.

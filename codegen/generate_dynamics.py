@@ -50,21 +50,21 @@ Usage::
         --urdf src/drivers/ur5/ur5_inertial.urdf \
         --output src/drivers/ur5/dynamics.rs
 
-Dynamics (gravity, mass matrix, Coriolis, inverse dynamics)
+Dynamics (runtime gravity, mass matrix, Coriolis, inverse dynamics)
 -----------------------------------------------------------
 When ``--urdf`` points at a URDF that carries ``<inertial>`` blocks (link
 masses, centres of mass and inertia tensors), the generator also derives the
 manipulator dynamics with the energy (Lagrangian) method and emits matching
 ``#![no_std]`` Rust:
 
-* ``gravity(q) -> [f64; N]`` — holding torque ``tau = dU/dq`` from the total
-  potential energy ``U = -sum_i m_i (g . p_com_i)``.
+* ``gravity(q, gravity) -> [f64; N]`` — holding torque ``tau = dU/dq`` from the
+    total potential energy ``U = -sum_i m_i (g . p_com_i)``.
 * ``mass_matrix(q) -> [[f64; N]; N]`` — symmetric inertia matrix
   ``M = sum_i (m_i Jv_i^T Jv_i + Jw_i^T R_i I_i R_i^T Jw_i)``.
 * ``coriolis(q, qd) -> [f64; N]`` — ``C(q, qd) qd`` from the Christoffel symbols
   of the first kind.
-* ``inverse_dynamics(q, qd, qdd) -> [f64; N]`` — ``M qdd + C qd + g`` for the
-  MIT-mode torque feed-forward.
+* ``inverse_dynamics(q, qd, qdd, gravity) -> [f64; N]`` — ``M qdd + C qd + g``
+    for the MIT-mode torque feed-forward.
 
 The dynamics path is all-revolute (every arm currently in the repo); prismatic
 joints contribute to the linear Jacobian only and carry no angular inertia term.
@@ -473,10 +473,10 @@ def build_bodies(
 
 
 def build_gravity(
-    bodies: List[RigidBody], q_syms: List[sp.Symbol], gravity: Tuple[float, float, float]
+    bodies: List[RigidBody], q_syms: List[sp.Symbol], gravity_syms: List[sp.Symbol]
 ) -> sp.Matrix:
     """Gravity (holding) torque ``tau_j = dU/dq_j`` from total potential energy."""
-    g_vec = sp.Matrix([_snap(v) for v in gravity])
+    g_vec = sp.Matrix(gravity_syms)
     u = sp.Integer(0)
     for b in bodies:
         u -= b.mass * (g_vec.dot(b.p_com))
@@ -545,6 +545,7 @@ class Dynamics:
     q_syms: List[sp.Symbol]
     qd_syms: List[sp.Symbol]
     qdd_syms: List[sp.Symbol]
+    gravity_syms: List[sp.Symbol]
     gravity: sp.Matrix
     mass_matrix: sp.Matrix
     coriolis: sp.Matrix
@@ -557,7 +558,6 @@ def build_dynamics(
     t_rights: List[sp.Matrix],
     q_syms: List[sp.Symbol],
     urdf_path: Path,
-    gravity: Tuple[float, float, float],
 ) -> Dynamics:
     """Derive gravity / mass-matrix / Coriolis / inverse-dynamics symbolically."""
     urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path))
@@ -572,8 +572,9 @@ def build_dynamics(
     n = len(q_syms)
     qd_syms = [sp.Symbol(f"qd{i}") for i in range(n)]
     qdd_syms = [sp.Symbol(f"qdd{i}") for i in range(n)]
+    gravity_syms = [sp.Symbol(f"g{i}") for i in range(3)]
 
-    grav = build_gravity(bodies, q_syms, gravity)
+    grav = build_gravity(bodies, q_syms, gravity_syms)
     mass = build_mass_matrix(bodies, q_syms, axes, frames)
     cor = build_coriolis(mass, q_syms, qd_syms)
     qdd_vec = sp.Matrix(qdd_syms)
@@ -583,6 +584,7 @@ def build_dynamics(
         q_syms=q_syms,
         qd_syms=qd_syms,
         qdd_syms=qdd_syms,
+        gravity_syms=gravity_syms,
         gravity=grav,
         mass_matrix=mass,
         coriolis=cor,
@@ -829,6 +831,7 @@ def _emit_dynamics(
     out: List[str], n: int, dyn: "Dynamics", printer: NoStdRustPrinter
 ) -> None:
     q_unpack = _unpack_q(dyn.q_syms, printer)
+    gravity_unpack = _unpack_array("gravity", dyn.gravity_syms, printer)
     qd_unpack = _unpack_array("qd", dyn.qd_syms, printer)
     qdd_unpack = _unpack_array("qdd", dyn.qdd_syms, printer)
 
@@ -837,11 +840,11 @@ def _emit_dynamics(
     out.append("/// Derived from the total potential energy of the link masses.")
     _emit_fn_vector(
         out,
-        f"pub fn gravity(q: &[f64; {n}]) -> [f64; {n}] {{",
+        f"pub fn gravity(q: &[f64; {n}], gravity: &[f64; 3]) -> [f64; {n}] {{",
         "g",
         n,
         dyn.gravity,
-        q_unpack,
+        q_unpack + gravity_unpack,
         printer,
     )
 
@@ -873,12 +876,12 @@ def _emit_dynamics(
     out.append("/// MIT-mode feed-forward torque for a desired joint acceleration.")
     _emit_fn_vector(
         out,
-        f"pub fn inverse_dynamics(q: &[f64; {n}], qd: &[f64; {n}], qdd: &[f64; {n}]) "
+        f"pub fn inverse_dynamics(q: &[f64; {n}], qd: &[f64; {n}], qdd: &[f64; {n}], gravity: &[f64; 3]) "
         f"-> [f64; {n}] {{",
         "tau",
         n,
         dyn.inverse_dynamics,
-        q_unpack + qd_unpack + qdd_unpack,
+        q_unpack + qd_unpack + qdd_unpack + gravity_unpack,
         printer,
     )
 
@@ -916,14 +919,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             "URDF's actuated-joint order must match the kinematics artifact."
         ),
     )
-    parser.add_argument(
-        "--gravity",
-        type=float,
-        nargs=3,
-        metavar=("GX", "GY", "GZ"),
-        default=(0.0, 0.0, -9.81),
-        help="Gravitational acceleration vector in the base frame (default: 0 0 -9.81).",
-    )
     args = parser.parse_args(argv)
 
     try:
@@ -946,17 +941,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[generate_dynamics] ERROR: URDF not found: {args.urdf}", file=sys.stderr)
             return 1
         try:
-            dynamics = build_dynamics(
-                axes, frames, t_rights, q_syms, args.urdf, tuple(args.gravity)
-            )
+            dynamics = build_dynamics(axes, frames, t_rights, q_syms, args.urdf)
         except ValueError as exc:
             print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
             return 1
-        print(
-            f"[generate_dynamics] {arm}: dynamics from {args.urdf} "
-            f"(gravity={tuple(args.gravity)})",
-            file=sys.stderr,
-        )
+        print(f"[generate_dynamics] {arm}: dynamics from {args.urdf} (runtime gravity)", file=sys.stderr)
 
     rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name, dynamics)
 
