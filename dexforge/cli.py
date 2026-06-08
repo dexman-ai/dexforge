@@ -123,28 +123,46 @@ _CONSTS_STEPS = {
 # IK regression datasets (test_data.rs).
 _TEST_DATA_STEPS = {
     "ur5": Step(
-        "ur5", "test_data", "ur5: IK regression dataset",
-        "codegen/generate_test_data.py", (),
+        arm="ur5",
+        stage="test_data",
+        description="ur5: IK regression dataset",
+        script="codegen/generate_test_data.py",
+        args=(),
     ),
     "franka_panda": Step(
-        "franka_panda", "test_data", "franka_panda: IK regression dataset",
-        "codegen/generate_franka_test_data.py", (),
+        arm="franka_panda",
+        stage="test_data",
+        description="franka_panda: IK regression dataset",
+        script="codegen/generate_franka_test_data.py",
+        args=(),
     ),
     "xarm7": Step(
-        "xarm7", "test_data", "xarm7: IK regression dataset",
-        "codegen/generate_xarm7_test_data.py", (),
+        arm="xarm7",
+        stage="test_data",
+        description="xarm7: IK regression dataset",
+        script="codegen/generate_xarm7_test_data.py",
+        args=(),
     ),
     "piper": Step(
-        "piper", "test_data", "piper: IK regression dataset",
-        "codegen/generate_piper_test_data.py", (),
+        arm="piper",
+        stage="test_data",
+        description="piper: IK regression dataset",
+        script="codegen/generate_piper_test_data.py",
+        args=(),
     ),
     "rizon4": Step(
-        "rizon4", "test_data", "rizon4: IK regression dataset",
-        "codegen/generate_rizon_test_data.py", ("rizon4",),
+        arm="rizon4",
+        stage="test_data",
+        description="rizon4: IK regression dataset",
+        script="codegen/generate_rizon_test_data.py",
+        args=("rizon4",),
     ),
     "rizon10": Step(
-        "rizon10", "test_data", "rizon10: IK regression dataset",
-        "codegen/generate_rizon_test_data.py", ("rizon10",),
+        arm="rizon10",
+        stage="test_data",
+        description="rizon10: IK regression dataset",
+        script="codegen/generate_rizon_test_data.py",
+        args=("rizon10",),
     ),
 }
 
