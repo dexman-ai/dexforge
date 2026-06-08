@@ -47,7 +47,6 @@ ARMS = {
 # For these 7R jointlock solvers, the deterministic kernel can surface
 # additional FK-valid roots beyond the Python reference set on singular poses.
 SOUNDNESS_ONLY_ARMS = {"rizon4", "rizon10"}
-SOUNDNESS_ONLY_ARMS = {"rizon4", "rizon10"}
 
 TWO_PI = 2.0 * math.pi
 STRICT_TOL = 1e-5
