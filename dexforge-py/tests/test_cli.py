@@ -37,6 +37,8 @@ def test_build_runs_full_codegen_pipeline(monkeypatch, tmp_path):
     assert rc == 0
     assert len(calls) == len(cli._IK_CODEGEN_SCRIPTS) + len(cli._DYNAMICS_ARMS)
     assert calls[0] == ["python3", str(repo / "codegen" / cli._IK_CODEGEN_SCRIPTS[0])]
+    dynamics_calls = calls[-len(cli._DYNAMICS_ARMS) :]
+    assert [Path(cmd[3]).parent.name for cmd in dynamics_calls] == list(cli._DYNAMICS_ARMS)
     assert calls[-1] == [
         "python3",
         str(repo / "codegen" / "generate_dynamics.py"),
@@ -60,4 +62,3 @@ def test_build_stops_after_first_failure(monkeypatch, tmp_path):
 
     assert rc == 9
     assert len(calls) == 2
-

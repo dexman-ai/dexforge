@@ -82,7 +82,7 @@ def _run_command(command: list[str], cwd: Path) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="dexforge")
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
     build_parser = subparsers.add_parser(
         "build",
@@ -101,9 +101,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    if args.command != "build":
-        parser.print_help()
-        return 2
 
     try:
         repo_root = _find_repo_root(args.repo_root)
