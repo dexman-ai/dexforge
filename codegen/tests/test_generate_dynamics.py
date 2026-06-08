@@ -40,6 +40,8 @@ def _write_fixtures(tmp_path: Path):
     artifact = tmp_path / "synth_ik.py"
     artifact.write_text(
         "import numpy as np\n"
+        'BASE_LINK = "base"\n'
+        'EE_LINK = "l2"\n'
         "DOF = 2\n"
         "def _tx(d):\n"
         "    m = np.eye(4); m[0, 3] = d; return m\n"
@@ -65,6 +67,7 @@ def _write_fixtures(tmp_path: Path):
       <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.006" iyz="0" izz="{IZ2}"/>
     </inertial>
   </link>
+  <link name="tool"/>
   <joint name="j0" type="revolute">
     <parent link="base"/><child link="l1"/>
     <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
@@ -72,6 +75,10 @@ def _write_fixtures(tmp_path: Path):
   <joint name="j1" type="revolute">
     <parent link="l1"/><child link="l2"/>
     <origin xyz="{L1} 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+  </joint>
+  <joint name="tool_mount" type="fixed">
+    <parent link="l2"/><child link="tool"/>
+    <origin xyz="0.1 0 0" rpy="0 0 0"/>
   </joint>
 </robot>
 """
@@ -135,7 +142,15 @@ def test_dynamics_matches_planar_rr_reference(tmp_path):
     mod = G.load_artifact(str(artifact))
     t_lefts, axes, t_rights, _ = G.extract_chain(mod)
     _, q_syms, frames = G.build_fk(t_lefts, axes, t_rights)
-    dyn = G.build_dynamics(axes, frames, t_rights, q_syms, urdf, GRAVITY)
+    dyn = G.build_dynamics(
+        axes,
+        frames,
+        t_rights,
+        q_syms,
+        urdf,
+        GRAVITY,
+        *G.extract_base_ee_links(mod),
+    )
 
     grav_f = sp.lambdify(q_syms, dyn.gravity, "numpy")
     mass_f = sp.lambdify(q_syms, dyn.mass_matrix, "numpy")
