@@ -68,8 +68,20 @@ class PlanExportTests(unittest.TestCase):
         self.assertNotIn("path =", cargo)
 
     def test_unknown_arm_raises(self) -> None:
-        with self.assertRaises(ValueError):
+        with self.assertRaises(FileNotFoundError):
             cli.plan_export("nope", Path("/tmp"), _REPO_ROOT)
+
+    def test_shared_modules_recorded_for_rizon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            export = cli.plan_export("rizon4", Path(tmp), _REPO_ROOT)
+        self.assertIn("rizon_common", export.shared_modules)
+
+    def test_drivers_mod_declares_shared_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            export = cli.plan_export("rizon4", Path(tmp), _REPO_ROOT)
+        mod = next(c for d, c in export.generated if d.name == "mod.rs")
+        self.assertIn("pub mod rizon_common;", mod)
+        self.assertIn("pub mod rizon4;", mod)
 
 
 class WriteExportTests(unittest.TestCase):
@@ -180,6 +192,78 @@ class CliMainTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             code = cli.main([])
         self.assertEqual(code, 1)
+
+
+class UrdfBuildTests(unittest.TestCase):
+    """End-to-end URDF → LLM → standalone driver path."""
+
+    def test_urdf_invokes_generator_then_exports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
+            out = Path(tmp) / "driver"
+            # Pretend the LLM generator produced the 'ur5' driver in-repo.
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+            ) as gen:
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "base_link",
+                         "--ee", "tool0", "-o", str(out), "--no-verify"]
+                    )
+            self.assertEqual(code, 0)
+            gen.assert_called_once()
+            # Exported as a single self-contained crate at -o (not a subdir).
+            self.assertTrue((out / "Cargo.toml").is_file())
+            self.assertTrue((out / "src" / "lib.rs").is_file())
+
+    def test_urdf_requires_base_and_ee(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot/>", encoding="utf-8")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = cli.main(["build", "--urdf", str(urdf), "-o", str(Path(tmp) / "o")])
+            self.assertEqual(code, 2)
+            self.assertIn("--base", buf.getvalue())
+
+    def test_urdf_missing_file_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = cli.main(
+                    ["build", "--urdf", str(Path(tmp) / "nope.urdf"),
+                     "--base", "b", "--ee", "e", "-o", str(Path(tmp) / "o")]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("not found", buf.getvalue())
+
+    def test_urdf_generation_failure_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot/>", encoding="utf-8")
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", return_value=(False, "ur5", "boom")
+            ):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                         "-o", str(Path(tmp) / "o")]
+                    )
+            self.assertEqual(code, 1)
+
+    def test_urdf_and_arm_are_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot/>", encoding="utf-8")
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                code = cli.main(
+                    ["build", "--urdf", str(urdf), "--arm", "ur5",
+                     "-o", str(Path(tmp) / "o")]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("not both", buf.getvalue())
 
 
 if __name__ == "__main__":

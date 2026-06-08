@@ -106,41 +106,52 @@ artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
 
 ## Driver compiler CLI (`dexforge build`)
 
-`dexforge` is a **driver compiler**: it compiles an arm's analytical IK driver
-into a *stand-alone* Rust crate written **outside** this repository. The emitted
-crate is fully self-contained — it copies the shared math kernels and the
-per-arm driver sources into the target directory and generates its own
-`Cargo.toml` + `lib.rs` — so it builds and runs **without** the dexforge
-repository or the `dexforge` Python package. This lets an OEM use dexforge as a
-one-shot URDF/IK compiler for their hardware and vendor the resulting minimal,
-zero-allocation `#![no_std]` driver straight into firmware.
+`dexforge` is an **end-to-end driver compiler**: point `dexforge build` at a
+URDF and it translates the arm's analytical IK into a *stand-alone* Rust crate
+written **outside** this repository — calling an LLM to do the URDF→Rust
+translation. The emitted crate is fully self-contained: it copies the shared
+math kernels and the per-arm driver sources into the target directory and
+generates its own `Cargo.toml` + `lib.rs`, so it builds and runs **without** the
+dexforge repository or the `dexforge` Python package. This lets an OEM use
+dexforge as a one-shot URDF compiler for their hardware and vendor the resulting
+minimal, zero-allocation `#![no_std]` driver straight into firmware.
 
 ```sh
 pip install dexforge
-dexforge build --arm ur5 --output ~/ur5_ik_driver
-cd ~/ur5_ik_driver && cargo build --release
+
+# End-to-end: compile a driver for new hardware straight from a URDF.
+dexforge build --urdf my_arm.urdf --base base_link --ee tool0 -o ~/my_arm_ik
+cd ~/my_arm_ik && cargo build --release
+```
+
+The URDF path drives the LLM-assisted generator (see *Adding a new arm* below):
+it builds a `ssik` artifact from the URDF, translates it to `#![no_std]` Rust,
+builds and tests it, then exports the result as the stand-alone crate. Set
+`DEXFORGE_LLM_KEY` / `DEXFORGE_LLM_BASE_URL` / `DEXFORGE_LLM_MODEL` (or the
+`--llm-key` / `--llm-url` / `--llm-model` flags) for your LLM backend.
+
+As an **optimisation**, when `build` is invoked with an **arm name** instead of a
+URDF, it reuses the prebuilt, committed driver under `src/drivers/<arm>/` and
+skips the LLM translation entirely:
+
+```sh
+dexforge build --arm ur5 --output ~/ur5_ik_driver   # reuse prebuilt, no LLM
 ```
 
 The generated crate re-exports the arm's entry points at its root, so a consumer
-just calls `ur5_ik_driver::fk(&q)` / `ur5_ik_driver::solve(&tf, …)`. Useful
-flags:
+just calls `my_arm_ik::fk(&q)` / `my_arm_ik::solve(&tf, …)`. Useful flags:
 
 ```sh
-dexforge build --arm ur5 -o ~/ur5 --list   # preview the file list, write nothing
-dexforge build --arm ur5 -o ~/ur5 --no-verify   # skip the standalone cargo build check
-dexforge build -o ~/dexforge_drivers       # all arms, one crate per arm subdir
+dexforge build --arm ur5 -o ~/ur5 --list      # preview the file list, write nothing
+dexforge build --arm ur5 -o ~/ur5 --no-verify # skip the standalone cargo build check
+dexforge build -o ~/dexforge_drivers          # all prebuilt arms, one crate per arm subdir
 ```
 
 By default each crate is verified by running `cargo build --release` inside it.
 `--output` must be outside the dexforge repository (the whole point is a
-self-contained driver). Supported arms: `ur5`, `piper`, `franka_panda`, `xarm7`,
-`rizon4`, `rizon10`.
-
-> The drivers `dexforge build` compiles are the committed, verified sources
-> under `src/drivers/<arm>/`. Producing a driver for *new* hardware from a raw
-> URDF is the job of the LLM-assisted generator in `codegen/ik_generator.py`
-> (below); once that has produced `src/drivers/<arm>/`, `dexforge build` exports
-> it as a stand-alone crate.
+self-contained driver). Prebuilt arms available to `--arm`: `ur5`, `piper`,
+`franka_panda`, `xarm7`, `rizon4`, `rizon10`; any other arm is compiled from its
+URDF.
 
 ## Adding a new arm
 
