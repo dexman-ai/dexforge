@@ -236,6 +236,7 @@ pip install ../target/wheels/dexforge-*.whl
 To install the packaged CLI and run the full IK + dynamics codegen pipeline:
 
 ```sh
+# package name: dexforge (formerly dexforge-py)
 pip install dexforge
 dexforge build
 ```
