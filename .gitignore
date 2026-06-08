@@ -8,3 +8,7 @@ __pycache__/
 **/.venv/
 *.so
 **/*.so
+*.egg-info/
+**/*.egg-info/
+build/
+dist/

@@ -104,6 +104,33 @@ Each `solve` accepts the same optional keyword arguments as the Python ssik
 artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
 `fk_atol`, `dedup_atol`, and `refinement_max_iters`.
 
+## Code generation CLI
+
+The whole inverse-kinematics and dynamics code-generation pipeline is wrapped by
+a single `dexforge` command:
+
+```sh
+pip install dexforge
+dexforge build
+```
+
+`dexforge build` regenerates every committed Rust driver under
+`src/drivers/<arm>/` by running the `codegen/` generators in dependency order
+(baked constants → symbolic FK/Jacobian → regression datasets) for all supported
+arms. Useful flags:
+
+```sh
+dexforge build --list            # print the plan without running anything
+dexforge build --arm ur5         # regenerate a single arm (repeatable)
+dexforge build --stage kinematics  # only re-run one stage (repeatable)
+```
+
+The generators require the *locked* `ssik` version plus `sympy`/`numpy`
+(`pip install $(grep ssik SSIK_VERSION.txt) sympy numpy`) and write back into the
+checked-out source tree, so run the command from a dexforge clone (install with
+`pip install -e .` when iterating). The individual generators are documented
+below.
+
 ## Adding a new arm
 
 The `codegen/ik_generator.py` script automates translation of a `ssik`
