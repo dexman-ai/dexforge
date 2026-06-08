@@ -132,7 +132,6 @@ After the Rust driver is accepted:
 1. In `dexforge-py/src/lib.rs`, add `#[pyfunction]` + `#[pyo3(name = "fk")]` /
    `#[pyo3(name = "solve")]` wrappers (copying an existing arm as a template),
    then create a submodule block in `dexforge_py()` and call `m.add_submodule`.
-2. Add the arm to the `ARMS_METADATA` registry in `dexforge-py/tests/conftest.py`.
 
 ### Symbolic dynamics & kinematics code generation
 

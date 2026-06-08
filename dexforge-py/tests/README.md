@@ -37,11 +37,6 @@ This approach allows zero modification to the upstream ssik tests while validati
 
 ### Supporting Files
 
-- **`conftest.py`** - Shared fixtures and configuration
-  - Contains original ARMS_METADATA from initial test implementation
-  - Not used by ssik tests (they use _manifest.py instead)
-  - Kept for backward compatibility and potential future extensions
-
 - **`_hypothesis_strategies.py`** - Hypothesis strategies (copied from ssik)
   - `non_singular_q6r()` - Generates 6R joint vectors avoiding singularities
   - `non_singular_q7r()` - Generates 7R joint vectors avoiding singularities
