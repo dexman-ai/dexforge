@@ -175,7 +175,8 @@ class CliMainTests(unittest.TestCase):
                 cli, "generate_dynamics_for_arm", return_value=(True, "ok")
             ):
                 with mock.patch.object(cli, "verify_crate") as vc:
-                    with redirect_stdout(io.StringIO()):
+                    out_buf = io.StringIO()
+                    with redirect_stdout(out_buf):
                         code = cli.main(
                             ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
                              "-o", str(out), "--no-verify"]
@@ -184,6 +185,10 @@ class CliMainTests(unittest.TestCase):
             vc.assert_not_called()
             self.assertTrue((out / "Cargo.toml").is_file())
             self.assertTrue((out / "src" / "lib.rs").is_file())
+            log = out_buf.getvalue()
+            self.assertIn("[1/3 | 33%] translate", log)
+            self.assertIn("[2/3 | 66%] compile full kinematics + dynamics", log)
+            self.assertIn("[3/3 | 100%] export", log)
 
     def test_verify_failure_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,6 +206,25 @@ class CliMainTests(unittest.TestCase):
                              "-o", str(out)]
                         )
             self.assertEqual(code, 1)
+
+    def test_build_verify_step_shows_100_percent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "ur5"
+            urdf = self._urdf(tmp)
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+            ), mock.patch.object(
+                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+            ), mock.patch.object(
+                cli, "verify_crate", return_value=(True, "ok")
+            ):
+                out_buf = io.StringIO()
+                with redirect_stdout(out_buf):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e", "-o", str(out)]
+                    )
+        self.assertEqual(code, 0)
+        self.assertIn("[4/4 | 100%] verify standalone build", out_buf.getvalue())
 
     def test_no_subcommand_prints_help(self) -> None:
         with redirect_stdout(io.StringIO()):

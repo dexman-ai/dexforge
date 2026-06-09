@@ -414,6 +414,12 @@ def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
     return options
 
 
+def _progress_line(step: int, total_steps: int, description: str) -> str:
+    """Render a stable progress line for ``dexforge build`` steps."""
+    percent = int((step * 100) / total_steps)
+    return f"[dexforge] [{step}/{total_steps} | {percent}%] {description}"
+
+
 def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> int:
     """Handle ``dexforge build --urdf``: translate a URDF, then export the crate."""
     urdf = Path(args.urdf)
@@ -428,7 +434,8 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         )
         return 2
 
-    print(f"[dexforge] translating {urdf.name} into an IK driver via the LLM …")
+    total_steps = 3 if args.list or not args.verify else 4
+    print(_progress_line(1, total_steps, f"translate {urdf.name} into an IK driver via the LLM …"))
     ok, arm, output = generate_driver_from_urdf(
         urdf, args.base, args.ee, repo_root, _llm_options(args)
     )
@@ -440,7 +447,7 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         return 1
     print(f"[dexforge]   \u2713 generated '{arm}' driver under src/drivers/{arm}/.")
 
-    print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
+    print(_progress_line(2, total_steps, f"compile full kinematics + dynamics for '{arm}' …"))
     ok, output = generate_dynamics_for_arm(arm, urdf, repo_root)
     if not ok:
         print(
@@ -453,7 +460,7 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         f"src/drivers/{arm}/."
     )
 
-    return _export_arm(arm, repo_root, base, args)
+    return _export_arm(arm, repo_root, base, args, total_steps)
 
 
 def _export_arm(
@@ -461,6 +468,7 @@ def _export_arm(
     repo_root: Path,
     out_dir: Path,
     args: argparse.Namespace,
+    total_steps: int,
 ) -> int:
     """Plan, optionally list, write, and verify the stand-alone crate for *arm*."""
     try:
@@ -470,6 +478,7 @@ def _export_arm(
         return 1
 
     if args.list:
+        print(_progress_line(3, total_steps, f"show compile plan for '{export.arm}'"))
         print("[dexforge] compile plan (1 crate):")
         print(f"  {export.arm} -> {export.out_dir}")
         print(f"      crate '{export.crate_name}', {len(export.files())} file(s):")
@@ -477,7 +486,7 @@ def _export_arm(
             print(f"        {path.relative_to(export.out_dir)}")
         return 0
 
-    print(f"[dexforge] compiling {export.arm} driver -> {export.out_dir}")
+    print(_progress_line(3, total_steps, f"export {export.arm} driver -> {export.out_dir}"))
     try:
         written = write_export(export)
     except FileNotFoundError as exc:
@@ -486,7 +495,7 @@ def _export_arm(
     print(f"[dexforge]   wrote {len(written)} file(s); crate '{export.crate_name}'.")
 
     if args.verify:
-        print("[dexforge]   verifying standalone build (cargo build --release) …")
+        print(_progress_line(4, total_steps, "verify standalone build (cargo build --release) …"))
         ok, output = verify_crate(export.out_dir)
         if not ok:
             print(f"[dexforge]   \u2717 {export.arm} failed to build:\n{output}", file=sys.stderr)
