@@ -1,7 +1,10 @@
 # dexforge
 
-Zero-allocation, `#![no_std]` analytical inverse kinematics translated from the
-Python [`ssik`](https://github.com/personalrobotics/ssik) prebuilt artifacts.
+Zero-allocation, `#![no_std]` analytical rigid-body kinematics **and dynamics**
+translated from the Python
+[`ssik`](https://github.com/personalrobotics/ssik) prebuilt artifacts (inverse
+kinematics) and a symbolic SymPy compiler (forward kinematics, Jacobian and
+inverse dynamics).
 
 The crate is a mathematically faithful port targeting hard real-time control
 loops (e.g. a 1 kHz servo thread): there is **no heap allocation**, every data
@@ -106,10 +109,13 @@ artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
 
 ## Driver compiler CLI (`dexforge build`)
 
-`dexforge` is an **end-to-end driver compiler**: point `dexforge build` at a
-URDF and it translates the arm's analytical IK into a *stand-alone* Rust crate
-written **outside** this repository — calling an LLM to do the URDF→Rust
-translation. The emitted crate is fully self-contained: it copies the shared
+`dexforge` is an **end-to-end rigid-body driver compiler**: point `dexforge
+build` at a URDF and it translates the arm's full **kinematics and dynamics**
+into a *stand-alone* Rust crate written **outside** this repository. It calls an
+LLM to translate the analytical IK and runs the symbolic compiler
+(`codegen/generate_dynamics.py`) to derive the forward kinematics, geometric
+Jacobian and — from the URDF's inertial data — gravity / mass-matrix / Coriolis /
+inverse-dynamics. The emitted crate is fully self-contained: it copies the shared
 math kernels and the per-arm driver sources into the target directory and
 generates its own `Cargo.toml` + `lib.rs`, so it builds and runs **without** the
 dexforge repository or the `dexforge` Python package. This lets an OEM use
@@ -119,19 +125,24 @@ minimal, zero-allocation `#![no_std]` driver straight into firmware.
 ```sh
 pip install dexforge
 
-# End-to-end: compile a driver for new hardware straight from a URDF.
+# End-to-end: compile a kinematics + dynamics driver from a URDF.
 dexforge build --urdf my_arm.urdf --base base_link --ee tool0 -o ~/my_arm_ik
 cd ~/my_arm_ik && cargo build --release
 ```
 
 The URDF path drives the LLM-assisted generator (see *Adding a new arm* below):
-it builds a `ssik` artifact from the URDF, translates it to `#![no_std]` Rust,
-builds and tests it, then exports the result as the stand-alone crate. Set
-`DEXFORGE_LLM_KEY` / `DEXFORGE_LLM_BASE_URL` / `DEXFORGE_LLM_MODEL` (or the
+it builds a `ssik` artifact from the URDF, translates the IK to `#![no_std]`
+Rust, builds and tests it, then compiles the symbolic kinematics + dynamics with
+`codegen/generate_dynamics.py` and exports the result as the stand-alone crate.
+Set `DEXFORGE_LLM_KEY` / `DEXFORGE_LLM_BASE_URL` / `DEXFORGE_LLM_MODEL` (or the
 `--llm-key` / `--llm-url` / `--llm-model` flags) for your LLM backend.
 
 The generated crate re-exports the arm's entry points at its root, so a consumer
-just calls `my_arm_ik::fk(&q)` / `my_arm_ik::solve(&tf, …)`. Useful flags:
+just calls `my_arm_ik::fk(&q)` / `my_arm_ik::solve(&tf, …)` for kinematics and
+reaches the full symbolic kinematics + dynamics suite via
+`my_arm_ik::generated_kinematics::{fk, jacobian, gravity, mass_matrix, coriolis,
+inverse_dynamics}` (the dynamics functions are emitted when the URDF carries
+`<inertial>` data). Useful flags:
 
 ```sh
 dexforge build --urdf my_arm.urdf --base base_link --ee tool0 \
@@ -231,19 +242,18 @@ python codegen/generate_dynamics.py --artifact ur5_ik \
     --output src/drivers/ur5/dynamics.rs
 ```
 
-Like FK/Jacobian, every dynamics function is a flat `sympy.cse()` body of `libm`
-arithmetic — no heap, no branches, no loops. The derivation is validated against
-an independent closed-form planar model in
-`codegen/tests/test_generate_dynamics.py`. The path is all-revolute (every arm
-currently in the repo); prismatic joints contribute to the linear Jacobian only.
-
-The dynamics path is wired and tested but **not yet baked into a driver**: it
-needs a URDF that is a single serial chain of exactly `N` actuated joints, each
-carrying an `<inertial>` block. None of the URDFs currently in `src/drivers/`
-qualify — `rizon4`/`rizon10` carry no `<inertial>` blocks, and the
-`franka_panda`/`piper`/`xarm7` URDFs branch into gripper joints — so only the
-FK/Jacobian `generated_kinematics.rs` is baked per arm. Drop in an arm-only
-inertial URDF to emit the inverse-dynamics suite.
+`dexforge build` runs this symbolic compiler as part of the end-to-end URDF
+flow: after the LLM produces the IK driver, it invokes
+`codegen/generate_dynamics.py` against the driver's ssik artifact to emit
+`generated_kinematics.rs`, passing the source URDF so the inverse-dynamics suite
+(gravity / mass-matrix / Coriolis / inverse-dynamics) is baked whenever the URDF
+carries `<inertial>` blocks. A URDF that is a single serial chain of exactly `N`
+actuated joints, each with an `<inertial>` block, yields the full dynamics; one
+without inertial data (or with branching gripper joints) yields FK/Jacobian only.
+The all-revolute path covers every arm currently in the repo; prismatic joints
+contribute to the linear Jacobian only. The derivation is validated against an
+independent closed-form planar model in
+`codegen/tests/test_generate_dynamics.py`.
 
 
 ## Development

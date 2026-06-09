@@ -1,22 +1,26 @@
-"""``dexforge`` command-line interface — a URDF/IK *driver compiler*.
+"""``dexforge`` command-line interface — a rigid-body *driver compiler*.
 
-``dexforge build`` is an **end-to-end** driver compiler: point it at a URDF and
-it translates the arm's analytical IK into a **stand-alone** Rust crate written
-*outside* the dexforge repository, calling an LLM to do the URDF→Rust
-translation. The emitted crate is fully self-contained: it copies the shared
-math kernels and the per-arm driver sources into the target directory and
-generates its own ``Cargo.toml`` + ``lib.rs``, so the result builds and runs
+``dexforge build`` is an **end-to-end** rigid-body dynamics compiler: point it at
+a URDF and it translates the arm's full **kinematics and dynamics** into a
+**stand-alone** Rust crate written *outside* the dexforge repository. It calls an
+LLM to translate the analytical inverse kinematics and runs the symbolic dynamics
+compiler (``codegen/generate_dynamics.py``) to derive the forward kinematics,
+geometric Jacobian and — from the URDF's inertial data — gravity / mass-matrix /
+Coriolis / inverse-dynamics. The emitted crate is fully self-contained: it copies
+the shared math kernels and the per-arm driver sources into the target directory
+and generates its own ``Cargo.toml`` + ``lib.rs``, so the result builds and runs
 **without** the dexforge repository or the ``dexforge`` Python package.
 
 This lets an OEM use dexforge as a one-shot URDF compiler for their hardware:
 hand it a URDF, get back a minimal, zero-allocation ``#![no_std]`` crate exposing
-``fk`` / ``solve`` that they can vendor straight into firmware.
+the arm's kinematics (``fk`` / ``solve``) and dynamics that they can vendor
+straight into firmware.
 
 Typical usage::
 
     pip install dexforge
 
-    # End-to-end: translate a URDF into a stand-alone driver crate via the LLM.
+    # End-to-end: compile a kinematics + dynamics driver crate from a URDF.
     dexforge build --urdf my_arm.urdf --base base_link --ee tool0 -o ~/my_arm_ik
     cd ~/my_arm_ik && cargo build --release
 
@@ -128,13 +132,15 @@ panic = "abort"
 def _lib_rs(crate_name: str, arm: str) -> str:
     """Render the stand-alone crate's ``src/lib.rs``."""
     return f"""\
-//! Stand-alone `{arm}` analytical inverse-kinematics driver,
+//! Stand-alone `{arm}` rigid-body driver (kinematics + dynamics),
 //! compiled by `dexforge build`.
 //!
 //! This crate is fully self-contained: it does not depend on the dexforge
 //! repository or the `dexforge` Python package. It exposes the arm's `fk` and
-//! `solve` entry points (re-exported at the crate root) and is `#![no_std]`,
-//! heap-free, and bounded-iteration throughout.
+//! `solve` entry points (re-exported at the crate root) alongside the symbolic
+//! kinematics and dynamics (`generated_kinematics::{{fk, jacobian, gravity,
+//! mass_matrix, coriolis, inverse_dynamics}}`, whichever the URDF supports), and
+//! is `#![no_std]`, heap-free, and bounded-iteration throughout.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -142,6 +148,11 @@ pub mod drivers;
 pub mod math;
 
 pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};
+// Symbolic forward kinematics, geometric Jacobian and rigid-body dynamics
+// (gravity / mass matrix / Coriolis / inverse dynamics) compiled by
+// `codegen/generate_dynamics.py`. Re-exported so consumers reach the full
+// kinematics + dynamics suite at the crate root.
+pub use drivers::{arm}::generated_kinematics;
 """
 
 
@@ -334,6 +345,60 @@ def generate_driver_from_urdf(
     return result.returncode == 0, arm, (result.stderr + result.stdout).strip()
 
 
+def generate_dynamics_for_arm(
+    arm: str,
+    urdf: Optional[Path],
+    repo_root: Path,
+) -> tuple:
+    """Compile the arm's full rigid-body kinematics + dynamics in-repo.
+
+    dexforge is a rigid-body dynamics compiler, not just an IK one: after the
+    LLM produces the IK driver, this drives ``codegen/generate_dynamics.py``
+    against the driver's ssik artifact (under ``src/drivers/<arm>/<arm>_ik.py``)
+    to derive — symbolically with SymPy — the exact forward kinematics and
+    geometric Jacobian, emitted as ``#![no_std]`` Rust at
+    ``src/drivers/<arm>/generated_kinematics.rs`` (the module the IK solver's FK
+    delegates to). When *urdf* carries ``<inertial>`` blocks, the same pass also
+    emits gravity / mass-matrix / Coriolis / inverse-dynamics so the exported
+    crate ships the complete kinematics **and** dynamics suite.
+
+    :param arm: Arm name whose in-repo driver was just generated.
+    :param urdf: Source URDF (supplies link masses/inertias for dynamics); the
+        dynamics functions are emitted only when it carries ``<inertial>`` data.
+    :param repo_root: dexforge source tree (provides the dynamics compiler).
+    :returns: ``(success, combined_output)``.
+    """
+    script = repo_root / "codegen" / "generate_dynamics.py"
+    if not script.is_file():
+        return False, f"missing dynamics compiler: {script}"
+
+    artifact = repo_root / "src" / "drivers" / arm / f"{arm}_ik.py"
+    if not artifact.is_file():
+        return False, f"missing ssik artifact for dynamics: {artifact}"
+
+    output = repo_root / "src" / "drivers" / arm / "generated_kinematics.rs"
+    cmd = [
+        sys.executable,
+        str(script),
+        "--artifact",
+        str(artifact),
+        "--arm",
+        arm,
+        "--output",
+        str(output),
+    ]
+    if urdf is not None and urdf.is_file():
+        cmd += ["--urdf", str(urdf.resolve())]
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    return result.returncode == 0, (result.stderr + result.stdout).strip()
+
+
 def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
     """Collect LLM override options from parsed args (omitting unset values)."""
     options: Dict[str, str] = {}
@@ -374,6 +439,19 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         )
         return 1
     print(f"[dexforge]   \u2713 generated '{arm}' driver under src/drivers/{arm}/.")
+
+    print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
+    ok, output = generate_dynamics_for_arm(arm, urdf, repo_root)
+    if not ok:
+        print(
+            f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under "
+        f"src/drivers/{arm}/."
+    )
 
     return _export_arm(arm, repo_root, base, args)
 
@@ -449,18 +527,21 @@ def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level ``dexforge`` argument parser."""
     parser = argparse.ArgumentParser(
         prog="dexforge",
-        description="dexforge — compile stand-alone analytical IK driver crates.",
+        description="dexforge — compile stand-alone rigid-body driver crates (kinematics + dynamics).",
     )
     subparsers = parser.add_subparsers(dest="command")
 
     build_p = subparsers.add_parser(
         "build",
-        help="Compile a stand-alone IK driver crate (outside the dexforge repo).",
+        help="Compile a stand-alone kinematics + dynamics driver crate (outside the dexforge repo).",
         description=(
-            "Compile an arm's analytical IK driver into a self-contained Rust "
-            "crate written outside the dexforge repository. Point it at a URDF "
-            "(--urdf, with --base and --ee) to translate new hardware end-to-end "
-            "via the LLM. The generated crate does not depend on dexforge."
+            "Compile an arm's full rigid-body kinematics and dynamics into a "
+            "self-contained Rust crate written outside the dexforge repository. "
+            "Point it at a URDF (--urdf, with --base and --ee) to translate new "
+            "hardware end-to-end: an LLM translates the analytical IK and the "
+            "symbolic compiler derives FK, the Jacobian and (from the URDF's "
+            "inertial data) gravity/mass-matrix/Coriolis/inverse-dynamics. The "
+            "generated crate does not depend on dexforge."
         ),
     )
     build_p.add_argument(
