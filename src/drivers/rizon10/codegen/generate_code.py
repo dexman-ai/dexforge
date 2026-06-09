@@ -16,8 +16,8 @@ and emits:
 Usage::
 
     pip install "ssik==1.2.4" numpy sympy
-    python codegen/generate_rizon_codegen.py            # both arms
-    python codegen/generate_rizon_codegen.py rizon4     # one arm
+    python codegen/generate_code.py            # both arms
+    python codegen/generate_code.py rizon4     # one arm
 
 Composition is cached on disk (see ``_rizon_codegen``), so re-runs are cheap.
 """
@@ -62,7 +62,7 @@ def _emit_consts(arm: str) -> None:
     o: list[str] = []
     o.append("//! AUTO-GENERATED baked constants for the Flexiv " + arm.title() + ".")
     o.append("//! Do not edit by hand. Regenerate with")
-    o.append("//! `python codegen/generate_rizon_codegen.py " + arm + "`.")
+    o.append("//! `python codegen/generate_code.py " + arm + "`.")
     o.append("//!")
     o.append("//! The arm is solved by `jointlock.seven_r` (lock joint " + str(ref._LOCK_IDX) + ",")
     o.append("//! no chain reversal) wrapping a deterministic Raghavan-Roth 6R inner")
@@ -173,9 +173,9 @@ def _emit_pq(arm: str) -> None:
     o.append("//!")
     o.append("//! Machine-generated (sympy `cse`) and reproduced without manual edits so")
     o.append("//! the floating-point accumulation order matches the Python reference")
-    o.append("//! bit-for-bit. Regenerate with `codegen/generate_rizon_codegen.py`.")
+    o.append("//! bit-for-bit. Regenerate with `codegen/generate_code.py`.")
     o.append("")
-    o.append("// Do not edit by hand. See codegen/generate_rizon_codegen.py.")
+    o.append("// Do not edit by hand. See codegen/generate_code.py.")
     o.append("")
     o.append("/// Signature of a per-sample PQ builder.")
     o.append("pub(crate) type PqBuilder = fn(")

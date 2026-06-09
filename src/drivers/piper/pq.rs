@@ -4,9 +4,9 @@
 //!
 //! The body is machine-generated (sympy `cse`) and is reproduced here without
 //! manual edits so the floating-point accumulation order matches the Python
-//! reference bit-for-bit. Regenerate with `codegen/generate_piper_pq.py`.
+//! reference bit-for-bit. Regenerate with `codegen/generate_code.py`.
 
-// Do not edit by hand. See codegen/generate_piper_pq.py.
+// Do not edit by hand. See codegen/generate_code.py.
 #[allow(clippy::all)]
 #[allow(unused_parens)]
 #[allow(clippy::too_many_lines)]

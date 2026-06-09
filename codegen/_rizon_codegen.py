@@ -113,7 +113,7 @@ def rmat4(m) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PQ builder AST -> Rust (identical accumulation order to generate_piper_pq.py)
+# PQ builder AST -> Rust (identical accumulation order to generate_code.py)
 # ---------------------------------------------------------------------------
 
 

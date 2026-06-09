@@ -9,7 +9,7 @@ the resulting 6R sub-chain, and dispatches each to an inner ikgeo solver
 locked/reversed sub-chain geometry is a pure function of the arm topology --
 it does not depend on the target pose -- so we bake it once here.
 
-This is the sister script of ``codegen/generate_franka_consts.py``; both arms
+This is the sister script of ``franka_panda/codegen/generate_code.py``; both arms
 belong to the ``jointlock.seven_r`` (non-SRS 7R) class and share the codegen.
 
 Usage::

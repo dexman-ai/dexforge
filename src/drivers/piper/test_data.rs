@@ -1,5 +1,5 @@
 //! Auto-generated Piper IK regression data. Regenerate with
-//! `python codegen/generate_piper_test_data.py`.
+//! `python codegen/generate_test_data.py`.
 //!
 //! Each entry is `(row-major 4x4 pose, &[expected joint solutions],
 //! singular)`, captured by running the reference Piper solver and

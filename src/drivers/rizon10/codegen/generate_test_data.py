@@ -2,7 +2,7 @@
 """Generate the Flexiv Rizon IK regression datasets for the Rust drivers.
 
 Multi-arm generator (Rizon 4 and Rizon 10) modelled on
-``codegen/generate_piper_test_data.py``. The Rizon arms are 7R ``jointlock``
+``codegen/generate_test_data.py``. The Rizon arms are 7R ``jointlock``
 solvers, so the strategy is the same two-tier scheme already used by the Piper
 and xArm7 regression sets:
 
@@ -32,8 +32,8 @@ source module (``src/drivers/<arm>/test_data.rs``).
 Run from the repository root:
 
     pip install "ssik==1.2.4" numpy
-    python codegen/generate_rizon_test_data.py            # both arms
-    python codegen/generate_rizon_test_data.py rizon4     # one arm
+    python codegen/generate_test_data.py            # both arms
+    python codegen/generate_test_data.py rizon4     # one arm
 """
 
 from __future__ import annotations
@@ -134,7 +134,7 @@ def _write_rust(arm, dest, cases) -> None:
     pretty = "Rizon 4" if arm == "rizon4" else "Rizon 10"
     lines = [
         f"//! Auto-generated {pretty} IK regression data. Regenerate with",
-        "//! `python codegen/generate_rizon_test_data.py`.",
+        "//! `python codegen/generate_test_data.py`.",
         "//!",
         "//! Each entry is `(row-major 4x4 pose, &[expected joint solutions],",
         "//! singular)`, captured by running the reference solver and retaining",

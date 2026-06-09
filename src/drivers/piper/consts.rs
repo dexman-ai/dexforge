@@ -1,6 +1,6 @@
 //! Baked geometric constants for the AgileX Piper 6-DOF arm,
 //! extracted verbatim from `ssik.prebuilt.piper_ik`. Regenerate with
-//! `codegen/generate_piper_test_data.py --dump-consts`.
+//! `codegen/generate_test_data.py --dump-consts`.
 
 #![allow(clippy::unreadable_literal)]
 #![allow(clippy::approx_constant)]

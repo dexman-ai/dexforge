@@ -12,7 +12,7 @@ it does not depend on the target pose -- so we bake it once here.
 Usage::
 
     pip install ssik
-    python codegen/generate_franka_consts.py  # writes src/drivers/franka_panda/consts.rs
+    python codegen/generate_consts.py  # writes src/drivers/franka_panda/consts.rs
 """
 
 import os

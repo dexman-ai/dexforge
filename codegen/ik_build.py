@@ -186,7 +186,8 @@ def write_generated_files(
             rust_files_written.append(filename)
             print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
         elif filename.endswith(".py"):
-            dest = _REPO_ROOT / "codegen" / filename
+            dest = driver_dir / "codegen" / filename
+            dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
             print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")

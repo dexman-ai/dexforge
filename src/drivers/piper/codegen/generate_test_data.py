@@ -38,7 +38,7 @@ source module (``src/drivers/piper/test_data.rs``) consumed by the
 Run from the repository root:
 
     pip install "ssik==1.2.3" numpy
-    python codegen/generate_piper_test_data.py
+    python codegen/generate_test_data.py
 """
 
 from __future__ import annotations
@@ -132,7 +132,7 @@ def _fmt(x: float) -> str:
 def _write_rust(cases) -> None:
     lines = [
         "//! Auto-generated Piper IK regression data. Regenerate with",
-        "//! `python codegen/generate_piper_test_data.py`.",
+        "//! `python codegen/generate_test_data.py`.",
         "//!",
         "//! Each entry is `(row-major 4x4 pose, &[expected joint solutions],",
         "//! singular)`, captured by running the reference Piper solver and",
@@ -150,8 +150,9 @@ def _write_rust(cases) -> None:
         "//!   tolerance (see `ik_solver`'s test module).",
         "",
         "/// `(pose, solutions, singular)` regression cases.",
-        "pub static CASES: &[(&[f64; 16], &[[f64; 6]], bool)] = &[",
+        "pub static CASES: &[(&[f64; 16], &[[f64; 6]], bool)] = &[,",
     ]
+    lines[-1] = "pub static CASES: &[(&[f64; 16], &[[f64; 6]], bool)] = &["
     for t, sols, singular in cases:
         pose = ", ".join(_fmt(v) for v in np.asarray(t, dtype=np.float64).reshape(-1))
         lines.append(f"    (&[{pose}], &[")

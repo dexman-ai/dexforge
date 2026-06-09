@@ -252,12 +252,13 @@ the IK pipeline produces — no URDF parsing), derives **exact** closed-form
 forward kinematics and the geometric Jacobian with SymPy, and emits pure,
 zero-dependency `#![no_std]` Rust. The ssik artifact encodes the chain as a
 product-of-exponentials (`_JOINT_T_LEFTS` / `_JOINT_AXES` / `_JOINT_T_RIGHTS`),
-so — like `generate_<arm>_consts.py` — this generator must run **after** the ssik
-artifact is available. The degrees of freedom `N` are read from the artifact and
-used to size the generated fixed arrays — there is no heap allocation, no
-branching, and no loops (the body is a flat list of `sympy.cse()` temporaries).
-Every transcendental is rewritten as a `libm::*` call and `pi` maps to
-`core::f64::consts::PI`, so the output cross-compiles cleanly for any ARM target.
+so — like the per-driver helper scripts under `src/drivers/<arm>/codegen/` —
+this generator must run **after** the ssik artifact is available. The degrees of
+freedom `N` are read from the artifact and used to size the generated fixed
+arrays — there is no heap allocation, no branching, and no loops (the body is a
+flat list of `sympy.cse()` temporaries). Every transcendental is rewritten as a
+`libm::*` call and `pi` maps to `core::f64::consts::PI`, so the output
+cross-compiles cleanly for any ARM target.
 
 ```sh
 pip install ssik sympy numpy
@@ -369,7 +370,12 @@ pytest dexforge-py/tests/
 
 ```sh
 pip install $(grep ssik SSIK_VERSION.txt)
-python codegen/generate_test_data.py
+python src/drivers/ur5/codegen/generate_test_data.py
+python src/drivers/franka_panda/codegen/generate_test_data.py
+python src/drivers/xarm7/codegen/generate_test_data.py
+python src/drivers/piper/codegen/generate_test_data.py
+python src/drivers/rizon4/codegen/generate_test_data.py
+python src/drivers/rizon10/codegen/generate_test_data.py
 ```
 
 ### ssik Version Locking
