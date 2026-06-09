@@ -5,14 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import ik_generator  # noqa: E402
+import generate_ik  # noqa: E402
 
 
 class BuildArgParserTests(unittest.TestCase):
     def test_allows_artifact_and_urdf_together(self) -> None:
-        parser = ik_generator._build_arg_parser()
+        parser = generate_ik._build_arg_parser()
         with tempfile.TemporaryDirectory() as tmp:
             urdf_path = Path(tmp) / "robot.urdf"
             urdf_path.write_text("<robot name='demo'/>\n", encoding="utf-8")

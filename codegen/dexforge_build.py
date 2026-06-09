@@ -1,26 +1,34 @@
-"""``dexforge`` command-line interface — a rigid-body *driver compiler*.
+"""``dexforge`` command-line interface — a rigid-body *kinematics + dynamics compiler*.
 
-``dexforge build`` is an **end-to-end** rigid-body dynamics compiler: point it at
-a URDF and it translates the arm's full **kinematics and dynamics** into a
-**stand-alone** Rust crate written *outside* the dexforge repository. It calls an
-LLM to translate the analytical inverse kinematics and runs the symbolic dynamics
-compiler (``codegen/generate_dynamics.py``) to derive the forward kinematics,
-geometric Jacobian and — from the URDF's inertial data — gravity / mass-matrix /
-Coriolis / inverse-dynamics. The emitted crate is fully self-contained: it copies
-the shared math kernels and the per-arm driver sources into the target directory
-and generates its own ``Cargo.toml`` + ``lib.rs``, so the result builds and runs
-**without** the dexforge repository or the ``dexforge`` Python package.
+``dexforge build`` is an **end-to-end** rigid-body compiler: point it at a URDF
+and it translates the arm's full **kinematics and dynamics** into a
+**stand-alone** Rust crate written *outside* the dexforge repository.  It calls
+an LLM to translate the analytical inverse kinematics and runs the symbolic
+kinematics + dynamics compiler (``codegen/generate_kinematics_dynamics.py``) to
+derive the forward kinematics, geometric Jacobian and — from the URDF's inertial
+data — gravity / mass-matrix / Coriolis / inverse-dynamics.  The emitted crate is
+fully self-contained: it copies the shared math kernels and the per-arm sources
+into the target directory and generates its own ``Cargo.toml`` + ``lib.rs``, so
+the result builds and runs **without** the dexforge repository or the ``dexforge``
+Python package.
 
 This lets an OEM use dexforge as a one-shot URDF compiler for their hardware:
 hand it a URDF, get back a minimal, zero-allocation ``#![no_std]`` crate exposing
 the arm's kinematics (``fk`` / ``solve``) and dynamics that they can vendor
 straight into firmware.
 
-Typical usage::
+Individual compilation steps can be run in isolation via ``--step``::
+
+    dexforge build --urdf arm.urdf --base base_link --ee tool0 -o ~/arm --step ik
+    dexforge build --urdf arm.urdf --base base_link --ee tool0 -o ~/arm --step kinematics
+    dexforge build --urdf arm.urdf --base base_link --ee tool0 -o ~/arm --step export
+    dexforge build --urdf arm.urdf --base base_link --ee tool0 -o ~/arm --step verify
+
+Typical end-to-end usage::
 
     pip install dexforge
 
-    # End-to-end: compile a kinematics + dynamics driver crate from a URDF.
+    # Compile a kinematics + dynamics crate from a URDF.
     dexforge build --urdf my_arm.urdf --base base_link --ee tool0 -o ~/my_arm_ik
     cd ~/my_arm_ik && cargo build --release
 
@@ -31,7 +39,6 @@ Typical usage::
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import subprocess
 import sys
@@ -150,7 +157,7 @@ pub mod math;
 pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};
 // Symbolic forward kinematics, geometric Jacobian and rigid-body dynamics
 // (gravity / mass matrix / Coriolis / inverse dynamics) compiled by
-// `codegen/generate_dynamics.py`. Re-exported so consumers reach the full
+// `codegen/generate_kinematics_dynamics.py`. Re-exported so consumers reach the full
 // kinematics + dynamics suite at the crate root.
 pub use drivers::{arm}::generated_kinematics;
 """
@@ -277,19 +284,20 @@ def verify_crate(out_dir: Path) -> tuple:
     return result.returncode == 0, (result.stderr + result.stdout).strip()
 
 
-def generate_driver_from_urdf(
+def generate_ik_from_urdf(
     urdf: Path,
     base_link: str,
     ee_link: str,
     repo_root: Path,
     llm_options: Optional[Dict[str, str]] = None,
 ) -> tuple:
-    """Translate a URDF into an in-repo driver via the LLM code generator.
+    """Translate a URDF into an in-repo IK module via the LLM code generator.
 
-    Drives ``codegen/ik_generator.py`` (which generates a ssik artifact from the
+    Drives ``codegen/generate_ik.py`` (which generates a ssik artifact from the
     URDF, calls the LLM to translate it into ``#![no_std]`` Rust, then builds and
-    tests the result) so the driver lands under ``src/drivers/<arm>/`` and can be
-    exported as a stand-alone crate. The arm name is derived from the URDF stem.
+    tests the result) so the IK module lands under ``src/drivers/<arm>/`` and can
+    be exported as a stand-alone crate.  The arm name is derived from the URDF
+    stem.
 
     :param urdf: Path to the source URDF file.
     :param base_link: Base link name passed to the generator.
@@ -299,24 +307,21 @@ def generate_driver_from_urdf(
         through to the generator (otherwise its env-var defaults apply).
     :returns: ``(success, arm_name, combined_output)``.
     """
-    generator = repo_root / "codegen" / "ik_generator.py"
-    if not generator.is_file():
-        return False, urdf.stem, f"missing code generator: {generator}"
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+
+    # Import generate_ik as a module (it lives in the same package).
+    from . import generate_ik
 
     arm = urdf.stem
     llm_options = llm_options or {}
+
     with tempfile.TemporaryDirectory(prefix="dexforge_build_") as work:
-        cmd = [
-            sys.executable,
-            str(generator),
-            "--urdf",
-            str(urdf.resolve()),
-            "--base",
-            base_link,
-            "--ee",
-            ee_link,
-            "--output-dir",
-            work,
+        argv = [
+            "--urdf", str(urdf.resolve()),
+            "--base", base_link,
+            "--ee", ee_link,
+            "--output-dir", work,
         ]
         for flag, key in (
             ("--llm-key", "key"),
@@ -326,26 +331,21 @@ def generate_driver_from_urdf(
         ):
             value = llm_options.get(key)
             if value is not None:
-                cmd += [flag, str(value)]
+                argv += [flag, str(value)]
 
-        # The generator imports its sibling modules (ik_build, ik_llm, …) by
-        # bare name, so it must run with codegen/ on the path; invoking it as a
-        # subprocess from there keeps it self-contained.
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            filter(None, [str(generator.parent), env.get("PYTHONPATH", "")])
-        )
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            env=env,
-        )
-    return result.returncode == 0, arm, (result.stderr + result.stdout).strip()
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        try:
+            with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                rc = generate_ik.main(argv)
+        except SystemExit as exc:
+            rc = exc.code if exc.code is not None else 0
+
+    output = (stderr_buf.getvalue() + stdout_buf.getvalue()).strip()
+    return rc == 0, arm, output
 
 
-def generate_dynamics_for_arm(
+def compile_kinematics_dynamics_for_arm(
     arm: str,
     urdf: Optional[Path],
     repo_root: Path,
@@ -353,50 +353,45 @@ def generate_dynamics_for_arm(
     """Compile the arm's full rigid-body kinematics + dynamics in-repo.
 
     dexforge is a rigid-body dynamics compiler, not just an IK one: after the
-    LLM produces the IK driver, this drives ``codegen/generate_dynamics.py``
-    against the driver's ssik artifact (under ``src/drivers/<arm>/<arm>_ik.py``)
-    to derive — symbolically with SymPy — the exact forward kinematics and
-    geometric Jacobian, emitted as ``#![no_std]`` Rust at
-    ``src/drivers/<arm>/generated_kinematics.rs`` (the module the IK solver's FK
-    delegates to). When *urdf* carries ``<inertial>`` blocks, the same pass also
-    emits gravity / mass-matrix / Coriolis / inverse-dynamics so the exported
-    crate ships the complete kinematics **and** dynamics suite.
+    LLM produces the IK module, this drives
+    ``codegen/generate_kinematics_dynamics.py`` against the ssik artifact
+    (under ``src/drivers/<arm>/<arm>_ik.py``) to derive — symbolically with
+    SymPy — the exact forward kinematics and geometric Jacobian, emitted as
+    ``#![no_std]`` Rust at ``src/drivers/<arm>/generated_kinematics.rs`` (the
+    module the IK solver's FK delegates to).  When *urdf* carries
+    ``<inertial>`` blocks, the same pass also emits gravity / mass-matrix /
+    Coriolis / inverse-dynamics so the exported crate ships the complete
+    kinematics **and** dynamics suite.
 
-    :param arm: Arm name whose in-repo driver was just generated.
+    :param arm: Arm name whose in-repo IK module was just generated.
     :param urdf: Source URDF (supplies link masses/inertias for dynamics); the
         dynamics functions are emitted only when it carries ``<inertial>`` data.
-    :param repo_root: dexforge source tree (provides the dynamics compiler).
+    :param repo_root: dexforge source tree (provides the kinematics compiler).
     :returns: ``(success, combined_output)``.
     """
-    script = repo_root / "codegen" / "generate_dynamics.py"
-    if not script.is_file():
-        return False, f"missing dynamics compiler: {script}"
+    import io
+    from contextlib import redirect_stderr
 
     artifact = repo_root / "src" / "drivers" / arm / f"{arm}_ik.py"
     if not artifact.is_file():
-        return False, f"missing ssik artifact for dynamics: {artifact}"
+        return False, f"missing ssik artifact for kinematics/dynamics: {artifact}"
 
     output = repo_root / "src" / "drivers" / arm / "generated_kinematics.rs"
-    cmd = [
-        sys.executable,
-        str(script),
-        "--artifact",
-        str(artifact),
-        "--arm",
-        arm,
-        "--output",
-        str(output),
-    ]
-    if urdf is not None and urdf.is_file():
-        cmd += ["--urdf", str(urdf.resolve())]
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=str(repo_root),
-    )
-    return result.returncode == 0, (result.stderr + result.stdout).strip()
+    try:
+        from . import generate_kinematics_dynamics as gkd
+
+        stderr_buf = io.StringIO()
+        with redirect_stderr(stderr_buf):
+            gkd.compile_kinematics_dynamics(
+                artifact=str(artifact),
+                output=output,
+                arm=arm,
+                urdf=urdf.resolve() if urdf is not None and urdf.is_file() else None,
+            )
+        return True, stderr_buf.getvalue().strip()
+    except (ImportError, ValueError, FileNotFoundError) as exc:
+        return False, str(exc)
 
 
 def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
@@ -428,20 +423,20 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         )
         return 2
 
-    print(f"[dexforge] translating {urdf.name} into an IK driver via the LLM …")
-    ok, arm, output = generate_driver_from_urdf(
+    print(f"[dexforge] translating {urdf.name} into analytical IK via the LLM …")
+    ok, arm, output = generate_ik_from_urdf(
         urdf, args.base, args.ee, repo_root, _llm_options(args)
     )
     if not ok:
         print(
-            f"[dexforge] ERROR: URDF→driver translation failed:\n{output}",
+            f"[dexforge] ERROR: URDF→IK translation failed:\n{output}",
             file=sys.stderr,
         )
         return 1
-    print(f"[dexforge]   \u2713 generated '{arm}' driver under src/drivers/{arm}/.")
+    print(f"[dexforge]   ✓ generated '{arm}' IK module under src/drivers/{arm}/.")
 
     print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
-    ok, output = generate_dynamics_for_arm(arm, urdf, repo_root)
+    ok, output = compile_kinematics_dynamics_for_arm(arm, urdf, repo_root)
     if not ok:
         print(
             f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
@@ -449,7 +444,7 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         )
         return 1
     print(
-        f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under "
+        f"[dexforge]   ✓ compiled FK, Jacobian and dynamics under "
         f"src/drivers/{arm}/."
     )
 
@@ -508,19 +503,67 @@ def _build(args: argparse.Namespace) -> int:
 
     base = Path(args.output).resolve()
 
-    # The whole point is to emit a driver *outside* dexforge; refuse to scribble
+    # The whole point is to emit a crate *outside* dexforge; refuse to scribble
     # generated crates back into the source tree.
     if _is_within(base, repo_root):
         print(
             f"[dexforge] ERROR: --output {base} is inside the dexforge repository "
             f"({repo_root}). Choose a directory outside the repo: the generated "
-            f"driver is meant to be self-contained.",
+            f"crate is meant to be self-contained.",
             file=sys.stderr,
         )
         return 2
 
-    # End-to-end path: compile a driver straight from a URDF via the LLM.
-    return _build_from_urdf(args, repo_root, base)
+    step = getattr(args, "step", None)
+
+    if step is None:
+        # End-to-end path: compile everything from URDF via the LLM.
+        return _build_from_urdf(args, repo_root, base)
+
+    # Discrete step execution — assume prior steps have already been run.
+    urdf = Path(args.urdf)
+    arm = urdf.stem
+
+    if step == "ik":
+        if not urdf.is_file():
+            print(f"[dexforge] ERROR: URDF file not found: {urdf}", file=sys.stderr)
+            return 2
+        if not args.base or not args.ee:
+            print("[dexforge] ERROR: --step ik requires --base and --ee.", file=sys.stderr)
+            return 2
+        print(f"[dexforge] step: translating {urdf.name} into analytical IK …")
+        ok, arm, output = generate_ik_from_urdf(
+            urdf, args.base, args.ee, repo_root, _llm_options(args)
+        )
+        if not ok:
+            print(f"[dexforge] ERROR: IK translation failed:\n{output}", file=sys.stderr)
+            return 1
+        print(f"[dexforge]   ✓ IK generated for '{arm}'.")
+        return 0
+
+    if step in ("kinematics", "dynamics"):
+        print(f"[dexforge] step: compiling kinematics + dynamics for '{arm}' …")
+        ok, output = compile_kinematics_dynamics_for_arm(arm, urdf, repo_root)
+        if not ok:
+            print(f"[dexforge] ERROR: {output}", file=sys.stderr)
+            return 1
+        print(f"[dexforge]   ✓ kinematics/dynamics compiled for '{arm}'.")
+        return 0
+
+    if step == "export":
+        return _export_arm(arm, repo_root, base, args)
+
+    if step == "verify":
+        print(f"[dexforge] step: verifying standalone build at {base} …")
+        ok, output = verify_crate(base)
+        if not ok:
+            print(f"[dexforge]   ✗ build failed:\n{output}", file=sys.stderr)
+            return 1
+        print(f"[dexforge]   ✓ standalone crate builds.")
+        return 0
+
+    print(f"[dexforge] ERROR: unknown step '{step}'.", file=sys.stderr)
+    return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -610,6 +653,24 @@ def build_parser() -> argparse.ArgumentParser:
         dest="list",
         action="store_true",
         help="Print the compile plan without writing anything.",
+    )
+    build_p.add_argument(
+        "--step",
+        metavar="STEP",
+        choices=[
+            "ik",
+            "kinematics",
+            "dynamics",
+            "export",
+            "verify",
+        ],
+        help=(
+            "Run only a specific compilation step instead of the full pipeline. "
+            "Choices: 'ik' (LLM IK translation), 'kinematics' (FK + Jacobian), "
+            "'dynamics' (gravity/mass-matrix/Coriolis), 'export' (write the "
+            "standalone crate), 'verify' (cargo build check). Steps assume "
+            "prior steps have already been run."
+        ),
     )
     build_p.add_argument(
         "--no-verify",

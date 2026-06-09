@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ik_generator.py — Generate ``#![no_std]`` Rust IK drivers from ssik Python artifacts.
+"""generate_ik.py — Generate ``#![no_std]`` Rust analytical IK from ssik Python artifacts.
 
-This script generates (or loads) a per-arm ssik Inverse Kinematics Python
+This module generates (or loads) a per-arm ssik Inverse Kinematics Python
 artifact, translates it into deterministic, zero-allocation Rust code via an
 LLM API, runs the companion Python helper scripts to produce auxiliary Rust
 files (``consts.rs``, ``pq.rs``, ``test_data.rs``), then builds and tests the
@@ -20,20 +20,20 @@ For instructions on upgrading the ssik version, see
 Usage examples::
 
     # From a ssik prebuilt artifact name (looks up ssik.prebuilt):
-    python codegen/ik_generator.py --artifact ur5_ik --output-dir out/
+    python codegen/generate_ik.py --artifact ur5_ik --output-dir out/
 
     # From a local artifact .py file:
-    python codegen/ik_generator.py --artifact /path/to/my_arm_ik.py --output-dir out/
+    python codegen/generate_ik.py --artifact /path/to/my_arm_ik.py --output-dir out/
 
     # Use an existing artifact and copy a source URDF alongside it:
-    python codegen/ik_generator.py --artifact ur5_ik --urdf robot.urdf --output-dir out/
+    python codegen/generate_ik.py --artifact ur5_ik --urdf robot.urdf --output-dir out/
 
     # Generate a fresh artifact from a URDF, then translate:
-    python codegen/ik_generator.py --urdf robot.urdf --base base_link --ee ee_link \\
+    python codegen/generate_ik.py --urdf robot.urdf --base base_link --ee ee_link \\
         --output-dir out/
 
     # Dump the full context to disk without invoking an LLM:
-    python codegen/ik_generator.py --artifact ur5_ik --dump-context --output-dir out/
+    python codegen/generate_ik.py --artifact ur5_ik --dump-context --output-dir out/
 
 Environment variables for offline / air-gapped LLM support::
 
@@ -84,10 +84,11 @@ _MAX_RETRIES = 3
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ik_generator",
+        prog="generate_ik",
         description=(
-            "Generate a #![no_std] Rust IK driver from a ssik Python artifact using "
-            "an LLM.  Provide --artifact, --urdf (with --base and --ee), or both."
+            "Generate a #![no_std] Rust analytical IK module from a ssik Python "
+            "artifact using an LLM.  Provide --artifact, --urdf (with --base and "
+            "--ee), or both."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -174,11 +175,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # --- Check locked ssik version ---
     try:
         locked_version = _get_locked_ssik_version()
-        print(f"[ik_generator] Locked ssik version: {locked_version}")
+        print(f"[codegen:ik] Locked ssik version: {locked_version}")
         _verify_ssik_version()
-        print(f"[ik_generator] ✓ ssik version verified")
+        print(f"[codegen:ik] ✓ ssik version verified")
     except (ImportError, FileNotFoundError) as exc:
-        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        print(f"[codegen:ik] ERROR: {exc}", file=sys.stderr)
         return 1
 
     if args.artifact is None and args.urdf is None:
@@ -187,7 +188,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         parser.error(f"URDF file not found: {args.urdf}")
 
     # --- Step 0: Obtain source Python artifact ---
-    print("[ik_generator] Step 0: Loading Python artifact …")
+    print("[codegen:ik] Step 0: Loading Python artifact …")
     try:
         if args.artifact is None:
             if not args.base or not args.ee:
@@ -195,26 +196,26 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_py_code, artifact_stem = generate_artifact_from_urdf(
                 args.urdf, args.base, args.ee, args.output_dir
             )
-            print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
+            print(f"[codegen:ik]   Generated artifact from URDF: {artifact_stem}")
         else:
             target_py_code, artifact_stem = load_prebuilt_artifact(args.artifact)
-            print(f"[ik_generator]   Loaded artifact: {artifact_stem}")
+            print(f"[codegen:ik]   Loaded artifact: {artifact_stem}")
     except (ImportError, FileNotFoundError, RuntimeError) as exc:
-        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        print(f"[codegen:ik] ERROR: {exc}", file=sys.stderr)
         return 1
 
     arm_name = artifact_stem.removesuffix("_ik")
     source_urdf = args.urdf
 
     # --- Step 1: Detect kinematic family ---
-    print("[ik_generator] Step 1: Detecting kinematic family …")
+    print("[codegen:ik] Step 1: Detecting kinematic family …")
     try:
         example_arm, max_solutions = find_best_example(target_py_code)
     except ValueError as exc:
-        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        print(f"[codegen:ik] ERROR: {exc}", file=sys.stderr)
         return 1
     print(
-        f"[ik_generator]   → example arm: '{example_arm}', "
+        f"[codegen:ik]   → example arm: '{example_arm}', "
         f"MAX_SOLUTIONS = {max_solutions}"
     )
 
@@ -225,29 +226,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         fallback_path = _REPO_ROOT / "src" / "drivers" / fallback / "ik_solver.rs"
         if fallback_path.exists():
             print(
-                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
+                f"[codegen:ik]   WARNING: No Rust driver for '{example_arm}'; "
                 f"falling back to '{fallback}' as structural template."
             )
             example_arm = fallback
         else:
             print(
-                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
+                f"[codegen:ik]   WARNING: No Rust driver found for '{example_arm}' "
                 "or fallback 'franka_panda'. The one-shot example will be empty.",
                 file=sys.stderr,
             )
 
     # --- Step 2 (internal) + Step 3: Assemble context ---
-    print("[ik_generator] Step 3: Assembling context …")
+    print("[codegen:ik] Step 3: Assembling context …")
     try:
         context = assemble_context(target_py_code, arm_name, example_arm, max_solutions)
     except FileNotFoundError as exc:
-        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        print(f"[codegen:ik] ERROR: {exc}", file=sys.stderr)
         return 1
-    print(f"[ik_generator]   Context assembled ({len(context):,} chars).")
+    print(f"[codegen:ik]   Context assembled ({len(context):,} chars).")
 
     # --- Dump context and exit if requested ---
     if args.dump_context:
-        print("[ik_generator] --dump-context: skipping LLM invocation.")
+        print("[codegen:ik] --dump-context: skipping LLM invocation.")
         args.output_dir.mkdir(parents=True, exist_ok=True)
         ctx_path = args.output_dir / f"{arm_name}_context.txt"
         ctx_path.write_text(context, encoding="utf-8")
@@ -259,12 +260,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_py_code,
             source_urdf,
         )
-        print(f"[ik_generator] ✓ Context dump : {ctx_path}")
-        print(f"[ik_generator] ✓ Python artifact : {py_path}")
+        print(f"[codegen:ik] ✓ Context dump : {ctx_path}")
+        print(f"[codegen:ik] ✓ Python artifact : {py_path}")
         return 0
 
     # --- Step 4: Invoke LLM with retry loop ---
-    print("[ik_generator] Step 4: Invoking LLM …")
+    print("[codegen:ik] Step 4: Invoking LLM …")
     try:
         llm = IKGeneratorLLM(
             api_key=args.llm_key,
@@ -272,7 +273,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             model=args.llm_model,
         )
     except ImportError as exc:
-        print(f"[ik_generator] ERROR: {exc}", file=sys.stderr)
+        print(f"[codegen:ik] ERROR: {exc}", file=sys.stderr)
         return 1
 
     messages: list[dict] = [
@@ -287,25 +288,25 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     for attempt in range(max_attempts):
         if attempt > 0:
-            print(f"[ik_generator]   Retry {attempt}/{args.max_retries} …")
+            print(f"[codegen:ik]   Retry {attempt}/{args.max_retries} …")
 
         try:
             raw_response = llm.generate(messages)
         except Exception as exc:  # noqa: BLE001 — surface all API errors
             print(
-                f"[ik_generator] LLM error ({type(exc).__name__}): {exc}",
+                f"[codegen:ik] LLM error ({type(exc).__name__}): {exc}",
                 file=sys.stderr,
             )
             return 1
 
         last_raw_response = raw_response
-        print(f"[ik_generator]   LLM response: {len(raw_response):,} chars.")
+        print(f"[codegen:ik]   LLM response: {len(raw_response):,} chars.")
 
         # --- Step 5: Parse multi-file output ---
         try:
             files = parse_llm_output(raw_response)
         except ValueError as exc:
-            print(f"[ik_generator]   Parse error: {exc}", file=sys.stderr)
+            print(f"[codegen:ik]   Parse error: {exc}", file=sys.stderr)
             if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({
@@ -320,12 +321,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
 
         print(
-            f"[ik_generator]   Parsed {len(files)} file(s): "
+            f"[codegen:ik]   Parsed {len(files)} file(s): "
             + ", ".join(files.keys())
         )
 
         # --- Step 6: Write generated files ---
-        print("[ik_generator] Step 6: Writing generated files …")
+        print("[codegen:ik] Step 6: Writing generated files …")
         written = write_generated_files(
             args.output_dir,
             arm_name,
@@ -336,7 +337,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
 
         # --- Step 7: Run Python helper scripts ---
-        print("[ik_generator] Step 7: Running Python helper scripts …")
+        print("[codegen:ik] Step 7: Running Python helper scripts …")
         script_failures = run_py_scripts(written)
 
         if script_failures:
@@ -349,58 +350,58 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"{failure_details}\n\n"
                 "Please fix the errors and regenerate all files."
             )
-            print(f"[ik_generator]   Script failures detected.")
+            print(f"[codegen:ik]   Script failures detected.")
             if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
-            print(f"[ik_generator] ERROR: Script failures after all retries.", file=sys.stderr)
+            print(f"[codegen:ik] ERROR: Script failures after all retries.", file=sys.stderr)
             return 1
 
         # --- Step 8: Build the Rust crate ---
-        print("[ik_generator] Step 8: Building Rust crate …")
+        print("[codegen:ik] Step 8: Building Rust crate …")
         build_ok, build_output = build_rust_crate()
         if not build_ok:
             error_msg = (
                 f"cargo build failed with the following errors:\n\n{build_output}\n\n"
                 "Please fix the Rust code and regenerate all files."
             )
-            print(f"[ik_generator]   Build failed.")
+            print(f"[codegen:ik]   Build failed.")
             if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
-            print(f"[ik_generator] ERROR: Build failed after all retries.", file=sys.stderr)
+            print(f"[codegen:ik] ERROR: Build failed after all retries.", file=sys.stderr)
             print(build_output, file=sys.stderr)
             return 1
-        print("[ik_generator]   Build succeeded.")
+        print("[codegen:ik]   Build succeeded.")
 
         # --- Step 9: Run Rust tests ---
-        print("[ik_generator] Step 9: Running Rust tests …")
+        print("[codegen:ik] Step 9: Running Rust tests …")
         test_ok, test_output = test_rust_crate()
         if not test_ok:
             error_msg = (
                 f"cargo test failed with the following output:\n\n{test_output}\n\n"
                 "Please fix the Rust code and regenerate all files."
             )
-            print(f"[ik_generator]   Tests failed.")
+            print(f"[codegen:ik]   Tests failed.")
             if attempt < max_attempts - 1:
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
-            print(f"[ik_generator] ERROR: Tests failed after all retries.", file=sys.stderr)
+            print(f"[codegen:ik] ERROR: Tests failed after all retries.", file=sys.stderr)
             print(test_output, file=sys.stderr)
             return 1
-        print("[ik_generator]   All tests passed.")
+        print("[codegen:ik]   All tests passed.")
 
         # --- All steps succeeded ---
         break
 
-    print(f"\n[ik_generator] ✓ Python artifact : {written.get('py')}")
-    print(f"[ik_generator] ✓ Context dump    : {written.get('ctx')}")
+    print(f"\n[codegen:ik] ✓ Python artifact : {written.get('py')}")
+    print(f"[codegen:ik] ✓ Context dump    : {written.get('ctx')}")
     for filename, path in sorted(written.items()):
         if filename not in ("py", "ctx"):
-            print(f"[ik_generator] ✓ {filename:<40} → {path.relative_to(_REPO_ROOT)}")
+            print(f"[codegen:ik] ✓ {filename:<40} → {path.relative_to(_REPO_ROOT)}")
 
     return 0
 

@@ -1,4 +1,4 @@
-"""Prompt generation module for ik_generator.
+"""Prompt generation module for generate_ik.
 
 This module handles:
 - Loading ssik Python artifacts (from prebuilt or file)

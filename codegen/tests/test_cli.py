@@ -138,9 +138,9 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "out"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_ik_from_urdf", return_value=(True, "ur5", "ok")
             ), mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "compile_kinematics_dynamics_for_arm", return_value=(True, "ok")
             ):
                 with mock.patch.object(cli, "write_export") as we:
                     with redirect_stdout(io.StringIO()):
@@ -170,9 +170,9 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "ur5"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_ik_from_urdf", return_value=(True, "ur5", "ok")
             ), mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "compile_kinematics_dynamics_for_arm", return_value=(True, "ok")
             ):
                 with mock.patch.object(cli, "verify_crate") as vc:
                     with redirect_stdout(io.StringIO()):
@@ -190,9 +190,9 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "ur5"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_ik_from_urdf", return_value=(True, "ur5", "ok")
             ), mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "compile_kinematics_dynamics_for_arm", return_value=(True, "ok")
             ):
                 with mock.patch.object(cli, "verify_crate", return_value=(False, "boom")):
                     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -218,9 +218,9 @@ class UrdfBuildTests(unittest.TestCase):
             out = Path(tmp) / "driver"
             # Pretend the LLM generator produced the 'ur5' driver in-repo.
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_ik_from_urdf", return_value=(True, "ur5", "ok")
             ) as gen, mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "compile_kinematics_dynamics_for_arm", return_value=(True, "ok")
             ) as dyn:
                 with redirect_stdout(io.StringIO()):
                     code = cli.main(
@@ -241,9 +241,9 @@ class UrdfBuildTests(unittest.TestCase):
             urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
             out = Path(tmp) / "driver"
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_ik_from_urdf", return_value=(True, "ur5", "ok")
             ), mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(False, "kaboom")
+                cli, "compile_kinematics_dynamics_for_arm", return_value=(False, "kaboom")
             ):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                     code = cli.main(
@@ -281,12 +281,74 @@ class UrdfBuildTests(unittest.TestCase):
             urdf = Path(tmp) / "ur5.urdf"
             urdf.write_text("<robot/>", encoding="utf-8")
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(False, "ur5", "boom")
+                cli, "generate_ik_from_urdf", return_value=(False, "ur5", "boom")
             ):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     code = cli.main(
                         ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
                          "-o", str(Path(tmp) / "o")]
+                    )
+            self.assertEqual(code, 1)
+
+
+class StepTests(unittest.TestCase):
+    """Tests for the --step discrete execution mode."""
+
+    def test_step_ik_calls_generate_ik(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
+            out = Path(tmp) / "out"
+            with mock.patch.object(
+                cli, "generate_ik_from_urdf", return_value=(True, "ur5", "ok")
+            ) as gen:
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                         "-o", str(out), "--step", "ik"]
+                    )
+            self.assertEqual(code, 0)
+            gen.assert_called_once()
+
+    def test_step_kinematics_calls_compile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
+            out = Path(tmp) / "out"
+            with mock.patch.object(
+                cli, "compile_kinematics_dynamics_for_arm", return_value=(True, "ok")
+            ) as comp:
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                         "-o", str(out), "--step", "kinematics"]
+                    )
+            self.assertEqual(code, 0)
+            comp.assert_called_once()
+
+    def test_step_export_writes_crate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
+            out = Path(tmp) / "out"
+            with redirect_stdout(io.StringIO()):
+                code = cli.main(
+                    ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                     "-o", str(out), "--step", "export", "--no-verify"]
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue((out / "Cargo.toml").is_file())
+
+    def test_step_verify_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "ur5.urdf"
+            urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
+            out = Path(tmp) / "out"
+            with mock.patch.object(cli, "verify_crate", return_value=(False, "oops")):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                         "-o", str(out), "--step", "verify"]
                     )
             self.assertEqual(code, 1)
 

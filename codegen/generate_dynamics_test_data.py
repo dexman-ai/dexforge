@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pinocchio ground-truth generator for the dexforge dynamics kernels.
 
-The dexforge codegen (``codegen/generate_dynamics.py``) emits the manipulator
+The dexforge codegen (``codegen/generate_kinematics_dynamics.py``) emits the manipulator
 dynamics — ``gravity(q, gravity)`` and ``inverse_dynamics(q, qd, qdd, gravity)``
 — as pure ``#![no_std]`` Rust derived symbolically (energy/Lagrangian method)
 from the arm's kinematic chain and the link inertials in its URDF.
@@ -52,7 +52,7 @@ _DEFAULT_QD_LIMIT = 1.0
 _DEFAULT_QDD_LIMIT = 2.0
 
 # Gravity in the base frame; must match the vector baked into the generated Rust
-# (`codegen/generate_dynamics.py --gravity`, default 0 0 -9.81).
+# (`codegen/generate_kinematics_dynamics.py --gravity`, default 0 0 -9.81).
 _DEFAULT_GRAVITY = (0.0, 0.0, -9.81)
 
 

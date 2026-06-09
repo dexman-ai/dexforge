@@ -173,7 +173,7 @@ artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
 build` at a URDF and it translates the arm's full **kinematics and dynamics**
 into a *stand-alone* Rust crate written **outside** this repository. It calls an
 LLM to translate the analytical IK and runs the symbolic compiler
-(`codegen/generate_dynamics.py`) to derive the forward kinematics, geometric
+(`codegen/generate_kinematics_dynamics.py`) to derive the forward kinematics, geometric
 Jacobian and — from the URDF's inertial data — gravity / mass-matrix / Coriolis /
 inverse-dynamics. The emitted crate is fully self-contained: it copies the shared
 math kernels and the per-arm driver sources into the target directory and
@@ -193,7 +193,7 @@ cd ~/my_arm_ik && cargo build --release
 The URDF path drives the LLM-assisted generator (see *Adding a new arm* below):
 it builds a `ssik` artifact from the URDF, translates the IK to `#![no_std]`
 Rust, builds and tests it, then compiles the symbolic kinematics + dynamics with
-`codegen/generate_dynamics.py` and exports the result as the stand-alone crate.
+`codegen/generate_kinematics_dynamics.py` and exports the result as the stand-alone crate.
 Set `DEXFORGE_LLM_KEY` / `DEXFORGE_LLM_BASE_URL` / `DEXFORGE_LLM_MODEL` (or the
 `--llm-key` / `--llm-url` / `--llm-model` flags) for your LLM backend.
 
@@ -217,7 +217,7 @@ self-contained driver).
 
 ## Adding a new arm
 
-The `codegen/ik_generator.py` script automates translation of a `ssik`
+The `codegen/generate_ik.py` script automates translation of a `ssik`
 prebuilt artifact into a `#![no_std]` Rust driver, including the
 machine-generated auxiliary files (`consts.rs`, `pq.rs`, `test_data.rs`). It
 calls an LLM API, builds the crate, runs the tests, and feeds any failures
@@ -225,13 +225,13 @@ back to the LLM for self-correction.
 
 ```sh
 # From a ssik prebuilt artifact name (looks up ssik.prebuilt):
-python codegen/ik_generator.py --artifact ur5_ik --output-dir out/
+python codegen/generate_ik.py --artifact ur5_ik --output-dir out/
 
 # From a local artifact .py file:
-python codegen/ik_generator.py --artifact /path/to/my_arm_ik.py --output-dir out/
+python codegen/generate_ik.py --artifact /path/to/my_arm_ik.py --output-dir out/
 
 # Generate a fresh artifact from a URDF, then translate:
-python codegen/ik_generator.py --urdf robot.urdf --base base_link --ee ee_link \
+python codegen/generate_ik.py --urdf robot.urdf --base base_link --ee ee_link \
     --output-dir out/
 ```
 
@@ -246,7 +246,7 @@ After the Rust driver is accepted:
 
 ### Symbolic dynamics & kinematics code generation
 
-`codegen/generate_dynamics.py` is a one-time symbolic compiler: it sources the
+`codegen/generate_kinematics_dynamics.py` is a one-time symbolic compiler: it sources the
 kinematic chain **directly from the ssik artifact** (the same `*_ik.py` prebuilt
 the IK pipeline produces — no URDF parsing), derives **exact** closed-form
 forward kinematics and the geometric Jacobian with SymPy, and emits pure,
@@ -262,10 +262,10 @@ Every transcendental is rewritten as a `libm::*` call and `pi` maps to
 ```sh
 pip install ssik sympy numpy
 # From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
-python codegen/generate_dynamics.py --artifact ur5_ik
+python codegen/generate_kinematics_dynamics.py --artifact ur5_ik
 
 # From a local artifact .py file, writing to a driver module:
-python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
+python codegen/generate_kinematics_dynamics.py --artifact /path/to/my_arm_ik.py \
     --output src/drivers/<arm>/dynamics.rs
 ```
 
@@ -296,7 +296,7 @@ generator additionally emits, via the energy (Lagrangian) method:
 ```sh
 # Kinematics from the artifact, masses/inertias from a URDF; default gravity
 # is (0, 0, −9.81), override with --gravity GX GY GZ:
-python codegen/generate_dynamics.py --artifact ur5_ik \
+python codegen/generate_kinematics_dynamics.py --artifact ur5_ik \
     --urdf src/drivers/ur5/ur5_inertial.urdf \
     --gravity 0 0 -9.81 \
     --output src/drivers/ur5/dynamics.rs
@@ -304,7 +304,7 @@ python codegen/generate_dynamics.py --artifact ur5_ik \
 
 `dexforge build` runs this symbolic compiler as part of the end-to-end URDF
 flow: after the LLM produces the IK driver, it invokes
-`codegen/generate_dynamics.py` against the driver's ssik artifact to emit
+`codegen/generate_kinematics_dynamics.py` against the driver's ssik artifact to emit
 `generated_kinematics.rs`, passing the source URDF so the inverse-dynamics suite
 (gravity / mass-matrix / Coriolis / inverse-dynamics) is baked whenever the URDF
 carries `<inertial>` blocks. A URDF that is a single serial chain of exactly `N`

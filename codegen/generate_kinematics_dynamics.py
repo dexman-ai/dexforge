@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""One-time symbolic compiler: ssik artifact -> SymPy -> zero-dependency Rust.
+"""Symbolic kinematics + dynamics compiler: ssik artifact -> SymPy -> Rust.
 
-This script acts as an offline code generator.  It sources the robot's
+This module acts as an offline code generator.  It sources the robot's
 kinematics **directly from the ssik Python artifact** (the same ``*_ik.py``
 prebuilt the IK pipeline produces — no URDF parsing required), derives **exact**
 closed-form Forward Kinematics (FK) and the geometric Jacobian symbolically with
@@ -949,7 +949,80 @@ def _emit_dynamics(
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Public API — importable entry point for dexforge_build and direct callers.
+# ---------------------------------------------------------------------------
+
+
+def compile_kinematics_dynamics(
+    artifact: str,
+    output: Optional[Path] = None,
+    arm: Optional[str] = None,
+    urdf: Optional[Path] = None,
+) -> str:
+    """Compile kinematics (FK + Jacobian) and optionally dynamics from an artifact.
+
+    This is the primary programmatic entry point.  It loads the ssik artifact,
+    derives symbolic FK and Jacobian, and — when *urdf* carries ``<inertial>``
+    blocks — also derives gravity, mass-matrix, Coriolis and inverse-dynamics.
+    The result is emitted as ``#![no_std]`` Rust code.
+
+    :param artifact: ssik artifact module name or path to a ``*_ik.py`` file.
+    :param output: Destination ``.rs`` file (if ``None``, returns the Rust code
+        without writing to disk).
+    :param arm: Human-readable arm name for doc comments (default: derived from
+        the artifact stem minus the ``_ik`` suffix).
+    :param urdf: Optional URDF carrying ``<inertial>`` blocks for dynamics.
+    :returns: The generated Rust source code.
+    :raises ImportError: If the artifact cannot be loaded.
+    :raises ValueError: If the artifact or URDF is malformed.
+    :raises FileNotFoundError: If *urdf* is specified but does not exist.
+    """
+    mod = load_artifact(artifact)
+    t_lefts, axes, t_rights, n = extract_chain(mod)
+
+    stem = Path(artifact).stem
+    arm = arm or stem.removesuffix("_ik")
+    base_link, ee_link = extract_base_ee_links(mod)
+    print(
+        f"[codegen] {arm}: {n} DOF from ssik artifact {stem!r}",
+        file=sys.stderr,
+    )
+
+    t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
+    jac = build_jacobian(t_ee, axes, frames)
+
+    dynamics = None
+    if urdf is not None:
+        if not urdf.exists():
+            raise FileNotFoundError(f"URDF not found: {urdf}")
+        dynamics = build_dynamics(
+            axes,
+            frames,
+            t_rights,
+            q_syms,
+            urdf,
+            base_link,
+            ee_link,
+        )
+        print(
+            f"[codegen] {arm}: dynamics from {urdf} "
+            f"(runtime gravity, base={base_link!r}, ee={ee_link!r})",
+            file=sys.stderr,
+        )
+
+    rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name, dynamics)
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rust)
+        print(f"[codegen] wrote {output}", file=sys.stderr)
+
+    return rust
+
+
+# ---------------------------------------------------------------------------
+# Legacy CLI (kept for backwards compatibility; prefer dexforge_build as the
+# single entry point).
 # ---------------------------------------------------------------------------
 
 
@@ -984,52 +1057,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        mod = load_artifact(args.artifact)
-        t_lefts, axes, t_rights, n = extract_chain(mod)
-    except (ImportError, ValueError) as exc:
-        print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    stem = Path(args.artifact).stem
-    arm = args.arm or stem.removesuffix("_ik")
-    base_link, ee_link = extract_base_ee_links(mod)
-    print(f"[generate_dynamics] {arm}: {n} DOF from ssik artifact {stem!r}", file=sys.stderr)
-
-    t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
-    jac = build_jacobian(t_ee, axes, frames)
-
-    dynamics = None
-    if args.urdf is not None:
-        if not args.urdf.exists():
-            print(f"[generate_dynamics] ERROR: URDF not found: {args.urdf}", file=sys.stderr)
-            return 1
-        try:
-            dynamics = build_dynamics(
-                axes,
-                frames,
-                t_rights,
-                q_syms,
-                args.urdf,
-                base_link,
-                ee_link,
-            )
-        except ValueError as exc:
-            print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
-            return 1
-        print(
-            f"[generate_dynamics] {arm}: dynamics from {args.urdf} "
-            f"(runtime gravity, base={base_link!r}, ee={ee_link!r})",
-            file=sys.stderr,
+        rust = compile_kinematics_dynamics(
+            artifact=args.artifact,
+            output=args.output,
+            arm=args.arm,
+            urdf=args.urdf,
         )
-
-    rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name, dynamics)
+    except (ImportError, ValueError) as exc:
+        print(f"[codegen] ERROR: {exc}", file=sys.stderr)
+        return 1
+    except FileNotFoundError as exc:
+        print(f"[codegen] ERROR: {exc}", file=sys.stderr)
+        return 1
 
     if args.output is None:
         sys.stdout.write(rust)
-    else:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rust)
-        print(f"[generate_dynamics] wrote {args.output}", file=sys.stderr)
+
     return 0
 
 

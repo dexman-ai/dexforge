@@ -104,10 +104,10 @@ For each currently-translated arm, generate the new artifact and compare:
 pip install ssik==<NEW_VERSION>
 
 # Generate fresh artifact for each arm
-python codegen/ik_generator.py --artifact ur5_ik --dump-context --output-dir /tmp/upgrade/
-python codegen/ik_generator.py --artifact franka_panda_ik --dump-context --output-dir /tmp/upgrade/
-python codegen/ik_generator.py --artifact xarm7_ik --dump-context --output-dir /tmp/upgrade/
-python codegen/ik_generator.py --artifact piper_ik --dump-context --output-dir /tmp/upgrade/
+python codegen/generate_ik.py --artifact ur5_ik --dump-context --output-dir /tmp/upgrade/
+python codegen/generate_ik.py --artifact franka_panda_ik --dump-context --output-dir /tmp/upgrade/
+python codegen/generate_ik.py --artifact xarm7_ik --dump-context --output-dir /tmp/upgrade/
+python codegen/generate_ik.py --artifact piper_ik --dump-context --output-dir /tmp/upgrade/
 ```
 
 Then diff the generated Python artifacts:
@@ -138,10 +138,10 @@ If the prebuilt artifacts changed significantly:
    python codegen/generate_piper_pq.py
    ```
 
-3. If the Rust drivers must be regenerated due to major algorithmic changes, use the ik_generator with the LLM:
+3. If the Rust drivers must be regenerated due to major algorithmic changes, use generate_ik with the LLM:
    ```bash
    # For each arm, if needed:
-   python codegen/ik_generator.py --artifact ur5_ik --output-dir out/
+   python codegen/generate_ik.py --artifact ur5_ik --output-dir out/
    ```
 
 ## Step 5: Update Test Data and Constants
@@ -243,7 +243,7 @@ Ensure the following are included in the PR:
 **Cause:** The underlying solver algorithm or parameters changed.
 **Action:** 
 1. If the change is minor (e.g., numerical thresholds), regenerate test data and constants.
-2. If the change is major (e.g., new solver or algorithm), regenerate the Rust driver using `ik_generator.py`.
+2. If the change is major (e.g., new solver or algorithm), regenerate the Rust driver using `generate_ik.py`.
 
 ### Tests fail after upgrade
 **Cause:** Numeric precision or algorithm differences between old and new ssik.

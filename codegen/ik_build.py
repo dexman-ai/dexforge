@@ -1,4 +1,4 @@
-"""Build and test module for ik_generator.
+"""Build and test module for generate_ik.
 
 This module handles:
 - Parsing multi-file LLM output
@@ -81,7 +81,7 @@ def _update_drivers_mod(arm_name: str) -> None:
     if declaration not in content:
         content = content.rstrip() + "\n" + declaration + "\n"
         mod_path.write_text(content, encoding="utf-8")
-        print(f"[ik_generator]   Added '{declaration}' to {mod_path.relative_to(_REPO_ROOT)}")
+        print(f"[codegen:ik]   Added '{declaration}' to {mod_path.relative_to(_REPO_ROOT)}")
 
 
 def _ensure_arm_mod_rs(arm_name: str, rust_files: list[str]) -> None:
@@ -107,7 +107,7 @@ def _ensure_arm_mod_rs(arm_name: str, rust_files: list[str]) -> None:
         lines.append(f"mod {stem};")
     mod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(
-        f"[ik_generator]   Created {mod_path.relative_to(_REPO_ROOT)}"
+        f"[codegen:ik]   Created {mod_path.relative_to(_REPO_ROOT)}"
     )
 
 
@@ -184,18 +184,18 @@ def write_generated_files(
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
             rust_files_written.append(filename)
-            print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
+            print(f"[codegen:ik]   Wrote {dest.relative_to(_REPO_ROOT)}")
         elif filename.endswith(".py"):
             dest = _REPO_ROOT / "codegen" / filename
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
-            print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
+            print(f"[codegen:ik]   Wrote {dest.relative_to(_REPO_ROOT)}")
         else:
             # Fallback: write to output_dir
             dest = output_dir / filename
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
-            print(f"[ik_generator]   Wrote {dest}")
+            print(f"[codegen:ik]   Wrote {dest}")
 
     # Ensure mod.rs exists for the new driver
     _ensure_arm_mod_rs(arm_name, rust_files_written)
@@ -223,7 +223,7 @@ def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
 
-        print(f"[ik_generator]   Running {path.relative_to(_REPO_ROOT)} …")
+        print(f"[codegen:ik]   Running {path.relative_to(_REPO_ROOT)} …")
         result = subprocess.run(
             [sys.executable, str(path)],
             capture_output=True,
@@ -232,10 +232,10 @@ def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
         )
         if result.returncode != 0:
             error = (result.stderr + result.stdout).strip()
-            print(f"[ik_generator]   ✗ {filename} failed:\n{error}")
+            print(f"[codegen:ik]   ✗ {filename} failed:\n{error}")
             failures.append((filename, error))
         else:
-            print(f"[ik_generator]   ✓ {filename} succeeded.")
+            print(f"[codegen:ik]   ✓ {filename} succeeded.")
 
     return failures
 

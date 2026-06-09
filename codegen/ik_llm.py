@@ -1,4 +1,4 @@
-"""LLM invocation module for ik_generator.
+"""LLM invocation module for generate_ik.
 
 This module handles communication with LLM APIs for translating
 ssik Python IK artifacts to Rust code.
