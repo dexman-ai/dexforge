@@ -416,7 +416,7 @@ def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
 
 def _progress_line(step: int, total_steps: int, description: str) -> str:
     """Render a stable progress line for ``dexforge build`` steps."""
-    percent = int((step * 100) / total_steps)
+    percent = (step * 100) // total_steps
     return f"[dexforge] [{step}/{total_steps} | {percent}%] {description}"
 
 
@@ -434,7 +434,8 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         )
         return 2
 
-    total_steps = 3 if args.list or not args.verify else 4
+    # Verify is a fourth step only when we're not in --list mode.
+    total_steps = 4 if (args.verify and not args.list) else 3
     print(_progress_line(1, total_steps, f"translate {urdf.name} into an IK driver via the LLM …"))
     ok, arm, output = generate_driver_from_urdf(
         urdf, args.base, args.ee, repo_root, _llm_options(args)
@@ -478,7 +479,7 @@ def _export_arm(
         return 1
 
     if args.list:
-        print(_progress_line(3, total_steps, f"show compile plan for '{export.arm}'"))
+        print(_progress_line(3, total_steps, f"display compile plan for '{export.arm}'"))
         print("[dexforge] compile plan (1 crate):")
         print(f"  {export.arm} -> {export.out_dir}")
         print(f"      crate '{export.crate_name}', {len(export.files())} file(s):")

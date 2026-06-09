@@ -186,9 +186,15 @@ class CliMainTests(unittest.TestCase):
             self.assertTrue((out / "Cargo.toml").is_file())
             self.assertTrue((out / "src" / "lib.rs").is_file())
             log = out_buf.getvalue()
-            self.assertIn("[1/3 | 33%] translate", log)
-            self.assertIn("[2/3 | 66%] compile full kinematics + dynamics", log)
-            self.assertIn("[3/3 | 100%] export", log)
+            self.assertIn(
+                f"[dexforge] [1/3 | 33%] translate {urdf.name} into an IK driver via the LLM …",
+                log,
+            )
+            self.assertIn(
+                "[dexforge] [2/3 | 66%] compile full kinematics + dynamics for 'ur5' …",
+                log,
+            )
+            self.assertIn(f"[dexforge] [3/3 | 100%] export ur5 driver -> {out}", log)
 
     def test_verify_failure_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,7 +230,20 @@ class CliMainTests(unittest.TestCase):
                         ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e", "-o", str(out)]
                     )
         self.assertEqual(code, 0)
-        self.assertIn("[4/4 | 100%] verify standalone build", out_buf.getvalue())
+        log = out_buf.getvalue()
+        self.assertIn(
+            f"[dexforge] [1/4 | 25%] translate {urdf.name} into an IK driver via the LLM …",
+            log,
+        )
+        self.assertIn(
+            "[dexforge] [2/4 | 50%] compile full kinematics + dynamics for 'ur5' …",
+            log,
+        )
+        self.assertIn(f"[dexforge] [3/4 | 75%] export ur5 driver -> {out}", log)
+        self.assertIn(
+            "[dexforge] [4/4 | 100%] verify standalone build (cargo build --release) …",
+            log,
+        )
 
     def test_no_subcommand_prints_help(self) -> None:
         with redirect_stdout(io.StringIO()):
