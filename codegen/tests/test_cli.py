@@ -17,6 +17,25 @@ import dexforge_build as cli  # noqa: E402
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _write_minimal_crate(root: Path) -> None:
+    (root / "src").mkdir(parents=True, exist_ok=True)
+    (root / "Cargo.toml").write_text("[package]\nname = \"demo\"\nversion = \"0.1.0\"\n", encoding="utf-8")
+    (root / "src" / "lib.rs").write_text("// lib\n", encoding="utf-8")
+
+
+def _mock_generate_driver(*args, **kwargs):
+    output_root = args[4]
+    _write_minimal_crate(output_root)
+    return True, "ur5", "ok"
+
+
+def _mock_generate_dynamics(*args, **kwargs):
+    crate_root = args[2]
+    (crate_root / "src" / "drivers" / "ur5").mkdir(parents=True, exist_ok=True)
+    (crate_root / "src" / "drivers" / "ur5" / "generated_kinematics.rs").write_text("// dyn\n", encoding="utf-8")
+    return True, "ok"
+
+
 class PlanExportTests(unittest.TestCase):
     def test_plan_copies_math_kernels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +125,7 @@ class WriteExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "ur5_driver"
             cli.write_export(cli.plan_export("ur5", out, _REPO_ROOT))
-            rust = "\n".join(p.read_text() for p in out.rglob("*.rs"))
+            rust = "\n".join(p.read_text(encoding="utf-8") for p in out.rglob("*.rs"))
         # Copied sources reference crate::math / crate::drivers, which resolve
         # within the standalone crate itself — never an external crate path back
         # into dexforge (e.g. `dexforge::` or the in-repo crate name `ssik_rust`).
@@ -141,38 +160,42 @@ class CliMainTests(unittest.TestCase):
                 cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", return_value=(True, "ok")
-            ):
-                with mock.patch.object(cli, "write_export") as we:
-                    with redirect_stdout(io.StringIO()):
-                        code = cli.main(
-                            ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
-                             "-o", str(out), "--list"]
-                        )
+            ) as dyn:
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                         "-o", str(out), "--list"]
+                    )
             self.assertEqual(code, 0)
-            we.assert_not_called()
+            dyn.assert_not_called()
             self.assertFalse(out.exists())
 
-    def test_refuses_output_inside_repo(self) -> None:
-        inside = _REPO_ROOT / "build_out"
-        with tempfile.TemporaryDirectory() as tmp:
+    def test_allows_output_inside_repo(self) -> None:
+        with tempfile.TemporaryDirectory(dir=_REPO_ROOT) as tmp:
+            inside = Path(tmp) / "build_out"
             urdf = self._urdf(tmp)
-            buf = io.StringIO()
-            with redirect_stderr(buf):
-                code = cli.main(
-                    ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
-                     "-o", str(inside)]
-                )
-        self.assertEqual(code, 2)
-        self.assertIn("inside the dexforge repository", buf.getvalue())
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
+            ), mock.patch.object(
+                cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
+            ), mock.patch.object(cli, "verify_crate", return_value=(True, "ok")):
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                         "-o", str(inside), "--no-verify"]
+                    )
+            self.assertEqual(code, 0)
+            self.assertTrue((inside / "Cargo.toml").is_file())
+            self.assertTrue((inside / "src" / "drivers" / "ur5" / "generated_kinematics.rs").is_file())
 
     def test_build_writes_and_skips_verify(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "ur5"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
             ), mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ):
                 with mock.patch.object(cli, "verify_crate") as vc:
                     with redirect_stdout(io.StringIO()):
@@ -190,9 +213,9 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "ur5"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
             ), mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ):
                 with mock.patch.object(cli, "verify_crate", return_value=(False, "boom")):
                     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -216,11 +239,10 @@ class UrdfBuildTests(unittest.TestCase):
             urdf = Path(tmp) / "ur5.urdf"
             urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
             out = Path(tmp) / "driver"
-            # Pretend the LLM generator produced the 'ur5' driver in-repo.
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
             ) as gen, mock.patch.object(
-                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+                cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ) as dyn:
                 with redirect_stdout(io.StringIO()):
                     code = cli.main(
@@ -231,7 +253,6 @@ class UrdfBuildTests(unittest.TestCase):
             gen.assert_called_once()
             # dexforge is a kinematics + dynamics compiler: dynamics must run.
             dyn.assert_called_once()
-            # Exported as a single self-contained crate at -o (not a subdir).
             self.assertTrue((out / "Cargo.toml").is_file())
             self.assertTrue((out / "src" / "lib.rs").is_file())
 
@@ -241,7 +262,7 @@ class UrdfBuildTests(unittest.TestCase):
             urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
             out = Path(tmp) / "driver"
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", return_value=(False, "kaboom")
             ):
@@ -252,8 +273,7 @@ class UrdfBuildTests(unittest.TestCase):
                     )
             self.assertEqual(code, 1)
             self.assertIn("dynamics", err.getvalue())
-            # Export must not run when the dynamics compile fails.
-            self.assertFalse((out / "Cargo.toml").exists())
+            self.assertTrue((out / "Cargo.toml").exists())
 
     def test_urdf_requires_base_and_ee(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

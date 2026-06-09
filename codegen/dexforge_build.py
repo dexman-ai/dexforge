@@ -3,10 +3,9 @@
 ``dexforge build`` is an **end-to-end** rigid-body dynamics compiler: point it at
 a URDF and it translates the arm's full **kinematics and dynamics** into a
 **stand-alone** Rust crate written *outside* the dexforge repository. It calls an
-LLM to translate the analytical inverse kinematics and runs the symbolic dynamics
-compiler (``codegen/generate_dynamics.py``) to derive the forward kinematics,
-geometric Jacobian and — from the URDF's inertial data — gravity / mass-matrix /
-Coriolis / inverse-dynamics. The emitted crate is fully self-contained: it copies
+LLM to translate the analytical inverse kinematics and runs the built-in symbolic
+dynamics compiler to derive the forward kinematics, geometric Jacobian and — from
+the URDF's inertial data — gravity / mass-matrix / Coriolis / inverse-dynamics.The emitted crate is fully self-contained: it copies
 the shared math kernels and the per-arm driver sources into the target directory
 and generates its own ``Cargo.toml`` + ``lib.rs``, so the result builds and runs
 **without** the dexforge repository or the ``dexforge`` Python package.
@@ -26,18 +25,44 @@ Typical usage::
 
     dexforge build --urdf my_arm.urdf --base base_link --ee tool0 \\
         -o ~/my_arm_ik --list   # preview, write nothing
+
+IK generation environment variables::
+
+    DEXFORGE_LLM_KEY       API key (defaults to "nokeyneeded" for local models)
+    DEXFORGE_LLM_BASE_URL  OpenAI-compatible base URL (e.g. http://localhost:11434/v1)
+    DEXFORGE_LLM_MODEL     Model name (e.g. "qwen2.5-coder:32b", "gpt-4o")
 """
 
 from __future__ import annotations
 
 import argparse
-import os
+import importlib
+import importlib.util
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+# Optional heavy deps — only required when compiling symbolic dynamics.
+try:
+    import numpy as np
+    import sympy as sp
+    from sympy.printing.rust import RustCodePrinter as _RustCodePrinterBase
+    _HAS_DYNAMICS_DEPS = True
+except ImportError:
+    np = None  # type: ignore[assignment]
+    sp = None  # type: ignore[assignment]
+    _RustCodePrinterBase = object  # type: ignore[assignment]
+    _HAS_DYNAMICS_DEPS = False
+
+# Default number of LLM *retry* attempts after the initial attempt, so total
+# LLM calls = _MAX_RETRIES + 1.
+_MAX_RETRIES = 3
 
 # Shared, arm-agnostic numeric kernels copied verbatim into every driver crate
 # (src/math/<name>.rs). The driver sources reference these as ``crate::math::*``,
@@ -45,9 +70,9 @@ from typing import Dict, List, NamedTuple, Optional, Sequence
 _MATH_MODULES = ("kinematics", "postprocess", "ssik_core", "tolerances")
 
 # Driver sources may reference shared solver modules that live alongside the
-# per-arm directories (``src/drivers/<module>.rs``, exposed as
-# ``crate::drivers::<module>``). These are detected per-arm by scanning the
-# driver sources, so URDF-derived drivers pull in whatever they actually use.
+# per-arm driver directories (exposed as ``crate::drivers::<module>``). These
+# are detected per-arm by scanning the driver sources, so URDF-derived drivers
+# pull in whatever they actually use.
 _SHARED_DRIVER_MODULES = ("rizon_common",)
 
 
@@ -150,14 +175,14 @@ pub mod math;
 pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};
 // Symbolic forward kinematics, geometric Jacobian and rigid-body dynamics
 // (gravity / mass matrix / Coriolis / inverse dynamics) compiled by
-// `codegen/generate_dynamics.py`. Re-exported so consumers reach the full
+// `dexforge build`. Re-exported so consumers reach the full
 // kinematics + dynamics suite at the crate root.
 pub use drivers::{arm}::generated_kinematics;
 """
 
 
 def _drivers_mod_rs(arm: str, shared_modules: Sequence[str]) -> str:
-    """Render the stand-alone crate's ``src/drivers/mod.rs``."""
+    """Render the stand-alone crate's driver module index."""
     lines = [
         "//! Driver module index (compiled by dexforge build).",
         "",
@@ -181,6 +206,11 @@ def _shared_modules_used(driver_src: Path) -> List[str]:
     return [m for m in _SHARED_DRIVER_MODULES if m in sources]
 
 
+def _driver_dir(repo_root: Path, arm: str) -> Path:
+    """Return the canonical source path for an arm's driver directory."""
+    return repo_root / "src" / "drivers" / arm
+
+
 def plan_export(
     arm: str,
     out_dir: Path,
@@ -191,10 +221,11 @@ def plan_export(
 
     Assembles the list of files to copy (shared math kernels, per-arm driver
     sources, and any shared solver modules the driver references) and the files
-    dexforge generates (``Cargo.toml``, ``src/lib.rs``, ``src/drivers/mod.rs``).
+    dexforge generates the crate manifest, ``src/lib.rs``, and the driver module
+    index.
 
-    Works for any arm with a driver directory under ``src/drivers/<arm>/``
-    (compiled from a URDF by the LLM-assisted generator).
+    Works for any arm with a driver directory in the source tree (compiled from
+    a URDF by the LLM-assisted generator).
 
     :raises FileNotFoundError: If an expected source directory is missing.
     """
@@ -213,7 +244,7 @@ def plan_export(
         copies.append((math_src / f"{name}.rs", out_dir / "src" / "math" / f"{name}.rs"))
 
     # Per-arm driver sources: every .rs file in the driver directory.
-    driver_src = src / "drivers" / arm
+    driver_src = _driver_dir(repo_root, arm)
     if not driver_src.is_dir():
         raise FileNotFoundError(
             f"missing driver directory: {driver_src}. Compile this arm from a "
@@ -225,7 +256,7 @@ def plan_export(
     # Shared solver modules the driver actually references.
     shared_modules = _shared_modules_used(driver_src)
     for module in shared_modules:
-        rc = src / "drivers" / f"{module}.rs"
+        rc = repo_root / "src" / "drivers" / f"{module}.rs"
         if not rc.is_file():
             raise FileNotFoundError(f"missing shared driver module: {rc}")
         copies.append((rc, out_dir / "src" / "drivers" / f"{module}.rs"))
@@ -277,126 +308,1187 @@ def verify_crate(out_dir: Path) -> tuple:
     return result.returncode == 0, (result.stderr + result.stdout).strip()
 
 
+# ===========================================================================
+# Symbolic dynamics compiler (formerly generate_dynamics.py)
+#
+# Derives closed-form FK, geometric Jacobian and manipulator dynamics
+# (gravity / mass-matrix / Coriolis / inverse-dynamics) symbolically with
+# SymPy from a ssik kinematics artifact, then emits pure #![no_std] Rust.
+# Heavy deps (numpy, sympy) are optional; _HAS_DYNAMICS_DEPS guards their use.
+# ===========================================================================
+
+# Tolerance for snapping a baked artifact float to the nearest integer.
+_SNAP_TOL = 1e-12
+
+
+# ---------------------------------------------------------------------------
+# ssik artifact loading
+# ---------------------------------------------------------------------------
+
+
+def load_artifact(artifact: str) -> types.ModuleType:
+    """Import a ssik artifact by prebuilt name or by path to a ``*_ik.py`` file."""
+    candidate = Path(artifact)
+    if candidate.exists():
+        spec = importlib.util.spec_from_file_location(candidate.stem, candidate)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load artifact module from {candidate}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    name = artifact[:-3] if artifact.endswith(".py") else artifact
+    try:
+        return importlib.import_module(f"ssik.prebuilt.{name}")
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            f"Cannot find {artifact!r} as a file or as ssik.prebuilt.{name}. "
+            "Install ssik (`pip install ssik`) or pass a path to the artifact file."
+        ) from exc
+
+
+def _snap(value: float) -> sp.Expr:
+    """Snap a baked float to an exact integer when within ``_SNAP_TOL``."""
+    rounded = round(value)
+    if abs(value - rounded) < _SNAP_TOL:
+        return sp.Integer(rounded)
+    return sp.Float(value, 17)
+
+
+def _to_matrix(arr) -> sp.Matrix:
+    a = np.asarray(arr, dtype=np.float64)
+    return sp.Matrix([[_snap(a[i, j]) for j in range(a.shape[1])] for i in range(a.shape[0])])
+
+
+def _to_vector(arr) -> sp.Matrix:
+    a = np.asarray(arr, dtype=np.float64).reshape(-1)
+    return sp.Matrix([_snap(x) for x in a])
+
+
+def extract_chain(
+    mod: types.ModuleType,
+) -> Tuple[List[sp.Matrix], List[sp.Matrix], List[sp.Matrix], int]:
+    """Pull the product-of-exponentials chain out of a ssik artifact.
+
+    :returns: ``(t_lefts, axes, t_rights, dof)`` as cleaned SymPy objects.
+    """
+    try:
+        axes_raw = mod._JOINT_AXES
+        tl_raw = mod._JOINT_T_LEFTS
+        tr_raw = mod._JOINT_T_RIGHTS
+    except AttributeError as exc:
+        raise ValueError(
+            f"artifact {mod.__name__!r} does not expose the expected "
+            "_JOINT_AXES / _JOINT_T_LEFTS / _JOINT_T_RIGHTS constants"
+        ) from exc
+
+    axes = [_to_vector(a) for a in axes_raw]
+    t_lefts = [_to_matrix(m) for m in tl_raw]
+    t_rights = [_to_matrix(m) for m in tr_raw]
+    dof = int(getattr(mod, "DOF", len(axes)))
+    if not (len(axes) == len(t_lefts) == len(t_rights) == dof):
+        raise ValueError(
+            f"inconsistent chain lengths: axes={len(axes)}, T_left={len(t_lefts)}, "
+            f"T_right={len(t_rights)}, DOF={dof}"
+        )
+    return t_lefts, axes, t_rights, dof
+
+
+def extract_base_ee_links(mod: types.ModuleType) -> Tuple[Optional[str], Optional[str]]:
+    """Read the optional base and end-effector link names from an artifact."""
+    base = getattr(mod, "BASE_LINK", None)
+    ee = getattr(mod, "EE_LINK", None)
+    return (base if isinstance(base, str) else None, ee if isinstance(ee, str) else None)
+
+
+# ---------------------------------------------------------------------------
+# Symbolic SE(3) construction
+# ---------------------------------------------------------------------------
+
+
+def _axis_angle_rot(axis: sp.Matrix, angle: sp.Expr) -> sp.Matrix:
+    """Homogeneous Rodrigues rotation about a (constant) ``axis`` by ``angle``."""
+    x, y, z = axis
+    c, s = sp.cos(angle), sp.sin(angle)
+    oc = 1 - c
+    r = sp.Matrix(
+        [
+            [c + x * x * oc, x * y * oc - z * s, x * z * oc + y * s],
+            [y * x * oc + z * s, c + y * y * oc, y * z * oc - x * s],
+            [z * x * oc - y * s, z * y * oc + x * s, c + z * z * oc],
+        ]
+    )
+    m = sp.eye(4)
+    m[:3, :3] = r
+    return m
+
+
+def build_fk(
+    t_lefts: List[sp.Matrix], axes: List[sp.Matrix], t_rights: List[sp.Matrix]
+) -> Tuple[sp.Matrix, List[sp.Symbol], List[sp.Matrix]]:
+    """Build the symbolic base->ee transform from the ssik chain.
+
+    :returns: ``(T_ee, q_syms, frames)`` where ``frames[i]`` is the base->joint-i
+        axis frame transform.
+    """
+    q_syms: List[sp.Symbol] = []
+    frames: List[sp.Matrix] = []
+    t_cum = sp.eye(4)
+    for i, (tl, axis, tr) in enumerate(zip(t_lefts, axes, t_rights)):
+        q = sp.Symbol(f"q{i}")
+        q_syms.append(q)
+        frame = t_cum * tl
+        frames.append(frame)
+        t_cum = frame * _axis_angle_rot(axis, q) * tr
+    return t_cum, q_syms, frames
+
+
+def build_jacobian(
+    t_ee: sp.Matrix, axes: List[sp.Matrix], frames: List[sp.Matrix]
+) -> sp.Matrix:
+    """Geometric Jacobian ``[Jv; Jw]`` (6 x N) for the all-revolute ssik chain."""
+    p_e = t_ee[:3, 3]
+    cols = []
+    for axis, frame in zip(axes, frames):
+        r = frame[:3, :3]
+        p_i = frame[:3, 3]
+        z_i = r * axis
+        jv = z_i.cross(p_e - p_i)
+        jw = z_i
+        cols.append(sp.Matrix.vstack(jv, jw))
+    return sp.Matrix.hstack(*cols)
+
+
+# ---------------------------------------------------------------------------
+# URDF inertial properties
+# ---------------------------------------------------------------------------
+
+_PI_MULTIPLE_TOL = 1e-9
+
+
+@dataclass
+class Inertial:
+    """Mass, centre-of-mass pose and inertia tensor of a single URDF link."""
+
+    mass: float
+    com_xyz: Tuple[float, float, float]
+    com_rpy: Tuple[float, float, float]
+    ixx: float
+    ixy: float
+    ixz: float
+    iyy: float
+    iyz: float
+    izz: float
+
+
+@dataclass
+class UrdfJoint:
+    """A single actuated/fixed URDF joint with its child link inertial (if any)."""
+
+    name: str
+    jtype: str
+    parent: str
+    child: str
+    axis: Tuple[float, float, float]
+    child_inertial: Optional[Inertial] = field(default=None)
+
+    @property
+    def actuated(self) -> bool:
+        return self.jtype in ("revolute", "continuous", "prismatic")
+
+
+def _parse_triple(text: Optional[str], default: Tuple[float, float, float]) -> Tuple[float, float, float]:
+    if text is None:
+        return default
+    parts = [float(v) for v in text.split()]
+    if len(parts) != 3:
+        raise ValueError(f"expected 3 values, got {text!r}")
+    return (parts[0], parts[1], parts[2])
+
+
+def _parse_inertials(root: ET.Element) -> Dict[str, Inertial]:
+    """Collect ``<inertial>`` blocks keyed by link name."""
+    out: Dict[str, Inertial] = {}
+    for link in root.findall("link"):
+        name = link.get("name")
+        inertial = link.find("inertial")
+        if name is None or inertial is None:
+            continue
+        mass_el = inertial.find("mass")
+        inertia_el = inertial.find("inertia")
+        if mass_el is None or inertia_el is None:
+            continue
+        origin = inertial.find("origin")
+        com_xyz = _parse_triple(origin.get("xyz") if origin is not None else None, (0.0, 0.0, 0.0))
+        com_rpy = _parse_triple(origin.get("rpy") if origin is not None else None, (0.0, 0.0, 0.0))
+
+        def _i(attr: str, _el: ET.Element = inertia_el) -> float:
+            return float(_el.get(attr, "0"))
+
+        out[name] = Inertial(
+            mass=float(mass_el.get("value", "0")),
+            com_xyz=com_xyz,
+            com_rpy=com_rpy,
+            ixx=_i("ixx"),
+            ixy=_i("ixy"),
+            ixz=_i("ixz"),
+            iyy=_i("iyy"),
+            iyz=_i("iyz"),
+            izz=_i("izz"),
+        )
+    return out
+
+
+def parse_urdf_joints(path: Path) -> List[UrdfJoint]:
+    """Parse the serial joint chain plus each child link's inertial block."""
+    root = ET.parse(path).getroot()
+    inertials = _parse_inertials(root)
+    joints: List[UrdfJoint] = []
+    for j in root.findall("joint"):
+        parent = j.find("parent")
+        child = j.find("child")
+        if parent is None or child is None:
+            raise ValueError(f"joint {j.get('name')!r} missing parent/child")
+        axis_el = j.find("axis")
+        axis = _parse_triple(axis_el.get("xyz") if axis_el is not None else None, (0.0, 0.0, 1.0))
+        child_link = child.get("link")
+        joints.append(
+            UrdfJoint(
+                name=j.get("name", "?"),
+                jtype=j.get("type", "fixed"),
+                parent=parent.get("link"),
+                child=child_link,
+                axis=axis,
+                child_inertial=inertials.get(child_link),
+            )
+        )
+    return joints
+
+
+def order_urdf_chain(
+    joints: List[UrdfJoint],
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+) -> List[UrdfJoint]:
+    """Order URDF joints into the serial base->ee chain.
+
+    The URDF may contain extra side branches; this walks the chain from
+    ``base_link`` to ``ee_link`` (or infers them if not given).
+    """
+    by_parent: Dict[str, List[UrdfJoint]] = {}
+    by_child: Dict[str, UrdfJoint] = {}
+    for jt in joints:
+        by_parent.setdefault(jt.parent, []).append(jt)
+        if jt.child in by_child:
+            raise ValueError(f"URDF has multiple parents for link {jt.child!r}")
+        by_child[jt.child] = jt
+
+    if base_link is None and ee_link is None:
+        children = {jt.child for jt in joints}
+        parents = {jt.parent for jt in joints}
+        roots = [p for p in parents if p not in children]
+        leaves = [c for c in children if c not in parents]
+        if len(roots) != 1 or len(leaves) != 1:
+            raise ValueError(
+                f"cannot infer base/ee links (roots={sorted(roots)}, leaves={sorted(leaves)})"
+            )
+        base_link = roots[0]
+        ee_link = leaves[0]
+
+    if base_link is not None and ee_link is not None:
+        chain: List[UrdfJoint] = []
+        link = base_link
+        visited: set = set()
+        while link != ee_link:
+            if link in visited:
+                raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+            visited.add(link)
+            outgoing = by_parent.get(link)
+            if not outgoing:
+                raise ValueError(f"URDF chain stopped before reaching ee_link at {link!r}")
+            jt = outgoing[0]
+            chain.append(jt)
+            link = jt.child
+        return chain
+
+    if base_link is None:
+        assert ee_link is not None
+        reverse_chain: List[UrdfJoint] = []
+        link = ee_link
+        visited = set()
+        while link in by_child:
+            if link in visited:
+                raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+            visited.add(link)
+            jt = by_child[link]
+            reverse_chain.append(jt)
+            link = jt.parent
+        return list(reversed(reverse_chain))
+
+    link = base_link
+    chain = []
+    visited = set()
+    while True:
+        if link in visited:
+            raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+        visited.add(link)
+        outgoing = by_parent.get(link)
+        if not outgoing:
+            break
+        if len(outgoing) != 1:
+            raise ValueError(f"URDF chain branches or breaks at link {link!r}")
+        jt = outgoing[0]
+        chain.append(jt)
+        link = jt.child
+    return chain
+
+
+def _rpy_to_rot(roll: float, pitch: float, yaw: float) -> sp.Matrix:
+    """URDF fixed-axis RPY: ``R = Rz(yaw) Ry(pitch) Rx(roll)`` (numeric, constant)."""
+
+    def rot_x(a):
+        c, s = sp.Float(np.cos(a), 17), sp.Float(np.sin(a), 17)
+        return sp.Matrix([[1, 0, 0], [0, c, -s], [0, s, c]])
+
+    def rot_y(a):
+        c, s = sp.Float(np.cos(a), 17), sp.Float(np.sin(a), 17)
+        return sp.Matrix([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+    def rot_z(a):
+        c, s = sp.Float(np.cos(a), 17), sp.Float(np.sin(a), 17)
+        return sp.Matrix([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+    return rot_z(yaw) * rot_y(pitch) * rot_x(roll)
+
+
+def _snap_matrix(m: sp.Matrix) -> sp.Matrix:
+    return sp.Matrix(m.rows, m.cols, [_snap(float(v)) for v in m])
+
+
+@dataclass
+class RigidBody:
+    """A massive link: its base->COM symbolic pose plus inertia, ready for energy terms."""
+
+    mass: sp.Expr
+    p_com: sp.Matrix
+    r_inertia: sp.Matrix
+    inertia_local: sp.Matrix
+    n_preceding: int
+
+
+def build_bodies(
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+    t_rights: List[sp.Matrix],
+    q_syms: List[sp.Symbol],
+    urdf_chain: List[UrdfJoint],
+) -> List[RigidBody]:
+    """Pair the artifact's per-joint link frames with the URDF inertial blocks."""
+    actuated = [jt for jt in urdf_chain if jt.actuated]
+    if len(actuated) != len(axes):
+        raise ValueError(
+            f"URDF actuated joints ({len(actuated)}) != artifact DOF ({len(axes)}); "
+            "the URDF chain must match the kinematics artifact."
+        )
+
+    bodies: List[RigidBody] = []
+    for i, (axis, frame, q, jt) in enumerate(zip(axes, frames, q_syms, actuated)):
+        inertial = jt.child_inertial
+        if inertial is None or inertial.mass <= 0.0:
+            continue
+        link_t = frame * _axis_angle_rot(axis, q)
+        r_link = link_t[:3, :3]
+        p_link = link_t[:3, 3]
+        com_local = sp.Matrix([_snap(v) for v in inertial.com_xyz])
+        r_com = _snap_matrix(_rpy_to_rot(*inertial.com_rpy))
+        p_com = p_link + r_link * com_local
+        r_inertia = r_link * r_com
+        inertia_local = _snap_matrix(
+            sp.Matrix(
+                [
+                    [inertial.ixx, inertial.ixy, inertial.ixz],
+                    [inertial.ixy, inertial.iyy, inertial.iyz],
+                    [inertial.ixz, inertial.iyz, inertial.izz],
+                ]
+            )
+        )
+        bodies.append(
+            RigidBody(
+                mass=_snap(inertial.mass),
+                p_com=p_com,
+                r_inertia=r_inertia,
+                inertia_local=inertia_local,
+                n_preceding=i + 1,
+            )
+        )
+    return bodies
+
+
+def build_gravity(
+    bodies: List[RigidBody], q_syms: List[sp.Symbol], gravity_syms: List[sp.Symbol]
+) -> sp.Matrix:
+    """Gravity (holding) torque ``tau_j = dU/dq_j`` from total potential energy."""
+    g_vec = sp.Matrix(gravity_syms)
+    u = sp.Integer(0)
+    for b in bodies:
+        u -= b.mass * (g_vec.dot(b.p_com))
+    n = len(q_syms)
+    tau = sp.Matrix([sp.diff(u, q_syms[j]) for j in range(n)])
+    return tau
+
+
+def _body_jacobians(
+    body: RigidBody, q_syms: List[sp.Symbol], axes: List[sp.Matrix], frames: List[sp.Matrix]
+) -> Tuple[sp.Matrix, sp.Matrix]:
+    """Linear (COM) and angular Jacobians (3xN each) of a single rigid body."""
+    n = len(q_syms)
+    jv = body.p_com.jacobian(sp.Matrix(q_syms))
+    jw_cols = []
+    for j in range(n):
+        if j < body.n_preceding:
+            r = frames[j][:3, :3]
+            jw_cols.append(r * axes[j])
+        else:
+            jw_cols.append(sp.zeros(3, 1))
+    jw = sp.Matrix.hstack(*jw_cols)
+    return jv, jw
+
+
+def build_mass_matrix(
+    bodies: List[RigidBody],
+    q_syms: List[sp.Symbol],
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+) -> sp.Matrix:
+    """Symmetric joint-space inertia matrix ``M(q)`` (NxN) via the energy method."""
+    n = len(q_syms)
+    m = sp.zeros(n, n)
+    for b in bodies:
+        jv, jw = _body_jacobians(b, q_syms, axes, frames)
+        i_world = b.r_inertia * b.inertia_local * b.r_inertia.T
+        m += b.mass * (jv.T * jv) + jw.T * i_world * jw
+    return m
+
+
+def build_coriolis(
+    mass_matrix: sp.Matrix, q_syms: List[sp.Symbol], qd_syms: List[sp.Symbol]
+) -> sp.Matrix:
+    """Coriolis/centrifugal torque ``C(q, qd) qd`` from Christoffel symbols."""
+    n = len(q_syms)
+    tau = sp.zeros(n, 1)
+    for i in range(n):
+        acc = sp.Integer(0)
+        for j in range(n):
+            for k in range(n):
+                c_ijk = sp.Rational(1, 2) * (
+                    sp.diff(mass_matrix[i, j], q_syms[k])
+                    + sp.diff(mass_matrix[i, k], q_syms[j])
+                    - sp.diff(mass_matrix[j, k], q_syms[i])
+                )
+                acc += c_ijk * qd_syms[k] * qd_syms[j]
+        tau[i] = acc
+    return tau
+
+
+@dataclass
+class Dynamics:
+    """Symbolic dynamics terms ready for Rust emission."""
+
+    q_syms: List[sp.Symbol]
+    qd_syms: List[sp.Symbol]
+    qdd_syms: List[sp.Symbol]
+    gravity_syms: List[sp.Symbol]
+    gravity: sp.Matrix
+    mass_matrix: sp.Matrix
+    coriolis: sp.Matrix
+    inverse_dynamics: sp.Matrix
+
+
+def build_dynamics(
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+    t_rights: List[sp.Matrix],
+    q_syms: List[sp.Symbol],
+    urdf_path: Path,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+) -> Dynamics:
+    """Derive gravity / mass-matrix / Coriolis / inverse-dynamics symbolically."""
+    urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path), base_link, ee_link)
+    bodies = build_bodies(axes, frames, t_rights, q_syms, urdf_chain)
+    if not bodies:
+        raise ValueError(
+            f"URDF {urdf_path} has no positive-mass <inertial> blocks on the chain; "
+            "cannot derive dynamics."
+        )
+
+    n = len(q_syms)
+    qd_syms = [sp.Symbol(f"qd{i}") for i in range(n)]
+    qdd_syms = [sp.Symbol(f"qdd{i}") for i in range(n)]
+    gravity_syms = [sp.Symbol(f"g{i}") for i in range(3)]
+
+    grav = build_gravity(bodies, q_syms, gravity_syms)
+    mass = build_mass_matrix(bodies, q_syms, axes, frames)
+    cor = build_coriolis(mass, q_syms, qd_syms)
+    qdd_vec = sp.Matrix(qdd_syms)
+    inv_dyn = mass * qdd_vec + cor + grav
+
+    return Dynamics(
+        q_syms=q_syms,
+        qd_syms=qd_syms,
+        qdd_syms=qdd_syms,
+        gravity_syms=gravity_syms,
+        gravity=grav,
+        mass_matrix=mass,
+        coriolis=cor,
+        inverse_dynamics=inv_dyn,
+    )
+
+
+# ---------------------------------------------------------------------------
+# no_std Rust printer
+# ---------------------------------------------------------------------------
+
+
+class NoStdRustPrinter(_RustCodePrinterBase):
+    """Rust printer that targets ``#![no_std]`` + ``libm`` instead of ``std``."""
+
+    _LIBM = {
+        "sin": "libm::sin",
+        "cos": "libm::cos",
+        "tan": "libm::tan",
+        "asin": "libm::asin",
+        "acos": "libm::acos",
+        "atan": "libm::atan",
+        "atan2": "libm::atan2",
+        "sinh": "libm::sinh",
+        "cosh": "libm::cosh",
+        "tanh": "libm::tanh",
+        "exp": "libm::exp",
+        "log": "libm::log",
+        "sqrt": "libm::sqrt",
+        "Abs": "libm::fabs",
+    }
+
+    def _print_Function(self, expr):  # noqa: N802
+        name = expr.func.__name__
+        if name in self._LIBM:
+            args = ", ".join(self._print(a) for a in expr.args)
+            return f"{self._LIBM[name]}({args})"
+        return super()._print_Function(expr)
+
+    def _print_Abs(self, expr):  # noqa: N802
+        return f"libm::fabs({self._print(expr.args[0])})"
+
+    def _print_Integer(self, expr):  # noqa: N802
+        return f"{int(expr)}.0"
+
+    def _print_Rational(self, expr):  # noqa: N802
+        return f"({int(expr.p)}.0 / {int(expr.q)}.0)"
+
+    def _print_Pow(self, expr):  # noqa: N802
+        base = self._print(expr.base)
+        exp = expr.exp
+        if exp == sp.Rational(1, 2):
+            return f"libm::sqrt({base})"
+        if exp == sp.Rational(-1, 2):
+            return f"(1.0 / libm::sqrt({base}))"
+        if exp.is_Integer:
+            n = int(exp)
+            if n == 0:
+                return "1.0"
+            if 1 <= n <= 8:
+                return "(" + " * ".join([base] * n) + ")"
+            if -8 <= n <= -1:
+                return "(1.0 / (" + " * ".join([base] * (-n)) + "))"
+        return f"libm::pow({base}, {self._print(expr.exp)})"
+
+
+def rust_literal(expr: sp.Expr, printer: NoStdRustPrinter) -> str:
+    return printer.doprint(expr)
+
+
+# ---------------------------------------------------------------------------
+# Rust emission
+# ---------------------------------------------------------------------------
+
+
+def _emit_matrix(
+    name: str,
+    matrix: sp.Matrix,
+    printer: NoStdRustPrinter,
+    rows: int,
+    cols: int,
+) -> List[str]:
+    lines = [f"    let {name}: [[f64; {cols}]; {rows}] = ["]
+    flat = list(matrix)
+    for i in range(rows):
+        row_exprs = [rust_literal(flat[i * cols + j], printer) for j in range(cols)]
+        lines.append("        [" + ", ".join(row_exprs) + "],")
+    lines.append("    ];")
+    return lines
+
+
+def _emit_vector(
+    name: str,
+    vector: sp.Matrix,
+    printer: NoStdRustPrinter,
+    n: int,
+) -> List[str]:
+    exprs = [rust_literal(vector[i], printer) for i in range(n)]
+    return [f"    let {name}: [f64; {n}] = [" + ", ".join(exprs) + "];"]
+
+
+def _unpack_array(name: str, syms: List[sp.Symbol], printer: NoStdRustPrinter) -> List[str]:
+    return [f"    let {printer.doprint(s)} = {name}[{i}];" for i, s in enumerate(syms)]
+
+
+def _unpack_q(q_syms: List[sp.Symbol], printer: NoStdRustPrinter) -> List[str]:
+    return _unpack_array("q", q_syms, printer)
+
+
+def _emit_cse(replacements, printer: NoStdRustPrinter) -> List[str]:
+    return [
+        f"    let {printer.doprint(sym)} = {rust_literal(sub, printer)};"
+        for sym, sub in replacements
+    ]
+
+
+def _emit_fn_matrix(
+    out: List[str],
+    signature: str,
+    ret_name: str,
+    rows: int,
+    cols: int,
+    matrix: sp.Matrix,
+    arg_unpacks: List[str],
+    printer: NoStdRustPrinter,
+) -> None:
+    repls, reduced = sp.cse(list(matrix), optimizations="basic")
+    reduced_mat = sp.Matrix(rows, cols, reduced)
+    out.append(signature)
+    out.extend(arg_unpacks)
+    out.extend(_emit_cse(repls, printer))
+    out.extend(_emit_matrix(ret_name, reduced_mat, printer, rows, cols))
+    out.append(f"    {ret_name}")
+    out.append("}")
+    out.append("")
+
+
+def _emit_fn_vector(
+    out: List[str],
+    signature: str,
+    ret_name: str,
+    n: int,
+    vector: sp.Matrix,
+    arg_unpacks: List[str],
+    printer: NoStdRustPrinter,
+) -> None:
+    repls, reduced = sp.cse(list(vector), optimizations="basic")
+    reduced_vec = sp.Matrix(reduced)
+    out.append(signature)
+    out.extend(arg_unpacks)
+    out.extend(_emit_cse(repls, printer))
+    out.extend(_emit_vector(ret_name, reduced_vec, printer, n))
+    out.append(f"    {ret_name}")
+    out.append("}")
+    out.append("")
+
+
+def generate_rust(
+    arm: str,
+    n: int,
+    t_ee: sp.Matrix,
+    jac: sp.Matrix,
+    q_syms: List[sp.Symbol],
+    script_name: str,
+    dynamics: Optional[Dynamics] = None,
+) -> str:
+    """Emit ``#![no_std]`` Rust for FK, geometric Jacobian and (optionally) dynamics."""
+    printer = NoStdRustPrinter({"contract": False})
+
+    out: List[str] = []
+    kind = "dynamics" if dynamics is not None else "kinematics"
+    out.append(f"//! Auto-generated symbolic {kind} for the {arm} ({n}-DOF).")
+    out.append("//!")
+    if dynamics is not None:
+        out.append("//! Forward kinematics, the geometric Jacobian and the inverse")
+        out.append("//! dynamics (gravity, mass matrix, Coriolis), derived")
+    else:
+        out.append("//! Forward kinematics and the geometric Jacobian, derived")
+    out.append("//! symbolically from the ssik artifact with SymPy and emitted as")
+    out.append(f"//! pure `#![no_std]` Rust. Regenerate with `{script_name}`.")
+    out.append("//!")
+    out.append("//! Do not edit by hand. Every transcendental is a `libm` call and")
+    out.append("//! every output is a fixed-size array: no heap, no branches, no loops.")
+    out.append("")
+    out.append("#![allow(clippy::all)]")
+    out.append("#![allow(unused_parens)]")
+    out.append("#![allow(unused_variables)]")
+    out.append("#![allow(dead_code)]")
+    out.append("")
+    out.append(f"/// Degrees of freedom of the {arm}.")
+    out.append(f"pub const DOF: usize = {n};")
+    out.append("")
+
+    out.append("/// Forward kinematics: base -> end-effector SE(3) pose.")
+    out.append("///")
+    out.append("/// Returns the 4x4 homogeneous transform as a row-major array.")
+    _emit_fn_matrix(
+        out,
+        f"pub fn fk(q: &[f64; {n}]) -> [[f64; 4]; 4] {{",
+        "m",
+        4,
+        4,
+        t_ee,
+        _unpack_q(q_syms, printer),
+        printer,
+    )
+
+    out.append("/// Geometric Jacobian `[Jv; Jw]` (6 x DOF) of the end-effector.")
+    out.append("///")
+    out.append("/// Rows 0-2 are linear velocity, rows 3-5 are angular velocity.")
+    _emit_fn_matrix(
+        out,
+        f"pub fn jacobian(q: &[f64; {n}]) -> [[f64; {n}]; 6] {{",
+        "j",
+        6,
+        n,
+        jac,
+        _unpack_q(q_syms, printer),
+        printer,
+    )
+
+    if dynamics is not None:
+        _emit_dynamics(out, n, dynamics, printer)
+
+    return "\n".join(out)
+
+
+def _emit_dynamics(
+    out: List[str], n: int, dyn: Dynamics, printer: NoStdRustPrinter
+) -> None:
+    q_unpack = _unpack_q(dyn.q_syms, printer)
+    gravity_unpack = _unpack_array("gravity", dyn.gravity_syms, printer)
+    qd_unpack = _unpack_array("qd", dyn.qd_syms, printer)
+    qdd_unpack = _unpack_array("qdd", dyn.qdd_syms, printer)
+
+    out.append("/// Gravity (holding) torque `tau = dU/dq` for each joint.")
+    out.append("///")
+    out.append("/// Derived from the total potential energy of the link masses.")
+    _emit_fn_vector(
+        out,
+        f"pub fn gravity(q: &[f64; {n}], gravity: &[f64; 3]) -> [f64; {n}] {{",
+        "g",
+        n,
+        dyn.gravity,
+        q_unpack + gravity_unpack,
+        printer,
+    )
+
+    out.append("/// Joint-space inertia (mass) matrix `M(q)` (symmetric, DOF x DOF).")
+    _emit_fn_matrix(
+        out,
+        f"pub fn mass_matrix(q: &[f64; {n}]) -> [[f64; {n}]; {n}] {{",
+        "mm",
+        n,
+        n,
+        dyn.mass_matrix,
+        q_unpack,
+        printer,
+    )
+
+    out.append("/// Coriolis & centrifugal torque `C(q, qd) qd` for each joint.")
+    _emit_fn_vector(
+        out,
+        f"pub fn coriolis(q: &[f64; {n}], qd: &[f64; {n}]) -> [f64; {n}] {{",
+        "c",
+        n,
+        dyn.coriolis,
+        q_unpack + qd_unpack,
+        printer,
+    )
+
+    out.append("/// Inverse dynamics torque `tau = M(q) qdd + C(q, qd) qd + g(q)`.")
+    out.append("///")
+    out.append("/// MIT-mode feed-forward torque for a desired joint acceleration.")
+    _emit_fn_vector(
+        out,
+        f"pub fn inverse_dynamics(q: &[f64; {n}], qd: &[f64; {n}], qdd: &[f64; {n}], gravity: &[f64; 3]) "
+        f"-> [f64; {n}] {{",
+        "tau",
+        n,
+        dyn.inverse_dynamics,
+        q_unpack + qd_unpack + qdd_unpack + gravity_unpack,
+        printer,
+    )
+
+
+def _run_generate_dynamics_core(
+    crate_root: Path,
+    arm: str,
+    urdf: Optional[Path] = None,
+) -> Tuple[bool, str]:
+    """Core dynamics compiler: load ssik artifact, derive FK/dynamics, emit Rust."""
+    if not _HAS_DYNAMICS_DEPS:
+        return False, (
+            "sympy and numpy are required for dynamics compilation. "
+            "Install them with: pip install sympy numpy"
+        )
+
+    driver = _driver_dir(crate_root, arm)
+    artifact_path = driver / f"{arm}_ik.py"
+    if not artifact_path.is_file():
+        return False, f"missing ssik artifact for dynamics: {artifact_path}"
+
+    try:
+        mod = load_artifact(str(artifact_path))
+        t_lefts, axes, t_rights, n = extract_chain(mod)
+    except (ImportError, ValueError) as exc:
+        return False, f"[generate_dynamics] ERROR: {exc}"
+
+    base_link, ee_link = extract_base_ee_links(mod)
+    print(f"[generate_dynamics] {arm}: {n} DOF from ssik artifact {artifact_path.name!r}", file=sys.stderr)
+
+    t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
+    jac = build_jacobian(t_ee, axes, frames)
+
+    dynamics = None
+    effective_urdf = urdf if (urdf is not None and urdf.is_file()) else None
+    if effective_urdf is not None:
+        try:
+            dynamics = build_dynamics(axes, frames, t_rights, q_syms, effective_urdf, base_link, ee_link)
+        except ValueError as exc:
+            return False, f"[generate_dynamics] ERROR: {exc}"
+        print(
+            f"[generate_dynamics] {arm}: dynamics from {effective_urdf} "
+            f"(runtime gravity, base={base_link!r}, ee={ee_link!r})",
+            file=sys.stderr,
+        )
+
+    rust = generate_rust(arm, n, t_ee, jac, q_syms, "dexforge build", dynamics)
+
+    output = driver / "generated_kinematics.rs"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(rust, encoding="utf-8")
+    print(f"[generate_dynamics] wrote {output}", file=sys.stderr)
+    return True, ""
+
+
+def _run_ik_generator_core(
+    urdf: Optional[Path],
+    base_link: Optional[str],
+    ee_link: Optional[str],
+    output_dir: Path,
+    repo_root: Path,
+    max_retries: int = _MAX_RETRIES,
+    llm_key: Optional[str] = None,
+    llm_url: Optional[str] = None,
+    llm_model: Optional[str] = None,
+) -> tuple:
+    """Core IK generator logic, without argument parsing.
+
+    Generates (or loads) a per-arm ssik artifact from a URDF, translates it
+    into deterministic ``#![no_std]`` Rust via an LLM API, runs the companion
+    Python helper scripts, then builds and tests the Rust crate. Build/test
+    failures are fed back to the LLM so it can correct the code automatically.
+
+    :param urdf: Path to the source URDF file (required).
+    :param base_link: Base link name in the URDF (required).
+    :param ee_link: End-effector link name in the URDF (required).
+    :param output_dir: Working directory for the Python artifact and context dump.
+    :param repo_root: dexforge source tree root (provides kernels and driver paths).
+    :param max_retries: Number of LLM retry attempts after the initial attempt.
+    :param llm_key: LLM API key (overrides DEXFORGE_LLM_KEY env var).
+    :param llm_url: LLM base URL (overrides DEXFORGE_LLM_BASE_URL env var).
+    :param llm_model: LLM model name (overrides DEXFORGE_LLM_MODEL env var).
+    :returns: ``(success, arm_name, error_message)``.  On success *error_message*
+        is an empty string; progress is printed to stdout during execution.
+    """
+    # Lazy imports: these depend on ssik, openai, etc. which are not always
+    # installed in environments that only need the export/packaging features.
+    try:
+        from ik_build import (
+            build_rust_crate,
+            parse_llm_output,
+            run_py_scripts,
+            test_rust_crate,
+            write_generated_files,
+        )
+        from ik_llm import IKGeneratorLLM
+        from ik_prompt import (
+            assemble_context,
+            find_best_example,
+            generate_artifact_from_urdf,
+            _get_locked_ssik_version,
+            _verify_ssik_version,
+        )
+    except ImportError:
+        from codegen.ik_build import (  # type: ignore[no-redef]
+            build_rust_crate,
+            parse_llm_output,
+            run_py_scripts,
+            test_rust_crate,
+            write_generated_files,
+        )
+        from codegen.ik_llm import IKGeneratorLLM  # type: ignore[no-redef]
+        from codegen.ik_prompt import (  # type: ignore[no-redef]
+            assemble_context,
+            find_best_example,
+            generate_artifact_from_urdf,
+            _get_locked_ssik_version,
+            _verify_ssik_version,
+        )
+
+    arm = urdf.stem if urdf is not None else ""
+
+    # --- Check locked ssik version ---
+    try:
+        locked_version = _get_locked_ssik_version()
+        print(f"[ik_generator] Locked ssik version: {locked_version}")
+        _verify_ssik_version()
+        print("[ik_generator] ✓ ssik version verified")
+    except (ImportError, FileNotFoundError) as exc:
+        return False, arm, str(exc)
+
+    # --- Step 0: Generate artifact from URDF ---
+    print("[ik_generator] Step 0: Loading Python artifact …")
+    try:
+        if not base_link or not ee_link:
+            return False, arm, "--urdf requires both --base and --ee to be specified."
+        target_py_code, artifact_stem = generate_artifact_from_urdf(
+            urdf, base_link, ee_link, output_dir
+        )
+        print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
+    except (ImportError, FileNotFoundError, RuntimeError) as exc:
+        return False, arm, str(exc)
+
+    arm_name = artifact_stem.removesuffix("_ik")
+    arm = arm_name
+
+    # --- Step 1: Detect kinematic family ---
+    print("[ik_generator] Step 1: Detecting kinematic family …")
+    try:
+        example_arm, max_solutions = find_best_example(target_py_code)
+    except ValueError as exc:
+        return False, arm, str(exc)
+    print(
+        f"[ik_generator]   → example arm: '{example_arm}', "
+        f"MAX_SOLUTIONS = {max_solutions}"
+    )
+
+    # Fall back gracefully when the chosen example arm has no Rust driver yet.
+    rs_example = _driver_dir(repo_root, example_arm) / "ik_solver.rs"
+    if not rs_example.exists():
+        fallback = "franka_panda"
+        fallback_path = _driver_dir(repo_root, fallback) / "ik_solver.rs"
+        if fallback_path.exists():
+            print(
+                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
+                f"falling back to '{fallback}' as structural template."
+            )
+            example_arm = fallback
+        else:
+            print(
+                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
+                "or fallback 'franka_panda'. The one-shot example will be empty.",
+                file=sys.stderr,
+            )
+
+    # --- Step 3: Assemble context ---
+    print("[ik_generator] Step 3: Assembling context …")
+    try:
+        context = assemble_context(
+            target_py_code, arm_name, example_arm, max_solutions, repo_root
+        )
+    except FileNotFoundError as exc:
+        return False, arm, str(exc)
+    print(f"[ik_generator]   Context assembled ({len(context):,} chars).")
+
+    # --- Step 4: Invoke LLM with retry loop ---
+    print("[ik_generator] Step 4: Invoking LLM …")
+    try:
+        llm = IKGeneratorLLM(
+            api_key=llm_key,
+            base_url=llm_url,
+            model=llm_model,
+        )
+    except ImportError as exc:
+        return False, arm, str(exc)
+
+    messages: list = [
+        {"role": "system", "content": IKGeneratorLLM.SYSTEM_PROMPT},
+        {"role": "user", "content": context},
+    ]
+
+    max_attempts = max_retries + 1
+
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            print(f"[ik_generator]   Retry {attempt}/{max_retries} …")
+
+        try:
+            raw_response = llm.generate(messages)
+        except Exception as exc:  # noqa: BLE001 — surface all API errors
+            return False, arm, f"LLM error ({type(exc).__name__}): {exc}"
+
+        print(f"[ik_generator]   LLM response: {len(raw_response):,} chars.")
+
+        # --- Step 5: Parse multi-file output ---
+        try:
+            files = parse_llm_output(raw_response)
+        except ValueError as exc:
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your output did not follow the required '=== FILE: <name> ===' "
+                        "separator format. Please regenerate all files using the exact "
+                        "output format specified in the prompt."
+                    ),
+                })
+                continue
+            return False, arm, f"Parse error: {exc}"
+
+        print(
+            f"[ik_generator]   Parsed {len(files)} file(s): "
+            + ", ".join(files.keys())
+        )
+
+        # --- Step 6: Write generated files ---
+        print("[ik_generator] Step 6: Writing generated files …")
+        written = write_generated_files(
+            output_dir,
+            repo_root,
+            arm_name,
+            files,
+            target_py_code,
+            context,
+            urdf,
+        )
+
+        # --- Step 7: Run Python helper scripts ---
+        print("[ik_generator] Step 7: Running Python helper scripts …")
+        script_failures = run_py_scripts(written, output_dir)
+
+        if script_failures:
+            failure_details = "\n\n".join(
+                f"Script '{name}' failed with:\n{err}"
+                for name, err in script_failures
+            )
+            error_msg = (
+                f"The following Python helper script(s) failed to run:\n\n"
+                f"{failure_details}\n\n"
+                "Please fix the errors and regenerate all files."
+            )
+            print("[ik_generator]   Script failures detected.")
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({"role": "user", "content": error_msg})
+                continue
+            return False, arm, f"Script failures after all retries.\n{failure_details}"
+
+        # --- Step 8: Build the Rust crate ---
+        print("[ik_generator] Step 8: Building Rust crate …")
+        build_ok, build_output = build_rust_crate(output_dir)
+        if not build_ok:
+            error_msg = (
+                f"cargo build failed with the following errors:\n\n{build_output}\n\n"
+                "Please fix the Rust code and regenerate all files."
+            )
+            print("[ik_generator]   Build failed.")
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({"role": "user", "content": error_msg})
+                continue
+            return False, arm, f"Build failed after all retries.\n{build_output}"
+        print("[ik_generator]   Build succeeded.")
+
+        # --- Step 9: Run Rust tests ---
+        print("[ik_generator] Step 9: Running Rust tests …")
+        test_ok, test_output = test_rust_crate(output_dir)
+        if not test_ok:
+            error_msg = (
+                f"cargo test failed with the following output:\n\n{test_output}\n\n"
+                "Please fix the Rust code and regenerate all files."
+            )
+            print("[ik_generator]   Tests failed.")
+            if attempt < max_attempts - 1:
+                messages.append({"role": "assistant", "content": raw_response})
+                messages.append({"role": "user", "content": error_msg})
+                continue
+            return False, arm, f"Tests failed after all retries.\n{test_output}"
+        print("[ik_generator]   All tests passed.")
+
+        # All steps succeeded.
+        break
+
+    return True, arm, ""
+
+
 def generate_driver_from_urdf(
     urdf: Path,
     base_link: str,
     ee_link: str,
     repo_root: Path,
+    output_root: Path,
     llm_options: Optional[Dict[str, str]] = None,
 ) -> tuple:
-    """Translate a URDF into an in-repo driver via the LLM code generator.
+    """Translate a URDF into a generated driver crate via the LLM code generator.
 
-    Drives ``codegen/ik_generator.py`` (which generates a ssik artifact from the
-    URDF, calls the LLM to translate it into ``#![no_std]`` Rust, then builds and
-    tests the result) so the driver lands under ``src/drivers/<arm>/`` and can be
-    exported as a stand-alone crate. The arm name is derived from the URDF stem.
+    Generates a ssik artifact from the URDF, calls the LLM to translate it into
+    ``#![no_std]`` Rust, then builds and tests the generated crate in-place.
+    The arm name is derived from the URDF stem.
 
     :param urdf: Path to the source URDF file.
     :param base_link: Base link name passed to the generator.
     :param ee_link: End-effector link name passed to the generator.
-    :param repo_root: dexforge source tree (provides the generator + kernels).
-    :param llm_options: Optional ``{key,url,model,max_retries}`` overrides passed
-        through to the generator (otherwise its env-var defaults apply).
+    :param repo_root: dexforge source tree (provides source inputs for examples
+        and the locked ssik version).
+    :param output_root: Generated crate root directory.
+    :param llm_options: Optional ``{key,url,model,max_retries}`` overrides
+        (otherwise env-var defaults apply).
     :returns: ``(success, arm_name, combined_output)``.
     """
-    generator = repo_root / "codegen" / "ik_generator.py"
-    if not generator.is_file():
-        return False, urdf.stem, f"missing code generator: {generator}"
-
-    arm = urdf.stem
     llm_options = llm_options or {}
-    with tempfile.TemporaryDirectory(prefix="dexforge_build_") as work:
-        cmd = [
-            sys.executable,
-            str(generator),
-            "--urdf",
-            str(urdf.resolve()),
-            "--base",
-            base_link,
-            "--ee",
-            ee_link,
-            "--output-dir",
-            work,
-        ]
-        for flag, key in (
-            ("--llm-key", "key"),
-            ("--llm-url", "url"),
-            ("--llm-model", "model"),
-            ("--max-retries", "max_retries"),
-        ):
-            value = llm_options.get(key)
-            if value is not None:
-                cmd += [flag, str(value)]
-
-        # The generator imports its sibling modules (ik_build, ik_llm, …) by
-        # bare name, so it must run with codegen/ on the path; invoking it as a
-        # subprocess from there keeps it self-contained.
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            filter(None, [str(generator.parent), env.get("PYTHONPATH", "")])
-        )
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            env=env,
-        )
-    return result.returncode == 0, arm, (result.stderr + result.stdout).strip()
+    ok, arm, err = _run_ik_generator_core(
+        urdf=urdf,
+        base_link=base_link,
+        ee_link=ee_link,
+        output_dir=output_root,
+        repo_root=repo_root,
+        max_retries=int(llm_options.get("max_retries", _MAX_RETRIES)),
+        llm_key=llm_options.get("key"),
+        llm_url=llm_options.get("url"),
+        llm_model=llm_options.get("model"),
+    )
+    return ok, arm, err
 
 
 def generate_dynamics_for_arm(
     arm: str,
     urdf: Optional[Path],
-    repo_root: Path,
+    crate_root: Path,
 ) -> tuple:
-    """Compile the arm's full rigid-body kinematics + dynamics in-repo.
+    """Compile the arm's full rigid-body kinematics + dynamics in the crate root.
 
     dexforge is a rigid-body dynamics compiler, not just an IK one: after the
-    LLM produces the IK driver, this drives ``codegen/generate_dynamics.py``
-    against the driver's ssik artifact (under ``src/drivers/<arm>/<arm>_ik.py``)
-    to derive — symbolically with SymPy — the exact forward kinematics and
-    geometric Jacobian, emitted as ``#![no_std]`` Rust at
-    ``src/drivers/<arm>/generated_kinematics.rs`` (the module the IK solver's FK
-    delegates to). When *urdf* carries ``<inertial>`` blocks, the same pass also
-    emits gravity / mass-matrix / Coriolis / inverse-dynamics so the exported
-    crate ships the complete kinematics **and** dynamics suite.
+    LLM produces the IK driver, this calls the built-in symbolic dynamics compiler
+    against the driver's ssik artifact to derive — symbolically with SymPy —
+    the exact forward kinematics and geometric Jacobian, emitted as ``#![no_std]``
+    Rust in the generated crate. When *urdf* carries ``<inertial>`` blocks, the
+    same pass also emits gravity / mass-matrix / Coriolis / inverse-dynamics so
+    the crate ships the complete kinematics **and** dynamics suite.
 
-    :param arm: Arm name whose in-repo driver was just generated.
+    :param arm: Arm name whose driver was just generated.
     :param urdf: Source URDF (supplies link masses/inertias for dynamics); the
         dynamics functions are emitted only when it carries ``<inertial>`` data.
-    :param repo_root: dexforge source tree (provides the dynamics compiler).
+    :param crate_root: Generated crate root directory.
     :returns: ``(success, combined_output)``.
     """
-    script = repo_root / "codegen" / "generate_dynamics.py"
-    if not script.is_file():
-        return False, f"missing dynamics compiler: {script}"
-
-    artifact = repo_root / "src" / "drivers" / arm / f"{arm}_ik.py"
-    if not artifact.is_file():
-        return False, f"missing ssik artifact for dynamics: {artifact}"
-
-    output = repo_root / "src" / "drivers" / arm / "generated_kinematics.rs"
-    cmd = [
-        sys.executable,
-        str(script),
-        "--artifact",
-        str(artifact),
-        "--arm",
-        arm,
-        "--output",
-        str(output),
-    ]
-    if urdf is not None and urdf.is_file():
-        cmd += ["--urdf", str(urdf.resolve())]
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=str(repo_root),
-    )
-    return result.returncode == 0, (result.stderr + result.stdout).strip()
+    return _run_generate_dynamics_core(crate_root, arm, urdf)
 
 
 def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
@@ -415,7 +1507,7 @@ def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
 
 
 def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> int:
-    """Handle ``dexforge build --urdf``: translate a URDF, then export the crate."""
+    """Handle ``dexforge build --urdf``: translate a URDF, then verify the crate."""
     urdf = Path(args.urdf)
     if not urdf.is_file():
         print(f"[dexforge] ERROR: URDF file not found: {urdf}", file=sys.stderr)
@@ -428,9 +1520,15 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         )
         return 2
 
+    if args.list:
+        print("[dexforge] compile plan (1 crate):")
+        print(f"  {urdf.stem} -> {base}")
+        print("      generated in-place in the requested output directory")
+        return 0
+
     print(f"[dexforge] translating {urdf.name} into an IK driver via the LLM …")
     ok, arm, output = generate_driver_from_urdf(
-        urdf, args.base, args.ee, repo_root, _llm_options(args)
+        urdf, args.base, args.ee, repo_root, base, _llm_options(args)
     )
     if not ok:
         print(
@@ -438,22 +1536,30 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
             file=sys.stderr,
         )
         return 1
-    print(f"[dexforge]   \u2713 generated '{arm}' driver under src/drivers/{arm}/.")
+    print(f"[dexforge]   \u2713 generated '{arm}' driver under {base}.")
 
     print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
-    ok, output = generate_dynamics_for_arm(arm, urdf, repo_root)
+    ok, output = generate_dynamics_for_arm(arm, urdf, base)
     if not ok:
         print(
             f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
             file=sys.stderr,
         )
         return 1
-    print(
-        f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under "
-        f"src/drivers/{arm}/."
-    )
+    print(f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under {base}.")
 
-    return _export_arm(arm, repo_root, base, args)
+    if args.verify:
+        print("[dexforge]   verifying standalone build (cargo build --release) …")
+        ok, output = verify_crate(base)
+        if not ok:
+            print(f"[dexforge]   \u2717 {arm} failed to build:\n{output}", file=sys.stderr)
+            return 1
+        print(f"[dexforge]   \u2713 {arm} builds standalone.")
+    else:
+        print(f"[dexforge]   \u2713 {arm} compiled (build not verified).")
+
+    print(f"[dexforge] done: standalone driver crate under {base}.")
+    return 0
 
 
 def _export_arm(
@@ -508,17 +1614,6 @@ def _build(args: argparse.Namespace) -> int:
 
     base = Path(args.output).resolve()
 
-    # The whole point is to emit a driver *outside* dexforge; refuse to scribble
-    # generated crates back into the source tree.
-    if _is_within(base, repo_root):
-        print(
-            f"[dexforge] ERROR: --output {base} is inside the dexforge repository "
-            f"({repo_root}). Choose a directory outside the repo: the generated "
-            f"driver is meant to be self-contained.",
-            file=sys.stderr,
-        )
-        return 2
-
     # End-to-end path: compile a driver straight from a URDF via the LLM.
     return _build_from_urdf(args, repo_root, base)
 
@@ -533,10 +1628,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_p = subparsers.add_parser(
         "build",
-        help="Compile a stand-alone kinematics + dynamics driver crate (outside the dexforge repo).",
+        help="Compile a stand-alone kinematics + dynamics driver crate.",
         description=(
             "Compile an arm's full rigid-body kinematics and dynamics into a "
-            "self-contained Rust crate written outside the dexforge repository. "
+            "self-contained Rust crate rooted at the requested output directory. "
             "Point it at a URDF (--urdf, with --base and --ee) to translate new "
             "hardware end-to-end: an LLM translates the analytical IK and the "
             "symbolic compiler derives FK, the Jacobian and (from the URDF's "
@@ -549,10 +1644,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         required=True,
         metavar="DIR",
-        help=(
-            "Target directory for the generated crate. Must be outside the "
-            "dexforge repository."
-        ),
+        help="Target directory for the generated crate.",
     )
     build_p.add_argument(
         "--urdf",

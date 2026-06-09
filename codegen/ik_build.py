@@ -9,8 +9,8 @@ This module handles:
 
 from __future__ import annotations
 
-import shutil
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -68,32 +68,85 @@ def parse_llm_output(llm_response: str) -> dict[str, str]:
     return files
 
 
-def _update_drivers_mod(arm_name: str) -> None:
-    """Add the new arm module declaration to ``src/drivers/mod.rs`` if absent.
+def _driver_dir(root: Path, arm_name: str) -> Path:
+    """Return the driver directory rooted at *root* for *arm_name*."""
+    return root / "src" / "drivers" / arm_name
 
-    :param arm_name: Clean arm name (e.g. ``"ur5"``, ``"my_arm"``).
-    """
-    mod_path = _REPO_ROOT / "src" / "drivers" / "mod.rs"
-    if not mod_path.exists():
-        return
-    content = mod_path.read_text(encoding="utf-8")
+
+def _math_dir(root: Path) -> Path:
+    """Return the math kernel directory rooted at *root*."""
+    return root / "src" / "math"
+
+
+def _copy_math_kernels(repo_root: Path, output_root: Path) -> None:
+    """Copy the shared math kernels into the generated crate tree."""
+    src = _math_dir(repo_root)
+    dst = _math_dir(output_root)
+    if not src.is_dir():
+        raise FileNotFoundError(f"missing math kernels: {src}")
+    dst.mkdir(parents=True, exist_ok=True)
+    for rs in sorted(src.glob("*.rs")):
+        shutil.copyfile(rs, dst / rs.name)
+
+
+def _cargo_toml(crate_name: str, arm_name: str) -> str:
+    """Render the generated crate's Cargo manifest."""
+    return f"""\
+[package]
+name = "{crate_name}"
+version = "0.1.0"
+edition = "2021"
+description = "Stand-alone analytical IK driver for the {arm_name} arm, compiled by dexforge."
+license = "BSD-3-Clause"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+"""
+
+
+def _lib_rs(arm_name: str) -> str:
+    """Render the generated crate's src/lib.rs."""
+    return f"""\
+#![no_std]
+#![forbid(unsafe_code)]
+
+pub mod drivers;
+pub mod math;
+
+pub use drivers::{arm_name}::ik_solver::{{fk, solve, TolerancePolicy}};
+pub use drivers::{arm_name}::generated_kinematics;
+"""
+
+
+def _update_drivers_mod(output_root: Path, arm_name: str) -> None:
+    """Add the new arm module declaration to the generated crate if absent."""
+    mod_path = output_root / "src" / "drivers" / "mod.rs"
+    mod_path.parent.mkdir(parents=True, exist_ok=True)
     declaration = f"pub mod {arm_name};"
+    if mod_path.exists():
+        content = mod_path.read_text(encoding="utf-8")
+    else:
+        content = ""
     if declaration not in content:
-        content = content.rstrip() + "\n" + declaration + "\n"
+        content = content.rstrip() + ("\n" if content.strip() else "") + declaration + "\n"
         mod_path.write_text(content, encoding="utf-8")
-        print(f"[ik_generator]   Added '{declaration}' to {mod_path.relative_to(_REPO_ROOT)}")
+        print(f"[ik_generator]   Added '{declaration}' to {mod_path.relative_to(output_root)}")
 
 
-def _ensure_arm_mod_rs(arm_name: str, rust_files: list[str]) -> None:
-    """Create ``src/drivers/{arm_name}/mod.rs`` if missing.
-
-    Declares ``ik_solver`` as public and any other ``.rs`` files (except
-    ``mod.rs`` and ``test_data.rs``) as private modules.
-
-    :param arm_name: Clean arm name.
-    :param rust_files: List of Rust filenames written to the driver directory.
-    """
-    mod_path = _REPO_ROOT / "src" / "drivers" / arm_name / "mod.rs"
+def _ensure_arm_mod_rs(output_root: Path, arm_name: str, rust_files: list[str]) -> None:
+    """Create the arm module file in the generated crate if missing."""
+    mod_path = _driver_dir(output_root, arm_name) / "mod.rs"
+    mod_path.parent.mkdir(parents=True, exist_ok=True)
     if mod_path.exists():
         return  # Don't overwrite an existing mod.rs
 
@@ -106,9 +159,7 @@ def _ensure_arm_mod_rs(arm_name: str, rust_files: list[str]) -> None:
             continue
         lines.append(f"mod {stem};")
     mod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(
-        f"[ik_generator]   Created {mod_path.relative_to(_REPO_ROOT)}"
-    )
+    print(f"[ik_generator]   Created {mod_path.relative_to(output_root)}")
 
 
 def copy_driver_provenance(
@@ -137,6 +188,7 @@ def copy_driver_provenance(
 
 def write_generated_files(
     output_dir: Path,
+    repo_root: Path,
     arm_name: str,
     files: dict[str, str],
     target_py_code: str,
@@ -145,12 +197,13 @@ def write_generated_files(
 ) -> dict[str, Path]:
     """Write all LLM-generated files to the appropriate locations.
 
-    * ``*.rs`` files → ``src/drivers/{arm_name}/``
+    * ``*.rs`` files → the generated crate's driver directory
     * The original Python artifact (and URDF, when available) → the driver dir
-    * ``generate_*.py`` files → ``codegen/``
+    * ``generate_*.py`` files → ``codegen/`` inside the generated crate
     * The original Python artifact and context dump → *output_dir*
 
-    :param output_dir: Working output directory for the artifact and context.
+    :param output_dir: Generated crate root directory.
+    :param repo_root: dexforge source tree (provides the shared math kernels).
     :param arm_name: Clean arm name (e.g. ``"my_arm"``).
     :param files: Parsed ``{filename: content}`` from :func:`parse_llm_output`.
     :param target_py_code: Source of the target Python artifact.
@@ -158,8 +211,18 @@ def write_generated_files(
     :returns: Mapping of logical name → written :class:`Path`.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    _copy_math_kernels(repo_root, output_dir)
 
-    driver_dir = _REPO_ROOT / "src" / "drivers" / arm_name
+    cargo_path = output_dir / "Cargo.toml"
+    if not cargo_path.exists():
+        cargo_path.write_text(_cargo_toml(f"{arm_name}_ik_driver", arm_name), encoding="utf-8")
+
+    lib_path = output_dir / "src" / "lib.rs"
+    if not lib_path.exists():
+        lib_path.parent.mkdir(parents=True, exist_ok=True)
+        lib_path.write_text(_lib_rs(arm_name), encoding="utf-8")
+
+    driver_dir = _driver_dir(output_dir, arm_name)
     driver_dir.mkdir(parents=True, exist_ok=True)
 
     written: dict[str, Path] = {}
@@ -179,18 +242,30 @@ def write_generated_files(
 
     rust_files_written: list[str] = []
     for filename, content in files.items():
-        if filename.endswith(".rs"):
+        if filename == "lib.rs":
+            dest = output_dir / "src" / "lib.rs"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+            written[filename] = dest
+            print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)}")
+        elif filename.endswith(".rs"):
             dest = driver_dir / filename
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
             rust_files_written.append(filename)
-            print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
+            print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)}")
         elif filename.endswith(".py"):
-            dest = driver_dir / "codegen" / filename
+            # Normalize script names: test-data generators → generate_test_data.py,
+            # all other generate_*.py scripts (consts, pq, etc.) → generate_code.py.
+            if "test" in filename.lower():
+                normalized = "generate_test_data.py"
+            else:
+                normalized = "generate_code.py"
+            dest = output_dir / "codegen" / normalized
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
-            written[filename] = dest
-            print(f"[ik_generator]   Wrote {dest.relative_to(_REPO_ROOT)}")
+            written[normalized] = dest
+            print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)} (from '{filename}')")
         else:
             # Fallback: write to output_dir
             dest = output_dir / filename
@@ -199,19 +274,20 @@ def write_generated_files(
             print(f"[ik_generator]   Wrote {dest}")
 
     # Ensure mod.rs exists for the new driver
-    _ensure_arm_mod_rs(arm_name, rust_files_written)
+    _ensure_arm_mod_rs(output_dir, arm_name, rust_files_written)
 
     # Register the arm module in the top-level drivers mod.rs
-    _update_drivers_mod(arm_name)
+    _update_drivers_mod(output_dir, arm_name)
 
     return written
 
 
-def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
+def run_py_scripts(written_files: dict[str, Path], output_dir: Path) -> list[tuple[str, str]]:
     """Run all ``generate_*.py`` files that were written to ``codegen/``.
 
     Each script is executed with the current Python interpreter from the
-    repository root so that relative paths inside the scripts resolve correctly.
+    generated crate root so that relative paths inside the scripts resolve
+    correctly.
 
     :param written_files: The ``{filename: path}`` dict returned by
         :func:`write_generated_files`.
@@ -224,12 +300,12 @@ def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
 
-        print(f"[ik_generator]   Running {path.relative_to(_REPO_ROOT)} …")
+        print(f"[ik_generator]   Running {path.relative_to(output_dir)} …")
         result = subprocess.run(
             [sys.executable, str(path)],
             capture_output=True,
             text=True,
-            cwd=str(_REPO_ROOT),
+            cwd=str(output_dir),
         )
         if result.returncode != 0:
             error = (result.stderr + result.stdout).strip()
@@ -241,8 +317,8 @@ def run_py_scripts(written_files: dict[str, Path]) -> list[tuple[str, str]]:
     return failures
 
 
-def build_rust_crate() -> Tuple[bool, str]:
-    """Run ``cargo build`` from the repository root.
+def build_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
+    """Run ``cargo build`` from *cwd*.
 
     :returns: ``(success, output)`` where *output* is combined stdout+stderr.
     """
@@ -250,14 +326,14 @@ def build_rust_crate() -> Tuple[bool, str]:
         ["cargo", "build"],
         capture_output=True,
         text=True,
-        cwd=str(_REPO_ROOT),
+        cwd=str(cwd),
     )
     output = (result.stderr + result.stdout).strip()
     return result.returncode == 0, output
 
 
-def test_rust_crate() -> Tuple[bool, str]:
-    """Run ``cargo test`` from the repository root.
+def test_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
+    """Run ``cargo test`` from *cwd*.
 
     :returns: ``(success, output)`` where *output* is combined stdout+stderr.
     """
@@ -265,7 +341,7 @@ def test_rust_crate() -> Tuple[bool, str]:
         ["cargo", "test"],
         capture_output=True,
         text=True,
-        cwd=str(_REPO_ROOT),
+        cwd=str(cwd),
     )
     output = (result.stderr + result.stdout).strip()
     return result.returncode == 0, output

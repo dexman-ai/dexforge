@@ -1,4 +1,4 @@
-"""Numerical validation of ``codegen/generate_dynamics.py`` dynamics.
+"""Numerical validation of symbolic dynamics in ``dexforge_build``.
 
 Builds a synthetic planar RR (2-DOF, revolute-about-z) artifact plus a matching
 URDF carrying ``<inertial>`` blocks, derives the symbolic dynamics and checks it
@@ -28,7 +28,7 @@ import sympy as sp  # noqa: E402  (after importorskip)
 
 _CODEGEN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_CODEGEN))
-import generate_dynamics as G  # noqa: E402
+import dexforge_build as G  # noqa: E402
 
 # Planar RR geometry shared between the generator fixtures and the reference.
 L1, LC1, M1, IZ1 = 0.5, 0.25, 2.0, 0.03

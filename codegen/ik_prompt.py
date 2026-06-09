@@ -188,8 +188,8 @@ def find_best_example(target_py_code: str) -> Tuple[str, int]:
 
     :param target_py_code: Full source text of the target ``*_ik.py`` artifact.
     :returns: ``(example_arm_name, max_solutions)`` where *example_arm_name*
-        matches a sub-directory of ``src/drivers/`` (e.g. ``"ur5"``,
-        ``"piper"``, ``"franka_panda"``).
+        matches a known driver family (e.g. ``"ur5"``, ``"piper"``,
+        ``"franka_panda"``).
     :raises ValueError: If the artifact's kinematic topology is not recognised.
     """
     # Use word-boundary patterns so bare numbers (e.g. "128", "16") are not
@@ -288,31 +288,31 @@ def _load_example_py_source(example_arm: str) -> str:
         return f"# ssik.prebuilt.{example_arm}_ik is not installed — skipped.\n"
 
 
-def _load_example_rust_source(example_arm: str) -> str:
-    """Load the translated Rust IK driver for *example_arm* from src/drivers/."""
-    rs_path = _REPO_ROOT / "src" / "drivers" / example_arm / "ik_solver.rs"
+def _load_example_rust_source(example_arm: str, repo_root: Path) -> str:
+    """Load the translated Rust IK driver for *example_arm* from the source tree."""
+    rs_path = repo_root / "src" / "drivers" / example_arm / "ik_solver.rs"
     if rs_path.exists():
         return rs_path.read_text(encoding="utf-8")
     return (
-        f"// src/drivers/{example_arm}/ik_solver.rs does not exist yet — "
+        f"// driver source for {example_arm!r} does not exist yet — "
         "no Rust example available for this kinematic family.\n"
     )
 
 
-def _load_example_scripts(example_arm: str) -> str:
-    """Load the Python helper scripts for *example_arm* from codegen/, if present."""
-    scripts_dir = _REPO_ROOT / "codegen"
+def _load_example_scripts(example_arm: str, repo_root: Path) -> str:
+    """Load the Python helper scripts for *example_arm* from the source tree.
+
+    Looks for ``generate_test_data.py`` and ``generate_code.py`` under
+    ``src/drivers/<example_arm>/codegen/``.
+    """
+    codegen_dir = repo_root / "src" / "drivers" / example_arm / "codegen"
     arm_scripts: list[str] = []
-    for pattern in (
-        f"generate_{example_arm}_consts.py",
-        f"generate_{example_arm}_pq.py",
-        f"generate_{example_arm}_test_data.py",
-    ):
-        path = scripts_dir / pattern
+    for script_name in ("generate_test_data.py", "generate_code.py"):
+        path = codegen_dir / script_name
         if path.exists():
-            arm_scripts.append(f"--- {pattern} ---\n" + path.read_text(encoding="utf-8"))
+            arm_scripts.append(f"--- {script_name} ---\n" + path.read_text(encoding="utf-8"))
     if not arm_scripts:
-        return f"# No Python helper scripts found for '{example_arm}' in codegen/ — skipped.\n"
+        return f"# No Python helper scripts found for '{example_arm}' in src/drivers/{example_arm}/codegen/ — skipped.\n"
     return "\n\n".join(arm_scripts)
 
 
@@ -321,6 +321,7 @@ def assemble_context(
     target_arm_stem: str,
     example_arm: str,
     max_solutions: int,
+    repo_root: Path,
 ) -> str:
     """Build the complete context string that will be sent to the LLM.
 
@@ -355,8 +356,8 @@ def assemble_context(
 
     # --- One-shot example (Python source + Rust translation + helper scripts) ---
     example_py = _load_example_py_source(example_arm)
-    example_rs = _load_example_rust_source(example_arm)
-    example_scripts = _load_example_scripts(example_arm)
+    example_rs = _load_example_rust_source(example_arm, repo_root)
+    example_scripts = _load_example_scripts(example_arm, repo_root)
 
     # --- Assemble ---
     sections = [

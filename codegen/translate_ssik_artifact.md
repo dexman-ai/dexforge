@@ -61,11 +61,10 @@ Generate a `#[cfg(test)]` module at the bottom of `ik_solver.rs`.
 
 ### **6. Python Helper Scripts**
 
-You must also generate one or more Python helper scripts that regenerate the auxiliary Rust files. Model them directly on the reference arm's existing scripts in `codegen/`. Provide whichever of the following apply to the target arm:
+You must also generate one or more Python helper scripts that regenerate the auxiliary Rust files. Model them directly on the reference arm's existing scripts provided as examples. Provide whichever of the following apply to the target arm:
 
-* `generate_<arm>_consts.py` — regenerates `consts.rs` (required for arms with precomputed sub-chain geometry, e.g. jointlock 7-DOF arms).
-* `generate_<arm>_pq.py` — regenerates `pq.rs` (required for arms that use Raghavan-Roth PQ matrices, e.g. general 6R arms).
-* `generate_<arm>_test_data.py` — regenerates `test_data.rs` (required for **all** arms).
+* `generate_code.py` — regenerates `consts.rs` and/or `pq.rs` (required for arms with precomputed sub-chain geometry or Raghavan-Roth PQ matrices).
+* `generate_test_data.py` — regenerates `test_data.rs` (required for **all** arms).
 
 Each generated script must:
 1. Import the relevant `ssik.prebuilt.<arm>_ik` artifact.
@@ -86,9 +85,8 @@ The complete set of files to produce:
 |---|---|
 | `ik_solver.rs` | Yes |
 | `consts.rs` | If the arm uses precomputed constants (jointlock 7-DOF arms) |
-| `generate_<arm>_consts.py` | If `consts.rs` is generated |
-| `generate_<arm>_pq.py` | If `pq.rs` is needed (general 6R Raghavan-Roth arms) |
-| `generate_<arm>_test_data.py` | Yes, always |
+| `generate_code.py` | If `consts.rs` or `pq.rs` is generated |
+| `generate_test_data.py` | Yes, always |
 
 Example output structure:
 
@@ -99,10 +97,10 @@ Example output structure:
 === FILE: consts.rs ===
 // ... rust code ...
 
-=== FILE: generate_myarm_consts.py ===
+=== FILE: generate_code.py ===
 # ... python code ...
 
-=== FILE: generate_myarm_test_data.py ===
+=== FILE: generate_test_data.py ===
 # ... python code ...
 ```
 

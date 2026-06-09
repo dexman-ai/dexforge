@@ -28,8 +28,8 @@ Usage::
 
     pip install pin numpy
     python codegen/generate_dynamics_test_data.py \
-        --urdf src/drivers/xarm7/xarm7.urdf \
-        --output src/drivers/xarm7/dynamics_test_data.rs \
+        --urdf path/to/xarm7.urdf \
+        --output path/to/out/dynamics_test_data.rs \
         --samples 1000 --seed 0
 """
 
