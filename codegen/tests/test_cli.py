@@ -10,9 +10,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dexforge import cli  # noqa: E402
+import dexforge_build as cli  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
