@@ -36,17 +36,17 @@ Usage::
 
     pip install ssik sympy numpy
     # From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
-    python codegen/generate_dynamics.py --artifact ur5_ik
+    python codegen/generate_kinematics_dynamics.py --artifact ur5_ik
 
     # From a local artifact .py file, writing to a driver module:
-    python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
+    python codegen/generate_kinematics_dynamics.py --artifact /path/to/my_arm_ik.py \
         --output src/drivers/my_arm/dynamics.rs
 
     # Also emit inverse-dynamics (gravity / mass-matrix / Coriolis) by sourcing
     # the link masses + inertias from a URDF whose actuated-joint order matches
     # the artifact (the URDF supplies the *physical* properties the kinematics
     # artifact does not carry):
-    python codegen/generate_dynamics.py --artifact ur5_ik \
+    python codegen/generate_kinematics_dynamics.py --artifact ur5_ik \
         --urdf src/drivers/ur5/ur5_inertial.urdf \
         --output src/drivers/ur5/dynamics.rs
 
