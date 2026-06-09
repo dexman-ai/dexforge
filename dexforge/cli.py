@@ -12,11 +12,6 @@ This lets an OEM use dexforge as a one-shot URDF compiler for their hardware:
 hand it a URDF, get back a minimal, zero-allocation ``#![no_std]`` crate exposing
 ``fk`` / ``solve`` that they can vendor straight into firmware.
 
-As an *optimisation*, when ``build`` is invoked with an **arm name** (rather than
-a URDF file) it looks for a prebuilt, committed driver under
-``src/drivers/<arm>/`` and exports that directly — skipping the LLM translation
-entirely.
-
 Typical usage::
 
     pip install dexforge
@@ -25,13 +20,8 @@ Typical usage::
     dexforge build --urdf my_arm.urdf --base base_link --ee tool0 -o ~/my_arm_ik
     cd ~/my_arm_ik && cargo build --release
 
-    # Optimisation: reuse a prebuilt, committed driver (no LLM call).
-    dexforge build --arm ur5 --output ~/ur5_ik_driver
-
-    # compile every prebuilt arm into its own crate under a parent dir:
-    dexforge build --output ~/dexforge_drivers
-
-    dexforge build --arm ur5 --output ~/ur5 --list   # preview, write nothing
+    dexforge build --urdf my_arm.urdf --base base_link --ee tool0 \\
+        -o ~/my_arm_ik --list   # preview, write nothing
 """
 
 from __future__ import annotations
@@ -44,21 +34,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence
-
-# Arms dexforge ships a prebuilt, committed driver for. Passing one of these
-# names to ``dexforge build`` exports the prebuilt driver directly (the LLM
-# translation step is skipped). Any other arm must be compiled from a URDF.
-ARMS = ("ur5", "piper", "franka_panda", "xarm7", "rizon4", "rizon10")
-
-# Degrees of freedom, used only for documentation in the generated crate.
-DOF = {
-    "ur5": 6,
-    "piper": 6,
-    "franka_panda": 7,
-    "xarm7": 7,
-    "rizon4": 7,
-    "rizon10": 7,
-}
 
 # Shared, arm-agnostic numeric kernels copied verbatim into every driver crate
 # (src/math/<name>.rs). The driver sources reference these as ``crate::math::*``,
@@ -207,8 +182,8 @@ def plan_export(
     sources, and any shared solver modules the driver references) and the files
     dexforge generates (``Cargo.toml``, ``src/lib.rs``, ``src/drivers/mod.rs``).
 
-    Works for any arm with a driver directory under ``src/drivers/<arm>/`` —
-    both the prebuilt arms in :data:`ARMS` and arms freshly compiled from a URDF.
+    Works for any arm with a driver directory under ``src/drivers/<arm>/``
+    (compiled from a URDF by the LLM-assisted generator).
 
     :raises FileNotFoundError: If an expected source directory is missing.
     """
@@ -289,15 +264,6 @@ def verify_crate(out_dir: Path) -> tuple:
         cwd=str(out_dir),
     )
     return result.returncode == 0, (result.stderr + result.stdout).strip()
-
-
-def _target_dir(base: Path, arm: str, n_arms: int) -> Path:
-    """Resolve the crate directory for *arm*.
-
-    A single arm targets *base* directly; multiple arms each get a ``<base>/<arm>``
-    subdirectory so one ``--output`` can hold a whole fleet of drivers.
-    """
-    return base if n_arms == 1 else base / arm
 
 
 def generate_driver_from_urdf(
@@ -409,63 +375,49 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
         return 1
     print(f"[dexforge]   \u2713 generated '{arm}' driver under src/drivers/{arm}/.")
 
-    return _export_arms([arm], repo_root, base, args, single_output=True)
+    return _export_arm(arm, repo_root, base, args)
 
 
-def _export_arms(
-    arms: Sequence[str],
+def _export_arm(
+    arm: str,
     repo_root: Path,
-    base: Path,
+    out_dir: Path,
     args: argparse.Namespace,
-    single_output: bool,
 ) -> int:
-    """Plan, optionally list, write, and verify stand-alone crates for *arms*."""
-    n = 1 if single_output else len(arms)
-    exports: List[Export] = []
-    for arm in arms:
-        target = base if single_output else _target_dir(base, arm, n)
-        try:
-            exports.append(plan_export(arm, target, repo_root, args.name))
-        except FileNotFoundError as exc:
-            print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
-            return 1
-
-    if args.list:
-        print(f"[dexforge] compile plan ({len(exports)} crate(s)):")
-        for export in exports:
-            print(f"  {export.arm} ({DOF.get(export.arm, '?')}-DOF) -> {export.out_dir}")
-            print(f"      crate '{export.crate_name}', {len(export.files())} file(s):")
-            for path in export.files():
-                print(f"        {path.relative_to(export.out_dir)}")
-        return 0
-
-    failures: List[str] = []
-    for export in exports:
-        print(f"[dexforge] compiling {export.arm} driver -> {export.out_dir}")
-        try:
-            written = write_export(export)
-        except FileNotFoundError as exc:
-            print(f"[dexforge]   \u2717 {exc}", file=sys.stderr)
-            failures.append(export.arm)
-            continue
-        print(f"[dexforge]   wrote {len(written)} file(s); crate '{export.crate_name}'.")
-
-        if args.verify:
-            print("[dexforge]   verifying standalone build (cargo build --release) …")
-            ok, output = verify_crate(export.out_dir)
-            if ok:
-                print(f"[dexforge]   \u2713 {export.arm} builds standalone.")
-            else:
-                print(f"[dexforge]   \u2717 {export.arm} failed to build:\n{output}", file=sys.stderr)
-                failures.append(export.arm)
-        else:
-            print(f"[dexforge]   \u2713 {export.arm} compiled (build not verified).")
-
-    if failures:
-        print(f"[dexforge] {len(failures)} driver(s) failed: {', '.join(failures)}", file=sys.stderr)
+    """Plan, optionally list, write, and verify the stand-alone crate for *arm*."""
+    try:
+        export = plan_export(arm, out_dir, repo_root, args.name)
+    except FileNotFoundError as exc:
+        print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[dexforge] done: {len(exports)} standalone driver crate(s) under {base}.")
+    if args.list:
+        print("[dexforge] compile plan (1 crate):")
+        print(f"  {export.arm} -> {export.out_dir}")
+        print(f"      crate '{export.crate_name}', {len(export.files())} file(s):")
+        for path in export.files():
+            print(f"        {path.relative_to(export.out_dir)}")
+        return 0
+
+    print(f"[dexforge] compiling {export.arm} driver -> {export.out_dir}")
+    try:
+        written = write_export(export)
+    except FileNotFoundError as exc:
+        print(f"[dexforge]   \u2717 {exc}", file=sys.stderr)
+        return 1
+    print(f"[dexforge]   wrote {len(written)} file(s); crate '{export.crate_name}'.")
+
+    if args.verify:
+        print("[dexforge]   verifying standalone build (cargo build --release) …")
+        ok, output = verify_crate(export.out_dir)
+        if not ok:
+            print(f"[dexforge]   \u2717 {export.arm} failed to build:\n{output}", file=sys.stderr)
+            return 1
+        print(f"[dexforge]   \u2713 {export.arm} builds standalone.")
+    else:
+        print(f"[dexforge]   \u2713 {export.arm} compiled (build not verified).")
+
+    print(f"[dexforge] done: standalone driver crate under {export.out_dir}.")
     return 0
 
 
@@ -489,35 +441,8 @@ def _build(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if args.urdf and args.arm:
-        print(
-            "[dexforge] ERROR: pass either --urdf (compile from a URDF) or --arm "
-            "(reuse a prebuilt driver), not both.",
-            file=sys.stderr,
-        )
-        return 2
-
     # End-to-end path: compile a driver straight from a URDF via the LLM.
-    if args.urdf:
-        return _build_from_urdf(args, repo_root, base)
-
-    # Optimisation path: an arm name reuses the prebuilt, committed driver.
-    arms = args.arm or list(ARMS)
-    for arm in arms:
-        if arm not in ARMS:
-            print(
-                f"[dexforge] ERROR: unknown arm {arm!r}; choose from "
-                f"{', '.join(ARMS)}, or compile it from a URDF with "
-                f"--urdf <file> --base <link> --ee <link>.",
-                file=sys.stderr,
-            )
-            return 2
-
-    if len(arms) > 1 and args.name:
-        print("[dexforge] ERROR: --name cannot be combined with multiple --arm.", file=sys.stderr)
-        return 2
-
-    return _export_arms(arms, repo_root, base, args, single_output=len(arms) == 1)
+    return _build_from_urdf(args, repo_root, base)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -534,9 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Compile an arm's analytical IK driver into a self-contained Rust "
             "crate written outside the dexforge repository. Point it at a URDF "
-            "(--urdf) to translate new hardware end-to-end via the LLM, or at a "
-            "prebuilt arm name (--arm) to reuse a committed driver without the "
-            "LLM. The generated crate does not depend on dexforge."
+            "(--urdf, with --base and --ee) to translate new hardware end-to-end "
+            "via the LLM. The generated crate does not depend on dexforge."
         ),
     )
     build_p.add_argument(
@@ -545,13 +469,13 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         metavar="DIR",
         help=(
-            "Target directory for the generated crate (single arm / --urdf) or "
-            "parent directory holding one crate per arm (multiple --arm). Must "
-            "be outside the dexforge repository."
+            "Target directory for the generated crate. Must be outside the "
+            "dexforge repository."
         ),
     )
     build_p.add_argument(
         "--urdf",
+        required=True,
         metavar="URDF",
         help=(
             "Compile a driver end-to-end from this URDF file (calls the LLM to "
@@ -569,18 +493,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="End-effector link name in the URDF (required with --urdf).",
     )
     build_p.add_argument(
-        "--arm",
-        action="append",
-        metavar="ARM",
-        help=(
-            "Reuse a prebuilt, committed driver for this arm (skips the LLM); "
-            "repeatable. Defaults to all prebuilt arms: " + ", ".join(ARMS)
-        ),
-    )
-    build_p.add_argument(
         "--name",
         metavar="CRATE",
-        help="Override the generated crate name (single-arm builds only).",
+        help="Override the generated crate name.",
     )
     build_p.add_argument(
         "--repo-root",

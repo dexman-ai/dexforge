@@ -126,71 +126,72 @@ class RepoRootTests(unittest.TestCase):
 
 
 class CliMainTests(unittest.TestCase):
+    def _urdf(self, tmp: str) -> Path:
+        urdf = Path(tmp) / "ur5.urdf"
+        urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
+        return urdf
+
     def test_list_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
-            with mock.patch.object(cli, "write_export") as we:
-                with redirect_stdout(io.StringIO()):
-                    code = cli.main(["build", "--arm", "ur5", "-o", str(out), "--list"])
+            urdf = self._urdf(tmp)
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+            ):
+                with mock.patch.object(cli, "write_export") as we:
+                    with redirect_stdout(io.StringIO()):
+                        code = cli.main(
+                            ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                             "-o", str(out), "--list"]
+                        )
             self.assertEqual(code, 0)
             we.assert_not_called()
             self.assertFalse(out.exists())
 
     def test_refuses_output_inside_repo(self) -> None:
         inside = _REPO_ROOT / "build_out"
-        buf = io.StringIO()
-        with redirect_stderr(buf):
-            code = cli.main(["build", "--arm", "ur5", "-o", str(inside)])
-        self.assertEqual(code, 2)
-        self.assertIn("inside the dexforge repository", buf.getvalue())
-
-    def test_unknown_arm_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            buf = io.StringIO()
-            with redirect_stderr(buf):
-                code = cli.main(["build", "--arm", "nope", "-o", tmp])
-        self.assertEqual(code, 2)
-        self.assertIn("unknown arm", buf.getvalue())
-
-    def test_name_rejected_with_multiple_arms(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+            urdf = self._urdf(tmp)
             buf = io.StringIO()
             with redirect_stderr(buf):
                 code = cli.main(
-                    ["build", "--arm", "ur5", "--arm", "piper", "-o", tmp, "--name", "x"]
+                    ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                     "-o", str(inside)]
                 )
         self.assertEqual(code, 2)
-        self.assertIn("--name", buf.getvalue())
+        self.assertIn("inside the dexforge repository", buf.getvalue())
 
     def test_build_writes_and_skips_verify(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "ur5"
-            with mock.patch.object(cli, "verify_crate") as vc:
-                with redirect_stdout(io.StringIO()):
-                    code = cli.main(["build", "--arm", "ur5", "-o", str(out), "--no-verify"])
+            urdf = self._urdf(tmp)
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+            ):
+                with mock.patch.object(cli, "verify_crate") as vc:
+                    with redirect_stdout(io.StringIO()):
+                        code = cli.main(
+                            ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                             "-o", str(out), "--no-verify"]
+                        )
             self.assertEqual(code, 0)
             vc.assert_not_called()
             self.assertTrue((out / "Cargo.toml").is_file())
             self.assertTrue((out / "src" / "lib.rs").is_file())
 
-    def test_multiple_arms_use_subdirectories(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
-            with redirect_stdout(io.StringIO()):
-                code = cli.main(
-                    ["build", "--arm", "ur5", "--arm", "piper",
-                     "-o", str(out / "drivers"), "--no-verify"]
-                )
-            self.assertEqual(code, 0)
-            self.assertTrue((out / "drivers" / "ur5" / "Cargo.toml").is_file())
-            self.assertTrue((out / "drivers" / "piper" / "Cargo.toml").is_file())
-
     def test_verify_failure_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "ur5"
-            with mock.patch.object(cli, "verify_crate", return_value=(False, "boom")):
-                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    code = cli.main(["build", "--arm", "ur5", "-o", str(out)])
+            urdf = self._urdf(tmp)
+            with mock.patch.object(
+                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+            ):
+                with mock.patch.object(cli, "verify_crate", return_value=(False, "boom")):
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        code = cli.main(
+                            ["build", "--urdf", str(urdf), "--base", "b", "--ee", "e",
+                             "-o", str(out)]
+                        )
             self.assertEqual(code, 1)
 
     def test_no_subcommand_prints_help(self) -> None:
@@ -256,19 +257,6 @@ class UrdfBuildTests(unittest.TestCase):
                          "-o", str(Path(tmp) / "o")]
                     )
             self.assertEqual(code, 1)
-
-    def test_urdf_and_arm_are_mutually_exclusive(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            urdf = Path(tmp) / "ur5.urdf"
-            urdf.write_text("<robot/>", encoding="utf-8")
-            buf = io.StringIO()
-            with redirect_stderr(buf):
-                code = cli.main(
-                    ["build", "--urdf", str(urdf), "--arm", "ur5",
-                     "-o", str(Path(tmp) / "o")]
-                )
-            self.assertEqual(code, 2)
-            self.assertIn("not both", buf.getvalue())
 
 
 if __name__ == "__main__":

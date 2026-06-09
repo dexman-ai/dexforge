@@ -130,28 +130,19 @@ builds and tests it, then exports the result as the stand-alone crate. Set
 `DEXFORGE_LLM_KEY` / `DEXFORGE_LLM_BASE_URL` / `DEXFORGE_LLM_MODEL` (or the
 `--llm-key` / `--llm-url` / `--llm-model` flags) for your LLM backend.
 
-As an **optimisation**, when `build` is invoked with an **arm name** instead of a
-URDF, it reuses the prebuilt, committed driver under `src/drivers/<arm>/` and
-skips the LLM translation entirely:
-
-```sh
-dexforge build --arm ur5 --output ~/ur5_ik_driver   # reuse prebuilt, no LLM
-```
-
 The generated crate re-exports the arm's entry points at its root, so a consumer
 just calls `my_arm_ik::fk(&q)` / `my_arm_ik::solve(&tf, …)`. Useful flags:
 
 ```sh
-dexforge build --arm ur5 -o ~/ur5 --list      # preview the file list, write nothing
-dexforge build --arm ur5 -o ~/ur5 --no-verify # skip the standalone cargo build check
-dexforge build -o ~/dexforge_drivers          # all prebuilt arms, one crate per arm subdir
+dexforge build --urdf my_arm.urdf --base base_link --ee tool0 \
+    -o ~/my_arm_ik --list       # preview the file list, write nothing
+dexforge build --urdf my_arm.urdf --base base_link --ee tool0 \
+    -o ~/my_arm_ik --no-verify  # skip the standalone cargo build check
 ```
 
-By default each crate is verified by running `cargo build --release` inside it.
+By default the crate is verified by running `cargo build --release` inside it.
 `--output` must be outside the dexforge repository (the whole point is a
-self-contained driver). Prebuilt arms available to `--arm`: `ur5`, `piper`,
-`franka_panda`, `xarm7`, `rizon4`, `rizon10`; any other arm is compiled from its
-URDF.
+self-contained driver).
 
 ## Adding a new arm
 
