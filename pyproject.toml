@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dexforge"
+version = "0.1.0"
+description = "Compile stand-alone analytical IK driver crates from dexforge."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "BSD-3-Clause" }
+
+[project.scripts]
+dexforge = "codegen.dexforge_build:main"
+
+[tool.setuptools]
+packages = ["codegen"]
