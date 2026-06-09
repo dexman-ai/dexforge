@@ -86,6 +86,36 @@ def _write_fixtures(tmp_path: Path):
     return artifact, urdf
 
 
+def test_order_urdf_chain_accepts_side_branches_when_endpoints_are_known():
+    joints = [
+        G.UrdfJoint(name="j0", jtype="revolute", parent="base", child="l1", axis=(0.0, 0.0, 1.0)),
+        G.UrdfJoint(name="j1", jtype="revolute", parent="l1", child="l2", axis=(0.0, 0.0, 1.0)),
+        G.UrdfJoint(name="tool_mount", jtype="fixed", parent="l2", child="tool", axis=(0.0, 0.0, 1.0)),
+        G.UrdfJoint(name="camera_mount", jtype="fixed", parent="base", child="camera", axis=(0.0, 0.0, 1.0)),
+    ]
+
+    chain = G.order_urdf_chain(joints, base_link=None, ee_link="tool")
+
+    assert [joint.name for joint in chain] == ["j0", "j1", "tool_mount"]
+
+
+def test_order_urdf_chain_handles_helper_branch_off_base_link():
+    joints = [
+        G.UrdfJoint(name="shoulder_pan_joint", jtype="revolute", parent="base_link", child="shoulder_link", axis=(0.0, 0.0, 1.0)),
+        G.UrdfJoint(name="base_link-base_fixed_joint", jtype="fixed", parent="base_link", child="base", axis=(1.0, 0.0, 0.0)),
+        G.UrdfJoint(name="shoulder_lift_joint", jtype="revolute", parent="shoulder_link", child="upper_arm_link", axis=(0.0, 1.0, 0.0)),
+        G.UrdfJoint(name="tool_mount", jtype="fixed", parent="upper_arm_link", child="tool0", axis=(1.0, 0.0, 0.0)),
+    ]
+
+    chain = G.order_urdf_chain(joints, base_link="base_link", ee_link="tool0")
+
+    assert [joint.name for joint in chain] == [
+        "shoulder_pan_joint",
+        "shoulder_lift_joint",
+        "tool_mount",
+    ]
+
+
 def _com_positions(q):
     q0, q1 = q
     p1 = np.array([LC1 * np.cos(q0), LC1 * np.sin(q0), 0.0])

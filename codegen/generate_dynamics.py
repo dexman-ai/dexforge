@@ -367,33 +367,73 @@ def order_urdf_chain(
     base_link: Optional[str] = None,
     ee_link: Optional[str] = None,
 ) -> List[UrdfJoint]:
-    """Order URDF joints into the serial base->ee chain (topological walk)."""
+    """Order URDF joints into the serial base->ee chain.
+
+    The URDF may contain extra side branches; for the common base->ee case we
+    simply walk the first child edge at each link and verify it lands on
+    ``ee_link``.
+    """
     by_parent: Dict[str, List[UrdfJoint]] = {}
+    by_child: Dict[str, UrdfJoint] = {}
     for jt in joints:
         by_parent.setdefault(jt.parent, []).append(jt)
+        if jt.child in by_child:
+            raise ValueError(f"URDF has multiple parents for link {jt.child!r}")
+        by_child[jt.child] = jt
 
-    if base_link is None or ee_link is None:
+    if base_link is None and ee_link is None:
         children = {jt.child for jt in joints}
         parents = {jt.parent for jt in joints}
         roots = [p for p in parents if p not in children]
         leaves = [c for c in children if c not in parents]
         if len(roots) != 1 or len(leaves) != 1:
             raise ValueError(
-                f"URDF is not a single serial chain (roots={sorted(roots)}, leaves={sorted(leaves)})"
+                f"cannot infer base/ee links (roots={sorted(roots)}, leaves={sorted(leaves)})"
             )
-        base_link = base_link or roots[0]
-        ee_link = ee_link or leaves[0]
+        base_link = roots[0]
+        ee_link = leaves[0]
 
-    chain: List[UrdfJoint] = []
+    if base_link is not None and ee_link is not None:
+        chain: List[UrdfJoint] = []
+        link = base_link
+        visited = set()
+        while link != ee_link:
+            if link in visited:
+                raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+            visited.add(link)
+            outgoing = by_parent.get(link)
+            if not outgoing:
+                raise ValueError(f"URDF chain stopped before reaching ee_link at {link!r}")
+            jt = outgoing[0]
+            chain.append(jt)
+            link = jt.child
+        return chain
+
+    if base_link is None:
+        assert ee_link is not None
+        reverse_chain: List[UrdfJoint] = []
+        link = ee_link
+        visited = set()
+        while link in by_child:
+            if link in visited:
+                raise ValueError(f"URDF chain contains a cycle at link {link!r}")
+            visited.add(link)
+            jt = by_child[link]
+            reverse_chain.append(jt)
+            link = jt.parent
+        return list(reversed(reverse_chain))
+
     link = base_link
-
+    chain: List[UrdfJoint] = []
     visited = set()
-    while link != ee_link:
+    while True:
         if link in visited:
             raise ValueError(f"URDF chain contains a cycle at link {link!r}")
         visited.add(link)
         outgoing = by_parent.get(link)
-        if not outgoing or len(outgoing) != 1:
+        if not outgoing:
+            break
+        if len(outgoing) != 1:
             raise ValueError(f"URDF chain branches or breaks at link {link!r}")
         jt = outgoing[0]
         chain.append(jt)
