@@ -9,7 +9,6 @@ This module handles:
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 import sys
@@ -19,54 +18,6 @@ from typing import Tuple
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
-
-
-def _sanitize_file_content(content: str) -> str:
-    """Strip Markdown code fences from a single file's content block.
-
-    :param content: Raw content string that may be wrapped in ``` fences.
-    :returns: Clean code with no Markdown artefacts.
-    """
-    # Extract content from ``` or ```rust / ```python fences if present
-    blocks = re.findall(r"```(?:\w+)?[ \t]*\n?(.*?)```", content, flags=re.DOTALL)
-    if blocks:
-        return "\n".join(block.strip() for block in blocks).strip()
-    # No fences: strip any stray fence opener lines
-    cleaned = re.sub(r"^```[^\n]*\n?", "", content, flags=re.MULTILINE)
-    return cleaned.strip()
-
-
-def parse_llm_output(llm_response: str) -> dict[str, str]:
-    """Parse a multi-file LLM response into a ``{filename: content}`` mapping.
-
-    The LLM is instructed to use ``=== FILE: <name> ===`` separator lines.
-    This function splits on those markers and returns all contained files.
-
-    Any Markdown code fences inside individual file blocks are stripped.
-
-    :param llm_response: Raw LLM response text.
-    :returns: Ordered mapping of filename → file content strings.
-    :raises ValueError: If no ``=== FILE: ... ===`` markers are found.
-    """
-    pattern = re.compile(r"^=== FILE:\s*(.+?)\s*===$", re.MULTILINE)
-    parts = pattern.split(llm_response)
-    # parts[0] is any preamble text before the first marker (discard).
-    # Remaining parts alternate: [filename, content, filename, content, ...]
-    if len(parts) < 3:
-        raise ValueError(
-            "LLM output does not contain any '=== FILE: <name> ===' markers. "
-            "The model may not have followed the output format instructions.\n"
-            f"Response preview (first 500 chars):\n{llm_response[:500]}"
-        )
-
-    files: dict[str, str] = {}
-    for i in range(1, len(parts), 2):
-        filename = parts[i].strip()
-        raw_content = parts[i + 1].strip() if i + 1 < len(parts) else ""
-        files[filename] = _sanitize_file_content(raw_content)
-
-    return files
-
 
 def _driver_dir(root: Path, arm_name: str) -> Path:
     """Return the driver directory rooted at *root* for *arm_name*."""
@@ -285,21 +236,20 @@ def write_generated_files(
     return written
 
 
-def run_py_scripts(written_files: dict[str, Path], output_dir: Path) -> list[tuple[str, str]]:
+def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list[tuple[str, str]]:
     """Run all ``generate_*.py`` files that were written to ``codegen/``.
 
     Each script is executed with the current Python interpreter from the
     generated crate root so that relative paths inside the scripts resolve
     correctly.
 
-    :param written_files: The ``{filename: path}`` dict returned by
+    :param generator_scripts: The ``{filename: path}`` dict returned by
         :func:`write_generated_files`.
-    :returns: List of ``(script_name, error_output)`` pairs for failed scripts.
-        An empty list means all scripts succeeded.
+    :returns:  ``(script_name, error_output)`` tuple when a script fails.
+        None means all scripts succeeded.
     """
-    failures: list[tuple[str, str]] = []
 
-    for filename, path in sorted(written_files.items()):
+    for filename, path in sorted(generator_scripts.items()):
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
 
@@ -313,11 +263,11 @@ def run_py_scripts(written_files: dict[str, Path], output_dir: Path) -> list[tup
         if result.returncode != 0:
             error = (result.stderr + result.stdout).strip()
             print(f"[ik_generator]   ✗ {filename} failed:\n{error}")
-            failures.append((filename, error))
+            return [(filename, error)]
         else:
             print(f"[ik_generator]   ✓ {filename} succeeded.")
 
-    return failures
+    return None
 
 
 def build_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
@@ -348,3 +298,46 @@ def test_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
     )
     output = (result.stderr + result.stdout).strip()
     return result.returncode == 0, output
+
+
+def build_and_verify(
+    generator_scripts: dict[str, Path],
+    output_dir: Path,
+) -> Tuple[bool, str]:
+    """Run helper scripts, cargo build, and cargo test.
+
+    :returns: ``error_message`` or None.
+    """
+    # --- Step 7: Run Python helper scripts ---
+    print("[ik_generator] Step 7: Running Python helper scripts …")
+    result = run_py_scripts(generator_scripts, output_dir)
+
+    if result is not None:
+        name, err = result
+        error_msg = f"Script '{name}' failed with:\n{err}"
+        print(f"[ik_generator]   Generator script {name} failed.")
+        return error_msg
+
+    # --- Step 8: Build the Rust crate ---
+    print("[ik_generator] Step 8: Building Rust crate …")
+    build_ok, build_output = build_rust_crate(output_dir)
+    if not build_ok:
+        error_msg = (
+            f"cargo build failed with the following errors:\n\n{build_output}\n\n"
+        )
+        print("[ik_generator]   Build failed.")
+        return error_msg
+    print("[ik_generator]   Build succeeded.")
+
+    # --- Step 9: Run Rust tests ---
+    print("[ik_generator] Step 9: Running Rust tests …")
+    test_ok, test_output = test_rust_crate(output_dir)
+    if not test_ok:
+        error_msg = (
+            f"cargo test failed with the following output:\n\n{test_output}\n\n"
+        )
+        print("[ik_generator]   Tests failed.")
+        return error_msg
+    print("[ik_generator]   All tests passed.")
+
+    return None

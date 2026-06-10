@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional
-
+import re
 
 class IKGeneratorLLM:
     """Thin wrapper around the OpenAI-compatible chat API for IK generation.
@@ -81,3 +81,50 @@ class IKGeneratorLLM:
         if content is None:
             raise RuntimeError("LLM returned a None message content.")
         return content
+
+
+def _sanitize_file_content(content: str) -> str:
+    """Strip Markdown code fences from a single file's content block.
+
+    :param content: Raw content string that may be wrapped in ``` fences.
+    :returns: Clean code with no Markdown artefacts.
+    """
+    # Extract content from ``` or ```rust / ```python fences if present
+    blocks = re.findall(r"```(?:\w+)?[ \t]*\n?(.*?)```", content, flags=re.DOTALL)
+    if blocks:
+        return "\n".join(block.strip() for block in blocks).strip()
+    # No fences: strip any stray fence opener lines
+    cleaned = re.sub(r"^```[^\n]*\n?", "", content, flags=re.MULTILINE)
+    return cleaned.strip()
+
+    
+def parse_llm_output(llm_response: str) -> dict[str, str]:
+    """Parse a multi-file LLM response into a ``{filename: content}`` mapping.
+
+    The LLM is instructed to use ``=== FILE: <name> ===`` separator lines.
+    This function splits on those markers and returns all contained files.
+
+    Any Markdown code fences inside individual file blocks are stripped.
+
+    :param llm_response: Raw LLM response text.
+    :returns: Ordered mapping of filename → file content strings.
+    :raises ValueError: If no ``=== FILE: ... ===`` markers are found.
+    """
+    pattern = re.compile(r"^=== FILE:\s*(.+?)\s*===$", re.MULTILINE)
+    parts = pattern.split(llm_response)
+    # parts[0] is any preamble text before the first marker (discard).
+    # Remaining parts alternate: [filename, content, filename, content, ...]
+    if len(parts) < 3:
+        raise ValueError(
+            "LLM output does not contain any '=== FILE: <name> ===' markers. "
+            "The model may not have followed the output format instructions.\n"
+            f"Response preview (first 500 chars):\n{llm_response[:500]}"
+        )
+
+    files: dict[str, str] = {}
+    for i in range(1, len(parts), 2):
+        filename = parts[i].strip()
+        raw_content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        files[filename] = _sanitize_file_content(raw_content)
+
+    return files

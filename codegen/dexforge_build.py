@@ -1231,12 +1231,12 @@ def _run_generate_dynamics_core(
     return True, ""
 
 
-def _run_ik_generator_core(
-    urdf: Optional[Path],
-    base_link: Optional[str],
-    ee_link: Optional[str],
-    output_dir: Path,
+def generate_driver_from_urdf(
+    urdf: Path,
+    base_link: str,
+    ee_link: str,
     repo_root: Path,
+    output_dir: Path,
     max_retries: int = _MAX_RETRIES,
     llm_key: Optional[str] = None,
     llm_url: Optional[str] = None,
@@ -1265,28 +1265,18 @@ def _run_ik_generator_core(
     # installed in environments that only need the export/packaging features.
     try:
         from ik_build import (
-            build_rust_crate,
-            parse_llm_output,
-            run_py_scripts,
-            test_rust_crate,
+            build_and_verify,
             write_generated_files,
         )
-        from ik_llm import IKGeneratorLLM
-        from ik_prompt import (
-            generate_context,
-        )
+        from ik_llm import (IKGeneratorLLM,  parse_llm_output)
+        from ik_prompt import generate_context
     except ImportError:
         from codegen.ik_build import (  # type: ignore[no-redef]
-            build_rust_crate,
-            parse_llm_output,
-            run_py_scripts,
-            test_rust_crate,
+            build_and_verify,
             write_generated_files,
         )
-        from codegen.ik_llm import IKGeneratorLLM  # type: ignore[no-redef]
-        from codegen.ik_prompt import (  # type: ignore[no-redef]
-            generate_context,
-        )
+        from codegen.ik_llm import (IKGeneratorLLM,  parse_llm_output) # type: ignore[no-redef]
+        from codegen.ik_prompt import generate_context  # type: ignore[no-redef]
 
     arm_name = urdf.stem if urdf is not None else ""
 
@@ -1374,102 +1364,29 @@ def _run_ik_generator_core(
             urdf,
         )
 
-        # --- Step 7: Run Python helper scripts ---
-        print("[ik_generator] Step 7: Running Python helper scripts …")
-        script_failures = run_py_scripts(written, output_dir)
+        # --- Step 7/8/9: scripts + build + test ---
+        error = build_and_verify(
+            generator_scripts=written,
+            output_dir=output_dir,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            raw_response=raw_response,
+            messages=messages,
+        )
+        if error is None:
+            break
 
-        if script_failures:
-            failure_details = "\n\n".join(
-                f"Script '{name}' failed with:\n{err}"
-                for name, err in script_failures
-            )
-            error_msg = (
-                f"The following Python helper script(s) failed to run:\n\n"
-                f"{failure_details}\n\n"
-                "Please fix the errors and regenerate all files."
-            )
-            print("[ik_generator]   Script failures detected.")
-            if attempt < max_attempts - 1:
-                messages.append({"role": "assistant", "content": raw_response})
-                messages.append({"role": "user", "content": error_msg})
-                continue
-            return False, arm_name, f"Script failures after all retries.\n{failure_details}"
+        # on failure, append the error to the message history and retry; on success, break out of the loop
+        messages.append({"role": "assistant", "content": raw_response})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"The generated code failed to build or test with the following error:\n```\n{error}\n```\n"
+                "Please fix the code to resolve this error and regenerate all files."
+            ),
+        })
 
-        # --- Step 8: Build the Rust crate ---
-        print("[ik_generator] Step 8: Building Rust crate …")
-        build_ok, build_output = build_rust_crate(output_dir)
-        if not build_ok:
-            error_msg = (
-                f"cargo build failed with the following errors:\n\n{build_output}\n\n"
-                "Please fix the Rust code and regenerate all files."
-            )
-            print("[ik_generator]   Build failed.")
-            if attempt < max_attempts - 1:
-                messages.append({"role": "assistant", "content": raw_response})
-                messages.append({"role": "user", "content": error_msg})
-                continue
-            return False, arm_name, f"Build failed after all retries.\n{build_output}"
-        print("[ik_generator]   Build succeeded.")
-
-        # --- Step 9: Run Rust tests ---
-        print("[ik_generator] Step 9: Running Rust tests …")
-        test_ok, test_output = test_rust_crate(output_dir)
-        if not test_ok:
-            error_msg = (
-                f"cargo test failed with the following output:\n\n{test_output}\n\n"
-                "Please fix the Rust code and regenerate all files."
-            )
-            print("[ik_generator]   Tests failed.")
-            if attempt < max_attempts - 1:
-                messages.append({"role": "assistant", "content": raw_response})
-                messages.append({"role": "user", "content": error_msg})
-                continue
-            return False, arm_name, f"Tests failed after all retries.\n{test_output}"
-        print("[ik_generator]   All tests passed.")
-
-        # All steps succeeded.
-        break
-
-    return True, arm_name, ""
-
-
-def generate_driver_from_urdf(
-    urdf: Path,
-    base_link: str,
-    ee_link: str,
-    repo_root: Path,
-    output_root: Path,
-    llm_options: Optional[Dict[str, str]] = None,
-) -> tuple:
-    """Translate a URDF into a generated driver crate via the LLM code generator.
-
-    Generates a ssik artifact from the URDF, calls the LLM to translate it into
-    ``#![no_std]`` Rust, then builds and tests the generated crate in-place.
-    The arm name is derived from the URDF stem.
-
-    :param urdf: Path to the source URDF file.
-    :param base_link: Base link name passed to the generator.
-    :param ee_link: End-effector link name passed to the generator.
-    :param repo_root: dexforge source tree (provides source inputs for examples
-        and the locked ssik version).
-    :param output_root: Generated crate root directory.
-    :param llm_options: Optional ``{key,url,model,max_retries}`` overrides
-        (otherwise env-var defaults apply).
-    :returns: ``(success, arm_name, combined_output)``.
-    """
-    llm_options = llm_options or {}
-    ok, arm, err = _run_ik_generator_core(
-        urdf=urdf,
-        base_link=base_link,
-        ee_link=ee_link,
-        output_dir=output_root,
-        repo_root=repo_root,
-        max_retries=int(llm_options.get("max_retries", _MAX_RETRIES)),
-        llm_key=llm_options.get("key"),
-        llm_url=llm_options.get("url"),
-        llm_model=llm_options.get("model"),
-    )
-    return ok, arm, err
+    return (True, arm_name, "") if error is None else (False, arm_name, f"Build failure after {max_attempts} attempts: {error}")
 
 
 def generate_dynamics_for_arm(
@@ -1495,24 +1412,16 @@ def generate_dynamics_for_arm(
     """
     return _run_generate_dynamics_core(crate_root, arm, urdf)
 
-
-def _llm_options(args: argparse.Namespace) -> Dict[str, str]:
-    """Collect LLM override options from parsed args (omitting unset values)."""
-    options: Dict[str, str] = {}
-    for attr, key in (
-        ("llm_key", "key"),
-        ("llm_url", "url"),
-        ("llm_model", "model"),
-        ("max_retries", "max_retries"),
-    ):
-        value = getattr(args, attr, None)
-        if value is not None:
-            options[key] = value
-    return options
-
-
-def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> int:
+def _build(args: argparse.Namespace) -> int:
     """Handle ``dexforge build --urdf``: translate a URDF, then verify the crate."""
+    try:
+        repo_root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root()
+    except FileNotFoundError as exc:
+        print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    base = Path(args.output).resolve()
+
     urdf = Path(args.urdf)
     if not urdf.is_file():
         print(f"[dexforge] ERROR: URDF file not found: {urdf}", file=sys.stderr)
@@ -1533,7 +1442,7 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
 
     print(f"[dexforge] translating {urdf.name} into an IK driver via the LLM …")
     ok, arm, output = generate_driver_from_urdf(
-        urdf, args.base, args.ee, repo_root, base, _llm_options(args)
+        urdf, args.base, args.ee, repo_root, base, args.llm_key, args.llm_url, args.llm_model, args.llm_max_retries
     )
     if not ok:
         print(
@@ -1565,62 +1474,6 @@ def _build_from_urdf(args: argparse.Namespace, repo_root: Path, base: Path) -> i
 
     print(f"[dexforge] done: standalone driver crate under {base}.")
     return 0
-
-
-def _export_arm(
-    arm: str,
-    repo_root: Path,
-    out_dir: Path,
-    args: argparse.Namespace,
-) -> int:
-    """Plan, optionally list, write, and verify the stand-alone crate for *arm*."""
-    try:
-        export = plan_export(arm, out_dir, repo_root, args.name)
-    except FileNotFoundError as exc:
-        print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    if args.list:
-        print("[dexforge] compile plan (1 crate):")
-        print(f"  {export.arm} -> {export.out_dir}")
-        print(f"      crate '{export.crate_name}', {len(export.files())} file(s):")
-        for path in export.files():
-            print(f"        {path.relative_to(export.out_dir)}")
-        return 0
-
-    print(f"[dexforge] compiling {export.arm} driver -> {export.out_dir}")
-    try:
-        written = write_export(export)
-    except FileNotFoundError as exc:
-        print(f"[dexforge]   \u2717 {exc}", file=sys.stderr)
-        return 1
-    print(f"[dexforge]   wrote {len(written)} file(s); crate '{export.crate_name}'.")
-
-    if args.verify:
-        print("[dexforge]   verifying standalone build (cargo build --release) …")
-        ok, output = verify_crate(export.out_dir)
-        if not ok:
-            print(f"[dexforge]   \u2717 {export.arm} failed to build:\n{output}", file=sys.stderr)
-            return 1
-        print(f"[dexforge]   \u2713 {export.arm} builds standalone.")
-    else:
-        print(f"[dexforge]   \u2713 {export.arm} compiled (build not verified).")
-
-    print(f"[dexforge] done: standalone driver crate under {export.out_dir}.")
-    return 0
-
-
-def _build(args: argparse.Namespace) -> int:
-    try:
-        repo_root = Path(args.repo_root).resolve() if args.repo_root else find_repo_root()
-    except FileNotFoundError as exc:
-        print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    base = Path(args.output).resolve()
-
-    # End-to-end path: compile a driver straight from a URDF via the LLM.
-    return _build_from_urdf(args, repo_root, base)
 
 
 def build_parser() -> argparse.ArgumentParser:
