@@ -307,9 +307,9 @@ def test_perf_solve(arm, request):
     if do_perf:
         print(
             f"\n[perf] {arm}  N={n}\n"
-            f"  Python total={t_py*1e3:.1f} ms  per-IK={t_py/n*1e6:.1f} us\n"
-            f"  Rust   total={t_rust*1e3:.1f} ms  per-IK={t_rust/n*1e6:.1f} us\n"
-            f"  Speedup: {t_py/t_rust:.1f}x"
+            f"  Python: {t_py/n*1e3:.3f} ms  \n"
+            f"  Rust: {t_rust/n*1e3:.3f} ms  \n"
+            f"  Speedup: {t_py/t_rust:.0f}x"
         )
 
     # Minimal correctness check: at least one pose should produce solutions.

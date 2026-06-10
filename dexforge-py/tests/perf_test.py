@@ -85,12 +85,14 @@ def bench(arm: str, n: int) -> None:
     print(f"Arm      : {arm}   N={actual_n}")
     print(sep)
     print(
-        f"Python   : total={t_py*1e3:8.1f} ms   per-IK={t_py/actual_n*1e6:7.1f} µs"
+        f"Python   : {t_py/actual_n*1e3:8.3f} ms"
     )
     print(
-        f"Rust     : total={t_rust*1e3:8.1f} ms   per-IK={t_rust/actual_n*1e6:7.1f} µs"
+        f"Rust     : {t_rust/actual_n*1e3:8.3f} ms"
     )
-    print(f"Speedup  : {t_py/t_rust:.2f}x  (Rust vs Python)")
+    speedup_str = f"{t_py/t_rust:.0f}x"
+    speedup_str = f"\033[92m{speedup_str}\033[0m" if t_py > t_rust else f"\033[91m{speedup_str}\033[0m"
+    print(f"Speedup  : {speedup_str} (Rust vs Python)")
     print(sep)
 
 
