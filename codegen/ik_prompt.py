@@ -17,11 +17,22 @@ import subprocess
 import sys
 import shutil
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
+
+
+class IKGenerationEntrypoint(NamedTuple):
+    """Prepared inputs produced by the IK prompt entrypoint."""
+
+    ssik_artifact: str
+    arm_name: str
+    example_arm: str
+    max_solutions: int
+    dof: int
+    context: str
 
 
 def _get_locked_ssik_version() -> str:
@@ -230,6 +241,86 @@ def find_best_example(target_py_code: str) -> Tuple[str, int]:
         )
 
 
+def _resolve_repo_driver_dir(repo_root: Path, arm: str) -> Optional[Path]:
+    """Resolve a driver directory in the repo for an arm name.
+    """
+    drivers_root = repo_root / "src" / "drivers"
+    for candidate in sorted(drivers_root.glob(f"*/drivers/{arm}")):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def generate_context(
+    urdf_path: Path,
+    base_link: Optional[str],
+    ee_link: Optional[str],
+    output_dir: Path,
+    repo_root: Path,
+) -> IKGenerationEntrypoint:
+    """Main entrypoint for preparing IK generation inputs.
+
+    Runs locked-version verification, Step 0 (artifact generation/loading),
+    Step 1 (family detection), and Step 2 (context assembly).
+    """
+    locked_version = _get_locked_ssik_version()
+    print(f"[ik_generator] Locked ssik version: {locked_version}")
+    _verify_ssik_version()
+    print("[ik_generator] ✓ ssik version verified")
+
+    print("[ik_generator] Step 0: Loading Python artifact …")
+    if not base_link or not ee_link:
+        raise ValueError("--urdf requires both --base and --ee to be specified.")
+
+    ssik_artifact, artifact_stem = generate_artifact_from_urdf(
+        urdf_path, base_link, ee_link, output_dir
+    )
+    print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
+    arm_name = artifact_stem.removesuffix("_ik")
+
+    print("[ik_generator] Step 1: Detecting kinematic family …")
+    example_arm, max_solutions, dof = find_best_example(ssik_artifact)
+    print(
+        f"[ik_generator]   → example arm: '{example_arm}', "
+        f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
+    )
+
+    # Fall back gracefully when the chosen example arm has no Rust driver yet.
+    if _resolve_repo_driver_dir(repo_root, example_arm) is None:
+        fallback = "franka_panda"
+        if _resolve_repo_driver_dir(repo_root, fallback) is not None:
+            print(
+                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
+                f"falling back to '{fallback}' as structural template."
+            )
+            example_arm = fallback
+        else:
+            print(
+                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
+                "or fallback 'franka_panda'. The one-shot example will be empty.",
+                file=sys.stderr,
+            )
+
+    print("[ik_generator] Step 2: Assembling context …")
+    context = assemble_context(
+        ssik_artifact,
+        arm_name,
+        example_arm,
+        max_solutions,
+        repo_root,
+    )
+    print(f"[ik_generator]   Context assembled ({len(context):,} chars).")
+
+    return IKGenerationEntrypoint(
+        ssik_artifact=ssik_artifact,
+        arm_name=arm_name,
+        example_arm=example_arm,
+        max_solutions=max_solutions,
+        dof=dof,
+        context=context,
+    )
+
+
 def extract_rust_signatures(rust_file_path: Path) -> str:
     """Extract ``pub fn`` signatures and their ``///`` docstrings from a Rust file.
 
@@ -290,8 +381,9 @@ def _load_example_py_source(example_arm: str) -> str:
 
 def _load_example_rust_source(example_arm: str, repo_root: Path) -> str:
     """Load the translated Rust IK driver for *example_arm* from the source tree."""
-    rs_path = repo_root / "src" / "drivers" / example_arm / "ik_solver.rs"
-    if rs_path.exists():
+    driver_dir = _resolve_repo_driver_dir(repo_root, example_arm)
+    rs_path = (driver_dir / "ik_solver.rs") if driver_dir is not None else None
+    if rs_path is not None and rs_path.exists():
         return rs_path.read_text(encoding="utf-8")
     return (
         f"// driver source for {example_arm!r} does not exist yet — "
@@ -305,9 +397,12 @@ def _load_example_scripts(example_arm: str, repo_root: Path) -> str:
     Looks for ``generate_test_data.py`` and ``generate_code.py`` under
     ``src/drivers/<example_arm>/codegen/``.
     """
-    codegen_dir = repo_root / "src" / "drivers" / example_arm / "codegen"
+    driver_dir = _resolve_repo_driver_dir(repo_root, example_arm)
+    codegen_dir = (driver_dir / "codegen") if driver_dir is not None else None
     arm_scripts: list[str] = []
     for script_name in ("generate_test_data.py", "generate_code.py"):
+        if codegen_dir is None:
+            continue
         path = codegen_dir / script_name
         if path.exists():
             arm_scripts.append(f"--- {script_name} ---\n" + path.read_text(encoding="utf-8"))

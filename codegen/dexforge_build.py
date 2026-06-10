@@ -1273,11 +1273,7 @@ def _run_ik_generator_core(
         )
         from ik_llm import IKGeneratorLLM
         from ik_prompt import (
-            assemble_context,
-            find_best_example,
-            generate_artifact_from_urdf,
-            _get_locked_ssik_version,
-            _verify_ssik_version,
+            generate_context,
         )
     except ImportError:
         from codegen.ik_build import (  # type: ignore[no-redef]
@@ -1289,77 +1285,28 @@ def _run_ik_generator_core(
         )
         from codegen.ik_llm import IKGeneratorLLM  # type: ignore[no-redef]
         from codegen.ik_prompt import (  # type: ignore[no-redef]
-            assemble_context,
-            find_best_example,
-            generate_artifact_from_urdf,
-            _get_locked_ssik_version,
-            _verify_ssik_version,
+            generate_context,
         )
 
     arm_name = urdf.stem if urdf is not None else ""
 
-    # --- Check locked ssik version ---
+    # --- Step 0/1/2: artifact + family + context entrypoint ---
     try:
-        locked_version = _get_locked_ssik_version()
-        print(f"[ik_generator] Locked ssik version: {locked_version}")
-        _verify_ssik_version()
-        print("[ik_generator] ✓ ssik version verified")
-    except (ImportError, FileNotFoundError) as exc:
-        return False, arm_name, str(exc)
-
-    # --- Step 0: Generate artifact from URDF ---
-    print("[ik_generator] Step 0: Loading Python artifact …")
-    try:
-        if not base_link or not ee_link:
-            return False, arm_name, "--urdf requires both --base and --ee to be specified."
-        ssik_artifact, artifact_stem = generate_artifact_from_urdf(
-            urdf, base_link, ee_link, output_dir
+        entry = generate_context(
+            urdf_path=urdf,
+            base_link=base_link,
+            ee_link=ee_link,
+            output_dir=output_dir,
+            repo_root=repo_root,
         )
-        print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
-    except (ImportError, FileNotFoundError, RuntimeError) as exc:
+        ssik_artifact = entry.ssik_artifact
+        arm_name = entry.arm_name
+        example_arm = entry.example_arm
+        max_solutions = entry.max_solutions
+        dof = entry.dof
+        context = entry.context
+    except (ImportError, FileNotFoundError, RuntimeError, ValueError) as exc:
         return False, arm_name, str(exc)
-
-    arm_name = artifact_stem.removesuffix("_ik")
-
-    # --- Step 1: Detect kinematic family ---
-    print("[ik_generator] Step 1: Detecting kinematic family …")
-    try:
-        example_arm, max_solutions, dof = find_best_example(ssik_artifact)
-    except ValueError as exc:
-        return False, arm_name, str(exc)
-    print(
-        f"[ik_generator]   → example arm: '{example_arm}', "
-        f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
-
-    )
-
-    # Fall back gracefully when the chosen example arm has no Rust driver yet.
-    rs_example = _driver_dir(repo_root, example_arm) / "ik_solver.rs"
-    if not rs_example.exists():
-        fallback = "franka_panda"
-        fallback_path = _driver_dir(repo_root, fallback) / "ik_solver.rs"
-        if fallback_path.exists():
-            print(
-                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
-                f"falling back to '{fallback}' as structural template."
-            )
-            example_arm = fallback
-        else:
-            print(
-                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
-                "or fallback 'franka_panda'. The one-shot example will be empty.",
-                file=sys.stderr,
-            )
-
-    # --- Step 3: Assemble context ---
-    print("[ik_generator] Step 3: Assembling context …")
-    try:
-        context = assemble_context(
-            ssik_artifact, arm_name, example_arm, max_solutions, repo_root
-        )
-    except FileNotFoundError as exc:
-        return False, arm_name, str(exc)
-    print(f"[ik_generator]   Context assembled ({len(context):,} chars).")
 
     # --- Step 4: Invoke LLM with retry loop ---
     print("[ik_generator] Step 4: Invoking LLM …")
