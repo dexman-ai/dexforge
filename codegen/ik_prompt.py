@@ -205,22 +205,22 @@ def find_best_example(target_py_code: str) -> Tuple[str, int]:
         if "husty_pfurner" in target_py_code or "polynomial" in target_py_code:
             # Category 4: Non-SRS 7-DOF (Flexiv, xArm7)
             # Requires the Husty-Pfurner polynomial loop template.
-            return "xarm7", 256
+            return "xarm7", 256, 7
         else:
             # Category 3: Canonical SRS / jointlock 7-DOF (Franka, KUKA, xArm7)
             # Requires the standard Joint-Lock + SP6 template.
-            return "franka_panda", 128
+            return "franka_panda", 128, 7
 
     # ---- 6-DOF Arms ----
     elif "DOF = 6" in target_py_code or _has_16:
         if "raghavan_roth" in target_py_code or "_ssik_solve_x2_roots_mobius" in target_py_code:
             # Category 2: General 6R (Piper, JACO)
             # Requires the Raghavan-Roth template.
-            return "piper", 16
+            return "piper", 16, 6
         else:
             # Category 1: Pieper-compliant 6-DOF (UR5, Puma, ABB, Fanuc)
             # Requires the fast SP6 template.
-            return "ur5", 8
+            return "ur5", 8, 6
 
     else:
         raise ValueError(

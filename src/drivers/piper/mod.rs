@@ -4,6 +4,7 @@
 //! (solver `ikgeo.general_6r`, tier 2). See [`ik_solver`] for the public API.
 
 mod consts;
+pub mod arm;
 pub mod generated_kinematics;
 pub mod ik_solver;
 mod pq;

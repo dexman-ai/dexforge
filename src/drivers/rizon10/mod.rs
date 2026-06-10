@@ -4,6 +4,7 @@
 //! (solver `jointlock.seven_r`, tier 1). See [`ik_solver`] for the public API.
 
 mod consts;
+pub mod arm;
 pub mod generated_kinematics;
 pub mod ik_solver;
 mod pq;

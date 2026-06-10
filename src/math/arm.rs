@@ -20,8 +20,8 @@
 //! ```
 //!
 //! Each arm is a zero-sized marker type ([`Ur5`], [`Piper`], [`FrankaPanda`],
-//! [`Xarm7`], [`Rizon4`], [`Rizon10`]) that implements [`Arm`] by delegating to
-//! its existing `ik_solver`/`generated_kinematics` functions. The facade
+//! [`Xarm7`], [`Rizon4`], [`Rizon10`]) whose [`ArmModel`] implementation lives
+//! in its driver module alongside the arm-specific solver code. The facade
 //! methods ([`Arm::fk`], [`Arm::ik`], [`Arm::jacobian`],
 //! [`Arm::inverse_jacobian`], [`Arm::gravity`], [`Arm::mass_matrix`],
 //! [`Arm::coriolis`]) are default trait methods built directly in this module,
@@ -36,6 +36,13 @@ use nalgebra::SMatrix;
 
 use crate::math::ssik_core::{add3, cross3, dot3};
 use crate::math::tolerances::TolerancePolicy;
+
+pub use crate::drivers::franka_panda::arm::FrankaPanda;
+pub use crate::drivers::piper::arm::Piper;
+pub use crate::drivers::rizon10::arm::Rizon10;
+pub use crate::drivers::rizon4::arm::Rizon4;
+pub use crate::drivers::ur5::arm::Ur5;
+pub use crate::drivers::xarm7::arm::Xarm7;
 
 /// Finite-difference step (rad) for the payload Coriolis directional derivative.
 const CORIOLIS_FD_STEP: f64 = 1e-6;
@@ -353,209 +360,6 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
             tau[i] = payload.mass * dot3(&jvp[i], &a_bias);
         }
         tau
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-arm marker types
-// ---------------------------------------------------------------------------
-
-/// Universal Robots UR5 (6-DOF) driver marker.
-pub struct Ur5;
-/// AgileX Piper (6-DOF) driver marker.
-pub struct Piper;
-/// Franka Emika Panda (7-DOF) driver marker.
-pub struct FrankaPanda;
-/// UFactory xArm7 (7-DOF) driver marker.
-pub struct Xarm7;
-/// Flexiv Rizon 4 (7-DOF) driver marker.
-pub struct Rizon4;
-/// Flexiv Rizon 10 (7-DOF) driver marker.
-pub struct Rizon10;
-
-impl ArmModel<6, 16> for Ur5 {
-    #[inline]
-    fn flange_fk(q: &[f64; 6]) -> Pose {
-        crate::drivers::ur5::ik_solver::fk(q)
-    }
-    #[inline]
-    fn flange_jacobian(q: &[f64; 6]) -> [[f64; 6]; 6] {
-        crate::drivers::ur5::generated_kinematics::jacobian(q)
-    }
-    #[inline]
-    fn flange_solve(
-        target: &Pose,
-        max_solutions: Option<usize>,
-        q_seed: Option<&[f64; 6]>,
-        respect_limits: bool,
-        allow_refinement: bool,
-        policy: TolerancePolicy,
-        refinement_max_iters: usize,
-    ) -> [Option<[f64; 6]>; 16] {
-        crate::drivers::ur5::ik_solver::solve(
-            target,
-            max_solutions,
-            q_seed,
-            respect_limits,
-            allow_refinement,
-            policy,
-            refinement_max_iters,
-        )
-    }
-}
-
-impl ArmModel<6, 16> for Piper {
-    #[inline]
-    fn flange_fk(q: &[f64; 6]) -> Pose {
-        crate::drivers::piper::ik_solver::fk(q)
-    }
-    #[inline]
-    fn flange_jacobian(q: &[f64; 6]) -> [[f64; 6]; 6] {
-        crate::drivers::piper::generated_kinematics::jacobian(q)
-    }
-    #[inline]
-    fn flange_solve(
-        target: &Pose,
-        max_solutions: Option<usize>,
-        q_seed: Option<&[f64; 6]>,
-        respect_limits: bool,
-        allow_refinement: bool,
-        policy: TolerancePolicy,
-        refinement_max_iters: usize,
-    ) -> [Option<[f64; 6]>; 16] {
-        crate::drivers::piper::ik_solver::solve(
-            target,
-            max_solutions,
-            q_seed,
-            respect_limits,
-            allow_refinement,
-            policy,
-            refinement_max_iters,
-        )
-    }
-}
-
-impl ArmModel<7, 128> for FrankaPanda {
-    #[inline]
-    fn flange_fk(q: &[f64; 7]) -> Pose {
-        crate::drivers::franka_panda::ik_solver::fk(q)
-    }
-    #[inline]
-    fn flange_jacobian(q: &[f64; 7]) -> [[f64; 7]; 6] {
-        crate::drivers::franka_panda::generated_kinematics::jacobian(q)
-    }
-    #[inline]
-    fn flange_solve(
-        target: &Pose,
-        max_solutions: Option<usize>,
-        q_seed: Option<&[f64; 7]>,
-        respect_limits: bool,
-        allow_refinement: bool,
-        policy: TolerancePolicy,
-        refinement_max_iters: usize,
-    ) -> [Option<[f64; 7]>; 128] {
-        crate::drivers::franka_panda::ik_solver::solve(
-            target,
-            max_solutions,
-            q_seed,
-            respect_limits,
-            allow_refinement,
-            policy,
-            refinement_max_iters,
-        )
-    }
-}
-
-impl ArmModel<7, 128> for Xarm7 {
-    #[inline]
-    fn flange_fk(q: &[f64; 7]) -> Pose {
-        crate::drivers::xarm7::ik_solver::fk(q)
-    }
-    #[inline]
-    fn flange_jacobian(q: &[f64; 7]) -> [[f64; 7]; 6] {
-        crate::drivers::xarm7::generated_kinematics::jacobian(q)
-    }
-    #[inline]
-    fn flange_solve(
-        target: &Pose,
-        max_solutions: Option<usize>,
-        q_seed: Option<&[f64; 7]>,
-        respect_limits: bool,
-        allow_refinement: bool,
-        policy: TolerancePolicy,
-        refinement_max_iters: usize,
-    ) -> [Option<[f64; 7]>; 128] {
-        crate::drivers::xarm7::ik_solver::solve(
-            target,
-            max_solutions,
-            q_seed,
-            respect_limits,
-            allow_refinement,
-            policy,
-            refinement_max_iters,
-        )
-    }
-}
-
-impl ArmModel<7, 256> for Rizon4 {
-    #[inline]
-    fn flange_fk(q: &[f64; 7]) -> Pose {
-        crate::drivers::rizon4::ik_solver::fk(q)
-    }
-    #[inline]
-    fn flange_jacobian(q: &[f64; 7]) -> [[f64; 7]; 6] {
-        crate::drivers::rizon4::generated_kinematics::jacobian(q)
-    }
-    #[inline]
-    fn flange_solve(
-        target: &Pose,
-        max_solutions: Option<usize>,
-        q_seed: Option<&[f64; 7]>,
-        respect_limits: bool,
-        allow_refinement: bool,
-        policy: TolerancePolicy,
-        refinement_max_iters: usize,
-    ) -> [Option<[f64; 7]>; 256] {
-        crate::drivers::rizon4::ik_solver::solve(
-            target,
-            max_solutions,
-            q_seed,
-            respect_limits,
-            allow_refinement,
-            policy,
-            refinement_max_iters,
-        )
-    }
-}
-
-impl ArmModel<7, 256> for Rizon10 {
-    #[inline]
-    fn flange_fk(q: &[f64; 7]) -> Pose {
-        crate::drivers::rizon10::ik_solver::fk(q)
-    }
-    #[inline]
-    fn flange_jacobian(q: &[f64; 7]) -> [[f64; 7]; 6] {
-        crate::drivers::rizon10::generated_kinematics::jacobian(q)
-    }
-    #[inline]
-    fn flange_solve(
-        target: &Pose,
-        max_solutions: Option<usize>,
-        q_seed: Option<&[f64; 7]>,
-        respect_limits: bool,
-        allow_refinement: bool,
-        policy: TolerancePolicy,
-        refinement_max_iters: usize,
-    ) -> [Option<[f64; 7]>; 256] {
-        crate::drivers::rizon10::ik_solver::solve(
-            target,
-            max_solutions,
-            q_seed,
-            respect_limits,
-            allow_refinement,
-            policy,
-            refinement_max_iters,
-        )
     }
 }
 

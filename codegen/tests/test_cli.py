@@ -49,6 +49,7 @@ class PlanExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             export = cli.plan_export("ur5", Path(tmp), _REPO_ROOT)
         dsts = {dst.name for _, dst in export.copies}
+        self.assertIn("arm.rs", dsts)
         self.assertIn("ik_solver.rs", dsts)
         self.assertIn("generated_kinematics.rs", dsts)
 
@@ -69,6 +70,12 @@ class PlanExportTests(unittest.TestCase):
             export = cli.plan_export("ur5", Path(tmp), _REPO_ROOT)
         gen = {dst.name for dst, _ in export.generated}
         self.assertEqual(gen, {"Cargo.toml", "lib.rs", "mod.rs"})
+
+    def test_generate_armmodel_impl_renders_arm_module(self) -> None:
+        rendered = cli.generate_armmodel_impl("franka_panda", 7, 128)
+        self.assertIn("pub struct FrankaPanda;", rendered)
+        self.assertIn("impl ArmModel<7, 128> for FrankaPanda", rendered)
+        self.assertIn("crate::drivers::franka_panda::ik_solver::fk(q)", rendered)
 
     def test_lib_rs_reexports_arm_entrypoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -157,7 +157,10 @@ def _ensure_arm_mod_rs(output_root: Path, arm_name: str, rust_files: list[str]) 
         stem = Path(fname).stem
         if stem in ("ik_solver", "mod", "test_data"):
             continue
-        lines.append(f"mod {stem};")
+        if stem == "arm":
+            lines.append("pub mod arm;")
+        else:
+            lines.append(f"mod {stem};")
     mod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[ik_generator]   Created {mod_path.relative_to(output_root)}")
 

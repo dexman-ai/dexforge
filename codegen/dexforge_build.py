@@ -193,6 +193,61 @@ def _drivers_mod_rs(arm: str, shared_modules: Sequence[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _arm_marker_name(arm_name: str) -> str:
+    """Render the Rust marker type name for an arm module."""
+    return "".join(part[:1].upper() + part[1:] for part in arm_name.split("_") if part)
+
+
+def generate_armmodel_impl(arm_name: str, dof: int, max_solutions: int) -> str:
+    """Render the per-arm ``arm.rs`` module containing the ArmModel impl.
+
+    The generated module owns the zero-sized marker type and the concrete
+    ``ArmModel`` implementation for the arm's ``fk`` / ``jacobian`` /
+    ``solve`` entry points.
+    """
+    marker_name = _arm_marker_name(arm_name)
+    return f"""\
+use crate::math::arm::{{ArmModel, Pose}};
+use crate::math::tolerances::TolerancePolicy;
+
+/// {marker_name} driver marker.
+pub struct {marker_name};
+
+impl ArmModel<{dof}, {max_solutions}> for {marker_name} {{
+    #[inline]
+    fn flange_fk(q: &[f64; {dof}]) -> Pose {{
+        crate::drivers::{arm_name}::ik_solver::fk(q)
+    }}
+
+    #[inline]
+    fn flange_jacobian(q: &[f64; {dof}]) -> [[f64; {dof}]; 6] {{
+        crate::drivers::{arm_name}::generated_kinematics::jacobian(q)
+    }}
+
+    #[inline]
+    fn flange_solve(
+        target: &Pose,
+        max_solutions: Option<usize>,
+        q_seed: Option<&[f64; {dof}]>,
+        respect_limits: bool,
+        allow_refinement: bool,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> [Option<[f64; {dof}]>; {max_solutions}] {{
+        crate::drivers::{arm_name}::ik_solver::solve(
+            target,
+            max_solutions,
+            q_seed,
+            respect_limits,
+            allow_refinement,
+            policy,
+            refinement_max_iters,
+        )
+    }}
+}}
+"""
+
+
 def _shared_modules_used(driver_src: Path) -> List[str]:
     """Detect which shared ``crate::drivers::<module>`` modules *driver_src* uses.
 
@@ -1270,12 +1325,13 @@ def _run_ik_generator_core(
     # --- Step 1: Detect kinematic family ---
     print("[ik_generator] Step 1: Detecting kinematic family …")
     try:
-        example_arm, max_solutions = find_best_example(target_py_code)
+        example_arm, max_solutions, dof = find_best_example(target_py_code)
     except ValueError as exc:
         return False, arm, str(exc)
     print(
         f"[ik_generator]   → example arm: '{example_arm}', "
-        f"MAX_SOLUTIONS = {max_solutions}"
+        f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
+
     )
 
     # Fall back gracefully when the chosen example arm has no Rust driver yet.
@@ -1356,6 +1412,9 @@ def _run_ik_generator_core(
             f"[ik_generator]   Parsed {len(files)} file(s): "
             + ", ".join(files.keys())
         )
+
+        if "arm.rs" not in files:
+            files["arm.rs"] = generate_armmodel_impl(arm_name, dof, max_solutions)
 
         # --- Step 6: Write generated files ---
         print("[ik_generator] Step 6: Writing generated files …")
