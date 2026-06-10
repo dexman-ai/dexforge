@@ -11,5 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"] }
-ssik-rust = { path = ".." }
+dexforge-examples = { path = "../src" }
 nalgebra = { version = "0.33", default-features = false, features = ["libm"] }

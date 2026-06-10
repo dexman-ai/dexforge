@@ -113,23 +113,21 @@ For detailed translation guidance, refer to `codegen/translate_ssik_artifact.md`
 
 ## Build & Test
 
-```bash
-cargo test                                             # host tests
-cargo build --release --target thumbv7em-none-eabihf  # embedded no_std
-```
+The Rust crate lives under `src/` and is built only through maturin from
+`dexforge-py/`.
 
 For Python bindings (dexforge-py):
 ```bash
 cd dexforge-py
-maturin build --release
+maturin develop --release
 pytest tests/
 ```
 
 ## PR Checklist
 
 Before submitting a PR with new Rust IK code:
-- [ ] Code compiles: `cargo build --release` and `cargo build --release --target thumbv7em-none-eabihf`
-- [ ] All tests pass: `cargo test`
+- [ ] `cd dexforge-py && maturin develop --release` succeeds
+- [ ] `cd dexforge-py && pytest tests/` passes
 - [ ] No `unsafe`, no `Vec`/`Box`/`std` heap allocation outside `#[cfg(test)]`
 - [ ] All loops have hardcoded iteration ceilings
 - [ ] FK verification done for every solution candidate

@@ -103,17 +103,17 @@ def find_repo_root(start: Optional[Path] = None) -> Path:
     """Locate the dexforge repository root (the source of driver/math files).
 
     Walks upward from *start* (the directory containing this module by default)
-    until it finds a directory holding both ``Cargo.toml`` and ``src/math``.
+    until it finds a directory holding ``src/Cargo.toml`` and ``src/math``.
 
     :raises FileNotFoundError: If no repository root is found.
     """
     here = start or Path(__file__).resolve().parent
     for candidate in (here, *here.parents):
-        if (candidate / "Cargo.toml").is_file() and (candidate / "src" / "math").is_dir():
+        if (candidate / "src" / "Cargo.toml").is_file() and (candidate / "src" / "math").is_dir():
             return candidate
     raise FileNotFoundError(
         "could not locate the dexforge source tree (no parent directory contains "
-        "both 'Cargo.toml' and 'src/math/'). Run 'dexforge build' from a dexforge "
+        "both 'src/Cargo.toml' and 'src/math/'). Run 'dexforge build' from a dexforge "
         "checkout, or pass --repo-root."
     )
 

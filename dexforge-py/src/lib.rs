@@ -29,12 +29,12 @@ use nalgebra::SMatrix;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use ssik_rust::drivers::franka_panda::ik_solver as franka;
-use ssik_rust::drivers::piper::ik_solver as piper;
-use ssik_rust::drivers::rizon10::ik_solver as rizon10;
-use ssik_rust::drivers::rizon4::ik_solver as rizon4;
-use ssik_rust::drivers::ur5::ik_solver as ur5;
-use ssik_rust::drivers::xarm7::ik_solver as xarm7;
+use dexforge_examples::drivers::franka_panda::ik_solver as franka;
+use dexforge_examples::drivers::piper::ik_solver as piper;
+use dexforge_examples::drivers::rizon10::ik_solver as rizon10;
+use dexforge_examples::drivers::rizon4::ik_solver as rizon4;
+use dexforge_examples::drivers::ur5::ik_solver as ur5;
+use dexforge_examples::drivers::xarm7::ik_solver as xarm7;
 
 // ---------------------------------------------------------------------------
 // Internal helpers

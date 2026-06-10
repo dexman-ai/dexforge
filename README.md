@@ -17,7 +17,7 @@ hardcoded iteration ceiling so worst-case execution time is bounded.
 
 ```rust
 use nalgebra::SMatrix;
-use ssik_rust::drivers::ur5::ik_solver::{fk, solve, TolerancePolicy};
+use dexforge_examples::drivers::ur5::ik_solver::{fk, solve, TolerancePolicy};
 
 let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of ee_link in base_link */;
 let solutions: [Option<[f64; 6]>; 16] =
@@ -35,7 +35,7 @@ unused slots are `None`.
 
 ```rust
 use nalgebra::SMatrix;
-use ssik_rust::drivers::franka_panda::ik_solver::{fk, solve, TolerancePolicy};
+use dexforge_examples::drivers::franka_panda::ik_solver::{fk, solve, TolerancePolicy};
 
 let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of panda_hand in panda_link0 */;
 let solutions: [Option<[f64; 7]>; 128] =
@@ -54,7 +54,7 @@ a `[Option<[f64; 7]>; 128]` stack array (unused slots are `None`).
 
 ```rust
 use nalgebra::SMatrix;
-use ssik_rust::drivers::piper::ik_solver::{fk, solve, TolerancePolicy};
+use dexforge_examples::drivers::piper::ik_solver::{fk, solve, TolerancePolicy};
 
 let target_tf: SMatrix<f64, 4, 4> = /* SE(3) pose of link6 in base_link */;
 let solutions: [Option<[f64; 6]>; 16] =
@@ -95,9 +95,9 @@ implementing the [`Arm`] trait, so a single call shape — `fk`, `ik`, `jacobian
 and takes the runtime TCP / payload as plain arguments.
 
 ```rust
-use ssik_rust::math::arm::{Arm, Xarm7, Payload};
-use ssik_rust::math::tcp::Pose;
-use ssik_rust::math::tolerances::TolerancePolicy;
+use dexforge_examples::math::arm::{Arm, Xarm7, Payload};
+use dexforge_examples::math::tcp::Pose;
+use dexforge_examples::math::tolerances::TolerancePolicy;
 
 // A tool whose control point sits 12 cm along the flange z axis.
 let mut tcp = Pose::identity();
@@ -330,18 +330,16 @@ the `dexforge-py` crate.
 
 ### Building and testing
 
-```sh
-cargo test                                             # host tests, incl. 500-pose dataset
-cargo build --release --target thumbv7em-none-eabihf   # embedded no_std build
-```
+The Rust crate under `src/` is built transitively by maturin from `dexforge-py/`.
+There is no top-level Cargo manifest.
 
 To build and install the Python extension:
 
 ```sh
 cd dexforge-py
 pip install maturin
-maturin build --release          # produces a wheel in ../target/wheels/
-pip install ../target/wheels/dexforge_py-*.whl
+maturin develop --release
+pip install -e .
 ```
 
 ### Python tests

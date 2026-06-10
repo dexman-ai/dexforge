@@ -128,9 +128,9 @@ class WriteExportTests(unittest.TestCase):
             rust = "\n".join(p.read_text(encoding="utf-8") for p in out.rglob("*.rs"))
         # Copied sources reference crate::math / crate::drivers, which resolve
         # within the standalone crate itself — never an external crate path back
-        # into dexforge (e.g. `dexforge::` or the in-repo crate name `ssik_rust`).
+        # into dexforge (e.g. `dexforge::` or the in-repo crate name `dexforge_examples`).
         self.assertNotIn("dexforge::", rust)
-        self.assertNotIn("ssik_rust", rust)
+        self.assertNotIn("dexforge_examples", rust)
 
 
 class RepoRootTests(unittest.TestCase):

@@ -6,8 +6,8 @@
 //! tool-center-point (TCP) and grasped payload passed as plain arguments:
 //!
 //! ```
-//! use ssik_rust::math::arm::{Arm, Xarm7, Payload};
-//! use ssik_rust::math::tcp::Pose;
+//! use dexforge_examples::math::arm::{Arm, Xarm7, Payload};
+//! use dexforge_examples::math::tcp::Pose;
 //!
 //! let q = [0.0; 7];
 //! let mut tcp = Pose::identity();

@@ -87,7 +87,7 @@ Compare the new ssik implementation against the current Rust translation:
 If changes are required:
 1. Create a test file (e.g., `src/math/ssik_core_upgrade_test.rs`) to compare old vs. new behavior
 2. Update the Rust implementation to match the new ssik code
-3. Run `cargo test` to verify the numeric kernels still produce correct results
+3. Rebuild through `dexforge-py` with `maturin develop --release` and run `pytest dexforge-py/tests/ -v` to verify the updated kernels still behave correctly through the supported build path
 4. Document the changes in the function docstrings (e.g., "Updated in ssik 0.9.0 to handle...").
 
 ## Step 4: Analyze Impact on Arm Drivers
@@ -181,33 +181,31 @@ git status src/drivers/*/test_data.rs src/drivers/*/consts.rs src/drivers/*/pq.r
 
 ## Step 6: Run Tests
 
-### 6.1 Build the Rust crate
+The Rust crate under `src/` is not built directly from the repository root.
+Build and validate it only through `dexforge-py/`, where maturin consumes
+`src/Cargo.toml` transitively.
+
+### 6.1 Rebuild the Python extension
 ```bash
-cd /path/to/dexforge
-cargo test --lib
+cd /path/to/dexforge/dexforge-py
+maturin develop --release
 ```
 
 Verify:
-- All unit tests pass
+- The extension rebuilds successfully
 - No compiler warnings related to the upgraded code
 
-### 6.2 Test host binaries (if applicable)
+### 6.2 Run the Python test suite
 ```bash
-cargo build --example piper_solve --release
+cd /path/to/dexforge
+pytest dexforge-py/tests/ -v
 ```
 
-### 6.3 Test embedded compilation (arm-eabihf)
-dexforge is a `#![no_std]` crate; verify it compiles for embedded targets:
-```bash
-cargo build --release --target thumbv7em-none-eabihf
-```
-
-### 6.4 Smoke tests on reference data
+### 6.3 Smoke tests on reference data
 If you regenerated test data or arm drivers, spot-check a few poses:
 ```bash
-# For Piper (has hosted binary):
-cat <<EOF | cargo run --example piper_solve --release
-0.5 0.5 1.0 [[1 0 0 0.1] [0 1 0 0.2] [0 0 1 0.3] [0 0 0 1]]
+cd /path/to/dexforge
+pytest dexforge-py/tests/test_dexforge_py.py --arm=piper --n=5 -v
 EOF
 ```
 
@@ -275,8 +273,8 @@ Before finalizing an ssik upgrade, ensure:
 - [ ] Updated `kinematics.rs` (if needed)
 - [ ] Regenerated test data for all arms
 - [ ] Regenerated constants for applicable arms
-- [ ] All unit tests pass (`cargo test --lib`)
-- [ ] Embedded target compiles (`cargo build --release --target thumbv7em-none-eabihf`)
+- [ ] `cd dexforge-py && maturin develop --release` succeeds
+- [ ] `pytest dexforge-py/tests/ -v` passes
 - [ ] Smoke tests on reference data (if applicable)
 - [ ] Updated `SSIK_VERSION.txt` to the new version
 - [ ] Committed all changes with a clear commit message

@@ -1,12 +1,12 @@
-[workspace]
-members = ["dexforge-py"]
-
 [package]
-name = "ssik-rust"
+name = "dexforge-examples"
 version = "0.1.0"
 edition = "2021"
 description = "Zero-allocation, no_std analytical inverse kinematics translated from the Python ssik artifacts."
 license = "BSD-3-Clause"
+
+[lib]
+path = "lib.rs"
 
 [dependencies]
 libm = "0.2"
@@ -18,8 +18,3 @@ features = ["libm"]
 
 [features]
 default = []
-
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
