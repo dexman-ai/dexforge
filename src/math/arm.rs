@@ -6,8 +6,8 @@
 //! tool-center-point (TCP) and grasped payload passed as plain arguments:
 //!
 //! ```
-//! use dexforge_examples::math::arm::{Arm, Xarm7, Payload};
-//! use dexforge_examples::math::arm::Pose;
+//! use dexforge_examples::drivers::xarm7::arm::Xarm7;
+//! use dexforge_examples::math::arm::{Arm, Payload, Pose};
 //!
 //! let q = [0.0; 7];
 //! let mut tcp = Pose::identity();
@@ -19,8 +19,7 @@
 //! let g = Xarm7::gravity(&q, &payload, &[0.0, 0.0, -9.81]); // payload holding torque
 //! ```
 //!
-//! Each arm is a zero-sized marker type ([`Ur5`], [`Piper`], [`FrankaPanda`],
-//! [`Xarm7`], [`Rizon4`], [`Rizon10`]) whose [`ArmModel`] implementation lives
+//! Each arm is a zero-sized marker type whose [`ArmModel`] implementation lives
 //! in its driver module alongside the arm-specific solver code. The facade
 //! methods ([`Arm::fk`], [`Arm::ik`], [`Arm::jacobian`],
 //! [`Arm::inverse_jacobian`], [`Arm::gravity`], [`Arm::mass_matrix`],
@@ -36,13 +35,6 @@ use nalgebra::SMatrix;
 
 use crate::math::ssik_core::{add3, cross3, dot3};
 use crate::math::tolerances::TolerancePolicy;
-
-pub use crate::drivers::franka_panda::arm::FrankaPanda;
-pub use crate::drivers::piper::arm::Piper;
-pub use crate::drivers::rizon10::arm::Rizon10;
-pub use crate::drivers::rizon4::arm::Rizon4;
-pub use crate::drivers::ur5::arm::Ur5;
-pub use crate::drivers::xarm7::arm::Xarm7;
 
 /// Finite-difference step (rad) for the payload Coriolis directional derivative.
 const CORIOLIS_FD_STEP: f64 = 1e-6;

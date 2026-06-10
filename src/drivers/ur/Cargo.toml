@@ -1,0 +1,18 @@
+[package]
+name = "dexforge-ur"
+version = "0.1.0"
+edition = "2021"
+description = "UR vendor crate wrapping dexforge UR5 examples."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_ur"
+path = "lib.rs"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

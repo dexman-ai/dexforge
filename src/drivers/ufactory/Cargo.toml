@@ -1,0 +1,18 @@
+[package]
+name = "dexforge-ufactory"
+version = "0.1.0"
+edition = "2021"
+description = "uFactory vendor crate wrapping dexforge xArm examples."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_ufactory"
+path = "lib.rs"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

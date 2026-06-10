@@ -1,0 +1,18 @@
+[package]
+name = "dexforge-franka"
+version = "0.1.0"
+edition = "2021"
+description = "Franka vendor crate wrapping dexforge Panda examples."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_franka"
+path = "lib.rs"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

@@ -1,0 +1,18 @@
+[package]
+name = "dexforge-flexiv"
+version = "0.1.0"
+edition = "2021"
+description = "Flexiv vendor crate wrapping dexforge Rizon examples."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_flexiv"
+path = "lib.rs"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

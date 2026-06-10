@@ -8,6 +8,15 @@ license = "BSD-3-Clause"
 [lib]
 path = "lib.rs"
 
+[workspace]
+members = [
+	"drivers/agilex",
+	"drivers/flexiv",
+	"drivers/franka",
+	"drivers/ufactory",
+	"drivers/ur",
+]
+
 [dependencies]
 libm = "0.2"
 
