@@ -7,7 +7,7 @@
 //!
 //! ```
 //! use dexforge_examples::math::arm::{Arm, Xarm7, Payload};
-//! use dexforge_examples::math::tcp::Pose;
+//! use dexforge_examples::math::arm::Pose;
 //!
 //! let q = [0.0; 7];
 //! let mut tcp = Pose::identity();
@@ -24,8 +24,8 @@
 //! its existing `ik_solver`/`generated_kinematics` functions. The facade
 //! methods ([`Arm::fk`], [`Arm::ik`], [`Arm::jacobian`],
 //! [`Arm::inverse_jacobian`], [`Arm::gravity`], [`Arm::mass_matrix`],
-//! [`Arm::coriolis`]) are default trait methods built on the primitives in
-//! [`crate::math::tcp`], so adding TCP/payload support requires **no** code
+//! [`Arm::coriolis`]) are default trait methods built directly in this module,
+//! so adding TCP/payload support requires **no** code
 //! regeneration and changes no per-arm driver code.
 //!
 //! Like the rest of the crate, every method is `#![no_std]`, allocates nothing,
@@ -34,17 +34,69 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::ssik_core::dot3;
-use crate::math::tcp::{
-    flange_point_jacobian, flange_target_for_tcp, fk_with_tcp, payload_gravity_torque,
-    payload_inertia_matrix,
-};
+use crate::math::ssik_core::{add3, cross3, dot3};
 use crate::math::tolerances::TolerancePolicy;
-
-pub use crate::math::tcp::{Payload, Pose};
 
 /// Finite-difference step (rad) for the payload Coriolis directional derivative.
 const CORIOLIS_FD_STEP: f64 = 1e-6;
+
+/// A 4×4 homogeneous SE(3) pose, matching the per-arm `fk` / `solve` type.
+pub type Pose = SMatrix<f64, 4, 4>;
+
+/// A grasped tool / payload rigidly attached to the flange (end-effector link).
+///
+/// The runtime inertial change the issue targets: a `mass` and a centre of
+/// mass `com` expressed in the flange frame. This is everything needed for
+/// gravity compensation (the dominant term when holding a tool in
+/// contact-rich tasks) and for the point-mass inertia contribution.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Payload {
+    /// Tool mass in kilograms.
+    pub mass: f64,
+    /// Tool centre of mass `[x, y, z]` in the flange (end-effector) frame.
+    pub com: [f64; 3],
+}
+
+impl Payload {
+    /// A massless payload (no dynamics contribution).
+    pub const NONE: Payload = Payload {
+        mass: 0.0,
+        com: [0.0, 0.0, 0.0],
+    };
+
+    /// Construct a payload from a mass and flange-frame centre of mass.
+    #[inline]
+    pub const fn new(mass: f64, com: [f64; 3]) -> Payload {
+        Payload { mass, com }
+    }
+}
+
+/// Exact SE(3) inverse of a homogeneous pose `[R | t; 0 0 0 1]`.
+///
+/// Returns `[Rᵀ | -Rᵀ t; 0 0 0 1]`. This is the rigid-motion inverse: it
+/// assumes the rotation block is orthonormal (true for any valid TCP or FK
+/// pose) and so avoids a general matrix factorisation, keeping the cost a
+/// fixed handful of multiply-adds.
+#[inline]
+pub fn se3_inv(m: &Pose) -> Pose {
+    let mut out = Pose::zeros();
+    // Rᵀ
+    for i in 0..3 {
+        for j in 0..3 {
+            out[(i, j)] = m[(j, i)];
+        }
+    }
+    // -Rᵀ t
+    for i in 0..3 {
+        let mut s = 0.0;
+        for k in 0..3 {
+            s += m[(k, i)] * m[(k, 3)];
+        }
+        out[(i, 3)] = -s;
+    }
+    out[(3, 3)] = 1.0;
+    out
+}
 
 /// Minimum-norm (Moore–Penrose) pseudo-inverse `J⁺ = Jᵀ (J Jᵀ)⁻¹` of a
 /// `6 × DOF` geometric Jacobian, returned as a `DOF × 6` array.
@@ -81,14 +133,39 @@ fn pseudo_inverse<const DOF: usize>(j: &[[f64; DOF]; 6]) -> Option<[[f64; 6]; DO
     Some(out)
 }
 
-/// A manipulator driver exposed behind a uniform, TCP/payload-aware interface.
+#[inline]
+pub fn flange_point_jacobian<const DOF: usize>(
+    flange_pose: &Pose,
+    jacobian: &[[f64; DOF]; 6],
+    local: &[f64; 3],
+) -> [[f64; 3]; DOF] {
+    // r = R_flange · local (point offset from flange origin, in base frame).
+    let mut r = [0.0f64; 3];
+    for i in 0..3 {
+        let mut s = 0.0;
+        for k in 0..3 {
+            s += flange_pose[(i, k)] * local[k];
+        }
+        r[i] = s;
+    }
+
+    let mut jvp = [[0.0f64; 3]; DOF];
+    for j in 0..DOF {
+        let jv = [jacobian[0][j], jacobian[1][j], jacobian[2][j]];
+        let jw = [jacobian[3][j], jacobian[4][j], jacobian[5][j]];
+        jvp[j] = add3(&jv, &cross3(&jw, &r));
+    }
+    jvp
+}
+
+/// A manipulator trait exposed behind a uniform, TCP/payload-aware interface.
 ///
 /// `DOF` is the number of actuated joints and `MAX` the capacity of the IK
 /// solution array (both fixed per arm). Implementors only provide the three
 /// *flange-frame* primitives (`flange_fk`, `flange_jacobian`, `flange_solve`);
 /// every TCP/payload-aware method is a provided default built on
-/// [`crate::math::tcp`].
-pub trait Arm<const DOF: usize, const MAX: usize> {
+/// local helpers in [`crate::math::arm`].
+pub trait ArmModel<const DOF: usize, const MAX: usize> {
     /// Forward kinematics of the flange (base → end-effector link), i.e. the
     /// driver's native `fk(q)`.
     fn flange_fk(q: &[f64; DOF]) -> Pose;
@@ -119,7 +196,7 @@ pub trait Arm<const DOF: usize, const MAX: usize> {
     /// Pass [`Pose::identity`] for `tcp` to recover the plain flange FK.
     #[inline]
     fn fk(q: &[f64; DOF], tcp: &Pose) -> Pose {
-        fk_with_tcp(&Self::flange_fk(q), tcp)
+        &Self::flange_fk(q) * tcp
     }
 
     /// Geometric Jacobian `[Jv; Jw]` (6 × DOF) referenced at the **TCP origin**.
@@ -132,6 +209,7 @@ pub trait Arm<const DOF: usize, const MAX: usize> {
         let jflange = Self::flange_jacobian(q);
         let p = [tcp[(0, 3)], tcp[(1, 3)], tcp[(2, 3)]];
         let lin = flange_point_jacobian(&flange, &jflange, &p);
+        
         let mut j = [[0.0f64; DOF]; 6];
         for c in 0..DOF {
             j[0][c] = lin[c][0];
@@ -170,7 +248,7 @@ pub trait Arm<const DOF: usize, const MAX: usize> {
         policy: TolerancePolicy,
         refinement_max_iters: usize,
     ) -> [Option<[f64; DOF]>; MAX] {
-        let flange_target = flange_target_for_tcp(tcp_target, tcp);
+        let flange_target = tcp_target * se3_inv(tcp);
         Self::flange_solve(
             &flange_target,
             max_solutions,
@@ -192,14 +270,32 @@ pub trait Arm<const DOF: usize, const MAX: usize> {
     /// [`payload_gravity_torque`].
     #[inline]
     fn gravity(q: &[f64; DOF], payload: &Payload, gravity: &[f64; 3]) -> [f64; DOF] {
-        payload_gravity_torque(&Self::flange_fk(q), &Self::flange_jacobian(q), payload, gravity)
+        let mut tau = [0.0f64; DOF];
+        if payload.mass == 0.0 {
+            return tau;
+        }
+        let jvp = flange_point_jacobian(&Self::flange_fk(q), &Self::flange_jacobian(q), &payload.com);
+        for j in 0..DOF {
+            tau[j] = -payload.mass * dot3(gravity, &jvp[j]);
+        }
+        tau
     }
 
     /// Grasped `payload` (point-mass) contribution to the joint-space inertia
     /// matrix `M(q)`. See [`payload_inertia_matrix`].
     #[inline]
     fn mass_matrix(q: &[f64; DOF], payload: &Payload) -> [[f64; DOF]; DOF] {
-        payload_inertia_matrix(&Self::flange_fk(q), &Self::flange_jacobian(q), payload)
+        let mut mm = [[0.0f64; DOF]; DOF];
+        if payload.mass == 0.0 {
+            return mm;
+        }
+        let jvp = flange_point_jacobian(&Self::flange_fk(q), &Self::flange_jacobian(q), &payload.com);
+        for i in 0..DOF {
+            for j in 0..DOF {
+                mm[i][j] = payload.mass * dot3(&jvp[i], &jvp[j]);
+            }
+        }
+        mm
     }
 
     /// Coriolis & centrifugal torque `C(q, qd) qd` contributed by a grasped
@@ -277,7 +373,7 @@ pub struct Rizon4;
 /// Flexiv Rizon 10 (7-DOF) driver marker.
 pub struct Rizon10;
 
-impl Arm<6, 16> for Ur5 {
+impl ArmModel<6, 16> for Ur5 {
     #[inline]
     fn flange_fk(q: &[f64; 6]) -> Pose {
         crate::drivers::ur5::ik_solver::fk(q)
@@ -308,7 +404,7 @@ impl Arm<6, 16> for Ur5 {
     }
 }
 
-impl Arm<6, 16> for Piper {
+impl ArmModel<6, 16> for Piper {
     #[inline]
     fn flange_fk(q: &[f64; 6]) -> Pose {
         crate::drivers::piper::ik_solver::fk(q)
@@ -339,7 +435,7 @@ impl Arm<6, 16> for Piper {
     }
 }
 
-impl Arm<7, 128> for FrankaPanda {
+impl ArmModel<7, 128> for FrankaPanda {
     #[inline]
     fn flange_fk(q: &[f64; 7]) -> Pose {
         crate::drivers::franka_panda::ik_solver::fk(q)
@@ -370,7 +466,7 @@ impl Arm<7, 128> for FrankaPanda {
     }
 }
 
-impl Arm<7, 128> for Xarm7 {
+impl ArmModel<7, 128> for Xarm7 {
     #[inline]
     fn flange_fk(q: &[f64; 7]) -> Pose {
         crate::drivers::xarm7::ik_solver::fk(q)
@@ -401,7 +497,7 @@ impl Arm<7, 128> for Xarm7 {
     }
 }
 
-impl Arm<7, 256> for Rizon4 {
+impl ArmModel<7, 256> for Rizon4 {
     #[inline]
     fn flange_fk(q: &[f64; 7]) -> Pose {
         crate::drivers::rizon4::ik_solver::fk(q)
@@ -432,7 +528,7 @@ impl Arm<7, 256> for Rizon4 {
     }
 }
 
-impl Arm<7, 256> for Rizon10 {
+impl ArmModel<7, 256> for Rizon10 {
     #[inline]
     fn flange_fk(q: &[f64; 7]) -> Pose {
         crate::drivers::rizon10::ik_solver::fk(q)
