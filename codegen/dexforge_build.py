@@ -1296,7 +1296,7 @@ def _run_ik_generator_core(
             _verify_ssik_version,
         )
 
-    arm = urdf.stem if urdf is not None else ""
+    arm_name = urdf.stem if urdf is not None else ""
 
     # --- Check locked ssik version ---
     try:
@@ -1305,29 +1305,28 @@ def _run_ik_generator_core(
         _verify_ssik_version()
         print("[ik_generator] ✓ ssik version verified")
     except (ImportError, FileNotFoundError) as exc:
-        return False, arm, str(exc)
+        return False, arm_name, str(exc)
 
     # --- Step 0: Generate artifact from URDF ---
     print("[ik_generator] Step 0: Loading Python artifact …")
     try:
         if not base_link or not ee_link:
-            return False, arm, "--urdf requires both --base and --ee to be specified."
-        target_py_code, artifact_stem = generate_artifact_from_urdf(
+            return False, arm_name, "--urdf requires both --base and --ee to be specified."
+        ssik_artifact, artifact_stem = generate_artifact_from_urdf(
             urdf, base_link, ee_link, output_dir
         )
         print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
     except (ImportError, FileNotFoundError, RuntimeError) as exc:
-        return False, arm, str(exc)
+        return False, arm_name, str(exc)
 
     arm_name = artifact_stem.removesuffix("_ik")
-    arm = arm_name
 
     # --- Step 1: Detect kinematic family ---
     print("[ik_generator] Step 1: Detecting kinematic family …")
     try:
-        example_arm, max_solutions, dof = find_best_example(target_py_code)
+        example_arm, max_solutions, dof = find_best_example(ssik_artifact)
     except ValueError as exc:
-        return False, arm, str(exc)
+        return False, arm_name, str(exc)
     print(
         f"[ik_generator]   → example arm: '{example_arm}', "
         f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
@@ -1356,10 +1355,10 @@ def _run_ik_generator_core(
     print("[ik_generator] Step 3: Assembling context …")
     try:
         context = assemble_context(
-            target_py_code, arm_name, example_arm, max_solutions, repo_root
+            ssik_artifact, arm_name, example_arm, max_solutions, repo_root
         )
     except FileNotFoundError as exc:
-        return False, arm, str(exc)
+        return False, arm_name, str(exc)
     print(f"[ik_generator]   Context assembled ({len(context):,} chars).")
 
     # --- Step 4: Invoke LLM with retry loop ---
@@ -1371,7 +1370,7 @@ def _run_ik_generator_core(
             model=llm_model,
         )
     except ImportError as exc:
-        return False, arm, str(exc)
+        return False, arm_name, str(exc)
 
     messages: list = [
         {"role": "system", "content": IKGeneratorLLM.SYSTEM_PROMPT},
@@ -1387,7 +1386,7 @@ def _run_ik_generator_core(
         try:
             raw_response = llm.generate(messages)
         except Exception as exc:  # noqa: BLE001 — surface all API errors
-            return False, arm, f"LLM error ({type(exc).__name__}): {exc}"
+            return False, arm_name, f"LLM error ({type(exc).__name__}): {exc}"
 
         print(f"[ik_generator]   LLM response: {len(raw_response):,} chars.")
 
@@ -1406,7 +1405,7 @@ def _run_ik_generator_core(
                     ),
                 })
                 continue
-            return False, arm, f"Parse error: {exc}"
+            return False, arm_name, f"Parse error: {exc}"
 
         print(
             f"[ik_generator]   Parsed {len(files)} file(s): "
@@ -1423,7 +1422,7 @@ def _run_ik_generator_core(
             repo_root,
             arm_name,
             files,
-            target_py_code,
+            ssik_artifact,
             context,
             urdf,
         )
@@ -1447,7 +1446,7 @@ def _run_ik_generator_core(
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
-            return False, arm, f"Script failures after all retries.\n{failure_details}"
+            return False, arm_name, f"Script failures after all retries.\n{failure_details}"
 
         # --- Step 8: Build the Rust crate ---
         print("[ik_generator] Step 8: Building Rust crate …")
@@ -1462,7 +1461,7 @@ def _run_ik_generator_core(
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
-            return False, arm, f"Build failed after all retries.\n{build_output}"
+            return False, arm_name, f"Build failed after all retries.\n{build_output}"
         print("[ik_generator]   Build succeeded.")
 
         # --- Step 9: Run Rust tests ---
@@ -1478,13 +1477,13 @@ def _run_ik_generator_core(
                 messages.append({"role": "assistant", "content": raw_response})
                 messages.append({"role": "user", "content": error_msg})
                 continue
-            return False, arm, f"Tests failed after all retries.\n{test_output}"
+            return False, arm_name, f"Tests failed after all retries.\n{test_output}"
         print("[ik_generator]   All tests passed.")
 
         # All steps succeeded.
         break
 
-    return True, arm, ""
+    return True, arm_name, ""
 
 
 def generate_driver_from_urdf(
