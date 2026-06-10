@@ -317,7 +317,7 @@ def _load_example_scripts(example_arm: str, repo_root: Path) -> str:
 
 
 def assemble_context(
-    target_py_code: str,
+    ssik_artifact: str,
     target_arm_stem: str,
     example_arm: str,
     max_solutions: int,
@@ -329,7 +329,7 @@ def assemble_context(
     Python artifact, the Rust API headers for ``ssik_core`` and ``kinematics``,
     and the one-shot example (Python + Rust pair plus Python helper scripts).
 
-    :param target_py_code: Source text of the target ``*_ik.py`` artifact.
+    :param ssik_artifact: Text of the source ``*_ik.py`` artifact being translated.
     :param target_arm_stem: Base name of the target arm (e.g. ``"ur5"``).
     :param example_arm: Name of the reference arm selected by
         :func:`find_best_example` (e.g. ``"franka_panda"``).
@@ -393,7 +393,7 @@ def assemble_context(
         "",
         f"--- [SECTION 6] TARGET: Python artifact to translate ('{target_arm_stem}') ---",
         "",
-        target_py_code,
+        ssik_artifact,
         "",
         "=" * 72,
         "END OF CONTEXT — PRODUCE ALL FILES USING THE === FILE: <name> === FORMAT",
