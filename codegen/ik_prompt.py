@@ -38,14 +38,14 @@ class IKGenerationEntrypoint(NamedTuple):
 def _get_locked_ssik_version() -> str:
     """Read the locked ssik version from SSIK_VERSION.txt.
 
-    :returns: Version string (e.g., "0.8.3").
+    :returns: Version string (e.g., "1.2.3").
     :raises FileNotFoundError: If SSIK_VERSION.txt is not found.
     """
     version_file = _REPO_ROOT / "SSIK_VERSION.txt"
     if not version_file.exists():
         raise FileNotFoundError(
             f"SSIK_VERSION.txt not found at {version_file}. "
-            "Create it with the locked ssik version (e.g., 'ssik==0.8.3')."
+            "Create it with the locked ssik version (e.g., 'ssik==1.2.3')."
         )
     content = version_file.read_text(encoding="utf-8").strip()
     # Parse "ssik==X.Y.Z" or "X.Y.Z" format
@@ -83,7 +83,7 @@ def _verify_ssik_version() -> str:
     return locked_version
 
 
-def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
+def try_load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
     """Load a ssik prebuilt artifact by name or file path.
 
     :param artifact_name: Either a bare module name (e.g. ``"ur5_ik"``) to
@@ -111,10 +111,7 @@ def load_prebuilt_artifact(artifact_name: str) -> Tuple[str, str]:
     try:
         mod = importlib.import_module(f"ssik.prebuilt.{module_name}")
     except ModuleNotFoundError:
-        raise ImportError(
-            f"Cannot find '{artifact_name}' as a file or as ssik.prebuilt.{module_name}. "
-            "Install ssik (`pip install ssik==$(cat SSIK_VERSION.txt | cut -d= -f3)`) or provide a path to the artifact file."
-        )
+        return None, None
 
     source_code = inspect.getsource(mod)
     return source_code, module_name
@@ -183,22 +180,19 @@ def generate_artifact_from_urdf(
         raise RuntimeError(
             f"ssik build reported success but the output file '{out_path}' was not created."
         )
-    urdf_copy = output_dir / f"{stem}.urdf"
-    if urdf_path.resolve() != urdf_copy.resolve():
-        shutil.copyfile(urdf_path, urdf_copy)
     source_code = out_path.read_text(encoding="utf-8")
     return source_code, f"{stem}_ik"
 
 
-def find_best_example(target_py_code: str) -> Tuple[str, int]:
+def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
     """Dynamically determine the kinematic family and maximum IK solution count.
 
     Inspects the target Python artifact's source code for DOF and solver
     signatures to select the most appropriate existing Rust example and the
     ``MAX_SOLUTIONS`` constant for the ``solve()`` return type.
 
-    :param target_py_code: Full source text of the target ``*_ik.py`` artifact.
-    :returns: ``(example_arm_name, max_solutions)`` where *example_arm_name*
+    :param ssik_artifact: Full source text of the target ``*_ik.py`` artifact.
+    :returns: ``(example_arm_name, max_solutions, dof)`` where *example_arm_name*
         matches a known driver family (e.g. ``"ur5"``, ``"piper"``,
         ``"franka_panda"``).
     :raises ValueError: If the artifact's kinematic topology is not recognised.
@@ -208,12 +202,12 @@ def find_best_example(target_py_code: str) -> Tuple[str, int]:
     # "_pq_x128" or floating-point coefficients.
     # 128 = MAX_SOLUTIONS for 7-DOF jointlock arms (16 lock samples × 8 sub-solutions)
     # 16  = MAX_SOLUTIONS for general 6R (Raghavan-Roth polynomial system)
-    _has_128 = bool(re.search(r"\b128\b", target_py_code))
-    _has_16 = bool(re.search(r"\b16\b", target_py_code))
+    _has_128 = bool(re.search(r"\b128\b", ssik_artifact))
+    _has_16 = bool(re.search(r"\b16\b", ssik_artifact))
 
     # ---- 7-DOF Arms ----
-    if "DOF = 7" in target_py_code or _has_128:
-        if "husty_pfurner" in target_py_code or "polynomial" in target_py_code:
+    if "DOF = 7" in ssik_artifact or _has_128:
+        if "husty_pfurner" in ssik_artifact or "polynomial" in ssik_artifact:
             # Category 4: Non-SRS 7-DOF (Flexiv, xArm7)
             # Requires the Husty-Pfurner polynomial loop template.
             return "xarm7", 256, 7
@@ -223,8 +217,8 @@ def find_best_example(target_py_code: str) -> Tuple[str, int]:
             return "franka_panda", 128, 7
 
     # ---- 6-DOF Arms ----
-    elif "DOF = 6" in target_py_code or _has_16:
-        if "raghavan_roth" in target_py_code or "_ssik_solve_x2_roots_mobius" in target_py_code:
+    elif "DOF = 6" in ssik_artifact or _has_16:
+        if "raghavan_roth" in ssik_artifact or "_ssik_solve_x2_roots_mobius" in ssik_artifact:
             # Category 2: General 6R (Piper, JACO)
             # Requires the Raghavan-Roth template.
             return "piper", 16, 6
@@ -257,6 +251,7 @@ def generate_context(
     ee_link: Optional[str],
     output_dir: Path,
     repo_root: Path,
+    example_arm: Optional[str] = None,
 ) -> IKGenerationEntrypoint:
     """Main entrypoint for preparing IK generation inputs.
 
@@ -271,22 +266,27 @@ def generate_context(
     print("[ik_generator] Step 0: Loading Python artifact …")
     if not base_link or not ee_link:
         raise ValueError("--urdf requires both --base and --ee to be specified.")
+    
+    # use an existing artifact, or generate it from the URDF if it doesn't exist yet
+    # first, try ssik.prebuilt.<stem> where stem is derived from the URDF filename (e.g. "ur5_ik" from "ur5.urdf")
+    # if that fails, try the URDF path directly (in case the user provided a path to a generated artifact instead of a URDF)
+    stem_candidate = urdf_path.stem + "_ik"  # e.g. "ur5_ik" from "ur5.urdf"
+    ssik_artifact, artifact_stem = try_load_prebuilt_artifact(stem_candidate)  # try loading by stem first (common case for prebuilt artifacts):
 
-    ssik_artifact, artifact_stem = generate_artifact_from_urdf(
-        urdf_path, base_link, ee_link, output_dir
-    )
-    print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
+    if ssik_artifact is None or artifact_stem is None:
+        ssik_artifact, artifact_stem = generate_artifact_from_urdf(
+            urdf_path, base_link, ee_link, output_dir
+        )
+        print(f"[ik_generator]   Generated artifact from URDF: {artifact_stem}")
+
     arm_name = artifact_stem.removesuffix("_ik")
 
     print("[ik_generator] Step 1: Detecting kinematic family …")
-    example_arm, max_solutions, dof = find_best_example(ssik_artifact)
-    print(
-        f"[ik_generator]   → example arm: '{example_arm}', "
-        f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
-    )
-
+    best_guess_example_arm, max_solutions, dof = find_best_example(ssik_artifact)
+    example_arm = example_arm or _resolve_repo_driver_dir(repo_root,best_guess_example_arm)
+    
     # Fall back gracefully when the chosen example arm has no Rust driver yet.
-    if _resolve_repo_driver_dir(repo_root, example_arm) is None:
+    if example_arm is None:
         fallback = "franka_panda"
         if _resolve_repo_driver_dir(repo_root, fallback) is not None:
             print(
@@ -300,6 +300,10 @@ def generate_context(
                 "or fallback 'franka_panda'. The one-shot example will be empty.",
                 file=sys.stderr,
             )
+    print(
+        f"[ik_generator]   → example arm: '{example_arm}', "
+        f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
+    )
 
     print("[ik_generator] Step 2: Assembling context …")
     context = assemble_context(
@@ -347,11 +351,15 @@ def extract_rust_signatures(rust_file_path: Path) -> str:
     source = rust_file_path.read_text(encoding="utf-8")
 
     # Match a run of /// doc-comment lines optionally followed by #[...] attrs,
-    # then the pub fn declaration up to the opening brace or semicolon.
+    # then the pub fn declaration up to a declaration terminator.
+    #
+    # Important: Rust type syntax can contain semicolons inside arrays
+    # (e.g. &[f64; 3]), so we only treat '{' or ';' as terminators when they
+    # appear at the end of a declaration line (before newline/EOF).
     pattern = re.compile(
         r"((?:[ \t]*///[^\n]*\n)+)"      # group 1: block of /// lines
         r"(?:[ \t]*#\[[^\]]*\]\n)*"       # optional #[...] attribute lines
-        r"([ \t]*pub fn [^{;]+(?:\{|;))", # group 2: pub fn ... { or ;
+        r"([ \t]*pub fn[\s\S]*?(?:\{|;)[ \t]*(?=\n|$))", # group 2: full pub fn decl
         re.MULTILINE,
     )
 

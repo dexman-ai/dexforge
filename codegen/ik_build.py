@@ -19,20 +19,15 @@ from typing import Tuple
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 
-def _driver_dir(root: Path, arm_name: str) -> Path:
+def _driver_dir(output_root: Path, oem_name: str, arm_name: str) -> Path:
     """Return the driver directory rooted at *root* for *arm_name*."""
-    return root / "src" / "drivers" / arm_name
-
-
-def _math_dir(root: Path) -> Path:
-    """Return the math kernel directory rooted at *root*."""
-    return root / "src" / "math"
+    return output_root / "drivers" / oem_name / arm_name
 
 
 def _copy_math_kernels(repo_root: Path, output_root: Path) -> None:
     """Copy the shared math kernels into the generated crate tree."""
-    src = _math_dir(repo_root)
-    dst = _math_dir(output_root)
+    src = repo_root / "src" / "math"
+    dst = output_root / "math"
     if not src.is_dir():
         raise FileNotFoundError(f"missing math kernels: {src}")
     dst.mkdir(parents=True, exist_ok=True)
@@ -40,14 +35,14 @@ def _copy_math_kernels(repo_root: Path, output_root: Path) -> None:
         shutil.copyfile(rs, dst / rs.name)
 
 
-def _cargo_toml(crate_name: str, arm_name: str) -> str:
+def _cargo_toml(cargo_suffix: str, arm_name: str) -> str:
     """Render the generated crate's Cargo manifest."""
     return f"""\
 [package]
-name = "{crate_name}"
+name = "dexforge-{cargo_suffix}"
 version = "0.1.0"
 edition = "2021"
-description = "Stand-alone analytical IK driver for the {arm_name} arm, compiled by dexforge."
+description = "Rigid Body Kinematics and Dynamics driver for {cargo_suffix} arms, compiled by dexforge."
 license = "BSD-3-Clause"
 
 [dependencies]
@@ -78,28 +73,15 @@ pub use drivers::{arm_name}::ik_solver::{{fk, solve, TolerancePolicy}};
 pub use drivers::{arm_name}::generated_kinematics;
 """
 
-
-def _update_drivers_mod(output_root: Path, arm_name: str) -> None:
-    """Add the new arm module declaration to the generated crate if absent."""
-    mod_path = output_root / "src" / "drivers" / "mod.rs"
+def _ensure_arm_mod_rs(output_root: Path, oem_name:str, arm_name: str, rust_files: list[str]) -> None:
+    """Create the arm module files in the generated crate if missing."""
+    mod_path = _driver_dir(output_root, oem_name, "") / "mod.rs"
     mod_path.parent.mkdir(parents=True, exist_ok=True)
-    declaration = f"pub mod {arm_name};"
-    if mod_path.exists():
-        content = mod_path.read_text(encoding="utf-8")
-    else:
-        content = ""
-    if declaration not in content:
-        content = content.rstrip() + ("\n" if content.strip() else "") + declaration + "\n"
-        mod_path.write_text(content, encoding="utf-8")
-        print(f"[ik_generator]   Added '{declaration}' to {mod_path.relative_to(output_root)}")
+    mod_path.write_text(f"pub mod {arm_name};\n\n", encoding="utf-8")
+    print(f"[ik_generator]   Created {mod_path.relative_to(output_root)}")
 
-
-def _ensure_arm_mod_rs(output_root: Path, arm_name: str, rust_files: list[str]) -> None:
-    """Create the arm module file in the generated crate if missing."""
-    mod_path = _driver_dir(output_root, arm_name) / "mod.rs"
+    mod_path = _driver_dir(output_root, oem_name, arm_name) / "mod.rs"
     mod_path.parent.mkdir(parents=True, exist_ok=True)
-    if mod_path.exists():
-        return  # Don't overwrite an existing mod.rs
 
     lines: list[str] = [f"//! {arm_name} IK driver.\n"]
     lines.append("")
@@ -119,16 +101,17 @@ def _ensure_arm_mod_rs(output_root: Path, arm_name: str, rust_files: list[str]) 
 def copy_driver_provenance(
     dest_dir: Path,
     arm_name: str,
-    target_py_code: str,
+    ssik_artifact: str,
     source_urdf: Path | None = None,
+    context: str | None = None,
 ) -> dict[str, Path]:
-    """Copy the Python artifact and optional URDF into a driver directory."""
+    """Copy the Python artifact, optional URDF, and context into a driver directory."""
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     written: dict[str, Path] = {}
 
     py_path = dest_dir / f"{arm_name}_ik.py"
-    py_path.write_text(target_py_code, encoding="utf-8")
+    py_path.write_text(ssik_artifact, encoding="utf-8")
     written["driver_py"] = py_path
 
     if source_urdf is not None:
@@ -136,16 +119,21 @@ def copy_driver_provenance(
         if source_urdf.resolve() != urdf_path.resolve():
             shutil.copyfile(source_urdf, urdf_path)
         written["driver_urdf"] = urdf_path
+    if context is not None:
+        ctx_path = dest_dir / f"{arm_name}_context.txt"
+        ctx_path.write_text(context, encoding="utf-8")
+        written["driver_ctx"] = ctx_path
 
     return written
 
 
 def write_generated_files(
     output_dir: Path,
+    oem_name: str,
     repo_root: Path,
     arm_name: str,
     files: dict[str, str],
-    target_py_code: str,
+    ssik_artifact: str,
     context: str,
     source_urdf: Path | None = None,
 ) -> dict[str, Path]:
@@ -160,44 +148,37 @@ def write_generated_files(
     :param repo_root: dexforge source tree (provides the shared math kernels).
     :param arm_name: Clean arm name (e.g. ``"my_arm"``).
     :param files: Parsed ``{filename: content}`` from :func:`parse_llm_output`.
-    :param target_py_code: Source of the target Python artifact.
+    :param ssik_artifact: Source code of the target Python artifact.
     :param context: Assembled prompt context string.
     :returns: Mapping of logical name → written :class:`Path`.
     """
+    output_dir = output_dir 
     output_dir.mkdir(parents=True, exist_ok=True)
+    driver_dir = _driver_dir(output_dir, oem_name, arm_name)
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    codegen_path = driver_dir / "codegen" 
+    codegen_path.mkdir(parents=True, exist_ok=True)
+
     _copy_math_kernels(repo_root, output_dir)
 
     cargo_path = output_dir / "Cargo.toml"
     if not cargo_path.exists():
-        cargo_path.write_text(_cargo_toml(f"{arm_name}_ik_driver", arm_name), encoding="utf-8")
+        cargo_path.write_text(_cargo_toml(oem_name, arm_name), encoding="utf-8")
 
     lib_path = output_dir / "src" / "lib.rs"
     if not lib_path.exists():
         lib_path.parent.mkdir(parents=True, exist_ok=True)
         lib_path.write_text(_lib_rs(arm_name), encoding="utf-8")
 
-    driver_dir = _driver_dir(output_dir, arm_name)
-    driver_dir.mkdir(parents=True, exist_ok=True)
-
-    written: dict[str, Path] = {}
-
     # Write artifact and context to output_dir
-    py_path = output_dir / f"{arm_name}_ik.py"
-    ctx_path = output_dir / f"{arm_name}_context.txt"
-    py_path.write_text(target_py_code, encoding="utf-8")
-    ctx_path.write_text(context, encoding="utf-8")
-    written["py"] = py_path
-    written["ctx"] = ctx_path
-
-    provenance_written = copy_driver_provenance(
-        driver_dir, arm_name, target_py_code, source_urdf
+    written = copy_driver_provenance(
+        codegen_path, arm_name, ssik_artifact, source_urdf, context
     )
-    written.update(provenance_written)
 
     rust_files_written: list[str] = []
     for filename, content in files.items():
         if filename == "lib.rs":
-            dest = output_dir / "src" / "lib.rs"
+            dest = output_dir / "lib.rs"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
@@ -215,23 +196,20 @@ def write_generated_files(
                 normalized = "generate_test_data.py"
             else:
                 normalized = "generate_code.py"
-            dest = output_dir / "codegen" / normalized
+            dest = codegen_path / normalized
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written[normalized] = dest
             print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)} (from '{filename}')")
         else:
-            # Fallback: write to output_dir
-            dest = output_dir / filename
+            # Fallback: write to codegen_path
+            dest = codegen_path / filename
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
-            print(f"[ik_generator]   Wrote {dest}")
+            print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)}")
 
     # Ensure mod.rs exists for the new driver
-    _ensure_arm_mod_rs(output_dir, arm_name, rust_files_written)
-
-    # Register the arm module in the top-level drivers mod.rs
-    _update_drivers_mod(output_dir, arm_name)
+    _ensure_arm_mod_rs(output_dir, oem_name, arm_name, rust_files_written)
 
     return written
 
