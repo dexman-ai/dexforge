@@ -42,8 +42,8 @@ class GenerateContextTests(unittest.TestCase):
             self.assertTrue(section_body, f"Section {section_num} is empty")
 
         # save to file for manual inspection if needed
-        with open("test_context.txt", "w", encoding="utf-8") as f:
-            f.write(context)
+        # with open("test_context.txt", "w", encoding="utf-8") as f:
+        #     f.write(context)
 
 
 class ExtractRustSignaturesTests(unittest.TestCase):
