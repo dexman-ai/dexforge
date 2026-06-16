@@ -133,12 +133,12 @@ fn pseudo_inverse<const DOF: usize>(j: &[[f64; DOF]; 6]) -> Option<[[f64; 6]; DO
 }
 
 #[inline]
-pub fn flange_point_jacobian<const DOF: usize>(
+pub fn flange_offset_jacobian<const DOF: usize>(
     flange_pose: &Pose,
     jacobian: &[[f64; DOF]; 6],
-    local: &[f64; 3],
+    offset: &[f64; 3],
 ) -> [[f64; 3]; DOF] {
-    // r = R_flange · local (point offset from flange origin, in base frame).
+    // r = R_flange · offset (point offset from flange origin, in base frame).
     let mut r = [0.0f64; 3];
     for i in 0..3 {
         let mut s = 0.0;
@@ -186,6 +186,18 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
         refinement_max_iters: usize,
     ) -> [Option<[f64; DOF]>; MAX];
 
+    /// Mass matrix of the flange (DOF × DOF), i.e. the driver's native
+    /// `mass_matrix(q)`.
+    fn flange_gravity(q: &[f64; DOF], gravity: &[f64; 3]) -> [f64; DOF];
+
+    /// Coriolis vector of the flange (DOF), i.e. the driver's native
+    /// `coriolis(q, qd)`.
+    fn flange_mass_matrix(q: &[f64; DOF]) -> [[f64; DOF]; DOF];
+
+    /// Coriolis vector of the flange (DOF), i.e. the driver's native
+    /// `coriolis(q, qd)`.
+    fn flange_coriolis(q: &[f64; DOF], qd: &[f64; DOF]) -> [f64; DOF];
+
     // -----------------------------------------------------------------------
     // TCP-aware kinematics (default methods)
     // -----------------------------------------------------------------------
@@ -207,7 +219,7 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
         let flange = Self::flange_fk(q);
         let jflange = Self::flange_jacobian(q);
         let p = [tcp[(0, 3)], tcp[(1, 3)], tcp[(2, 3)]];
-        let lin = flange_point_jacobian(&flange, &jflange, &p);
+        let lin = flange_offset_jacobian(&flange, &jflange, &p);
         
         let mut j = [[0.0f64; DOF]; 6];
         for c in 0..DOF {
@@ -273,7 +285,7 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
         if payload.mass == 0.0 {
             return tau;
         }
-        let jvp = flange_point_jacobian(&Self::flange_fk(q), &Self::flange_jacobian(q), &payload.com);
+        let jvp = flange_offset_jacobian(&Self::flange_fk(q), &Self::flange_jacobian(q), &payload.com);
         for j in 0..DOF {
             tau[j] = -payload.mass * dot3(gravity, &jvp[j]);
         }
@@ -288,7 +300,7 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
         if payload.mass == 0.0 {
             return mm;
         }
-        let jvp = flange_point_jacobian(&Self::flange_fk(q), &Self::flange_jacobian(q), &payload.com);
+        let jvp = flange_offset_jacobian(&Self::flange_fk(q), &Self::flange_jacobian(q), &payload.com);
         for i in 0..DOF {
             for j in 0..DOF {
                 mm[i][j] = payload.mass * dot3(&jvp[i], &jvp[j]);
@@ -318,7 +330,7 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
         }
         let h = CORIOLIS_FD_STEP;
         // Centre-of-mass translational Jacobian columns at the base config.
-        let jvp = flange_point_jacobian(
+        let jvp = flange_offset_jacobian(
             &Self::flange_fk(q),
             &Self::flange_jacobian(q),
             &payload.com,
@@ -330,12 +342,12 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
             qp[j] += h * qd[j];
             qm[j] -= h * qd[j];
         }
-        let jvp_p = flange_point_jacobian(
+        let jvp_p = flange_offset_jacobian(
             &Self::flange_fk(&qp),
             &Self::flange_jacobian(&qp),
             &payload.com,
         );
-        let jvp_m = flange_point_jacobian(
+        let jvp_m = flange_offset_jacobian(
             &Self::flange_fk(&qm),
             &Self::flange_jacobian(&qm),
             &payload.com,
