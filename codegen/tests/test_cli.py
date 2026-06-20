@@ -72,7 +72,7 @@ class PlanExportTests(unittest.TestCase):
         self.assertEqual(gen, {"Cargo.toml", "lib.rs", "mod.rs"})
 
     def test_generate_armmodel_impl_renders_arm_module(self) -> None:
-        rendered = cli.generate_armmodel_impl("franka_panda", 7, 128)
+        rendered = cli._arm_rs("franka_panda", 7, 128)
         self.assertIn("pub struct FrankaPanda;", rendered)
         self.assertIn("impl ArmModel<7, 128> for FrankaPanda", rendered)
         self.assertIn("crate::drivers::franka_panda::ik_solver::fk(q)", rendered)

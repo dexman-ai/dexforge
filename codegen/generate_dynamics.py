@@ -32,23 +32,6 @@ Real-time kernel constraints honoured by the emitted Rust
   ``let`` bindings followed by a single array literal — no ``if``/``else``, no
   ``for``/``while``.
 
-Usage::
-
-    pip install ssik sympy numpy
-    # From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
-    python codegen/generate_dynamics.py --artifact ur5_ik
-
-    # From a local artifact .py file, writing to a driver module:
-    python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
-        --output src/drivers/my_arm/dynamics.rs
-
-    # Also emit inverse-dynamics (gravity / mass-matrix / Coriolis) by sourcing
-    # the link masses + inertias from a URDF whose actuated-joint order matches
-    # the artifact (the URDF supplies the *physical* properties the kinematics
-    # artifact does not carry):
-    python codegen/generate_dynamics.py --artifact ur5_ik \
-        --urdf src/drivers/ur5/ur5_inertial.urdf \
-        --output src/drivers/ur5/dynamics.rs
 
 Dynamics (runtime gravity, mass matrix, Coriolis, inverse dynamics)
 -----------------------------------------------------------
@@ -72,15 +55,11 @@ joints contribute to the linear Jacobian only and carry no angular inertia term.
 
 from __future__ import annotations
 
-import argparse
-import importlib
-import importlib.util
-import sys
-import types
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import logging
 
 import numpy as np
 import sympy as sp
@@ -96,39 +75,7 @@ _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 # numerically faithful to the reference.
 _SNAP_TOL = 1e-12
 
-
-# ---------------------------------------------------------------------------
-# ssik artifact loading
-# ---------------------------------------------------------------------------
-
-
-def load_artifact(artifact: str) -> types.ModuleType:
-    """Import a ssik artifact by prebuilt name or by path to a ``*_ik.py`` file.
-
-    :param artifact: Either a bare module name (e.g. ``"ur5_ik"``) resolved
-        against ``ssik.prebuilt``, or a filesystem path to an artifact module.
-    :returns: The imported module exposing ``_JOINT_AXES``, ``_JOINT_T_LEFTS``
-        and ``_JOINT_T_RIGHTS`` (and usually ``DOF``).
-    :raises ImportError: If neither resolution strategy succeeds.
-    """
-    candidate = Path(artifact)
-    if candidate.exists():
-        spec = importlib.util.spec_from_file_location(candidate.stem, candidate)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load artifact module from {candidate}")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    name = artifact[:-3] if artifact.endswith(".py") else artifact
-    try:
-        return importlib.import_module(f"ssik.prebuilt.{name}")
-    except ModuleNotFoundError as exc:
-        raise ImportError(
-            f"Cannot find {artifact!r} as a file or as ssik.prebuilt.{name}. "
-            "Install ssik (`pip install ssik`) or pass a path to the artifact file."
-        ) from exc
+logger = logging.getLogger(__name__)
 
 
 def _snap(value: float) -> sp.Expr:
@@ -151,41 +98,11 @@ def _to_vector(arr) -> sp.Matrix:
     return sp.Matrix([_snap(x) for x in a])
 
 
-def extract_chain(
-    mod: types.ModuleType,
-) -> Tuple[List[sp.Matrix], List[sp.Matrix], List[sp.Matrix], int]:
-    """Pull the product-of-exponentials chain out of a ssik artifact.
-
-    :returns: ``(t_lefts, axes, t_rights, dof)`` as cleaned SymPy objects.
-    """
-    try:
-        axes_raw = mod._JOINT_AXES
-        tl_raw = mod._JOINT_T_LEFTS
-        tr_raw = mod._JOINT_T_RIGHTS
-    except AttributeError as exc:
-        raise ValueError(
-            f"artifact {mod.__name__!r} does not expose the expected "
-            "_JOINT_AXES / _JOINT_T_LEFTS / _JOINT_T_RIGHTS constants"
-        ) from exc
-
+def _translate_chain(axes_raw, tl_raw, tr_raw):
     axes = [_to_vector(a) for a in axes_raw]
     t_lefts = [_to_matrix(m) for m in tl_raw]
     t_rights = [_to_matrix(m) for m in tr_raw]
-    dof = int(getattr(mod, "DOF", len(axes)))
-    if not (len(axes) == len(t_lefts) == len(t_rights) == dof):
-        raise ValueError(
-            f"inconsistent chain lengths: axes={len(axes)}, T_left={len(t_lefts)}, "
-            f"T_right={len(t_rights)}, DOF={dof}"
-        )
-    return t_lefts, axes, t_rights, dof
-
-
-def extract_base_ee_links(mod: types.ModuleType) -> Tuple[Optional[str], Optional[str]]:
-    """Read the optional base and end-effector link names from an artifact."""
-    base = getattr(mod, "BASE_LINK", None)
-    ee = getattr(mod, "EE_LINK", None)
-    return (base if isinstance(base, str) else None, ee if isinstance(ee, str) else None)
-
+    return axes, t_lefts, t_rights
 
 # ---------------------------------------------------------------------------
 # Symbolic SE(3) construction
@@ -222,6 +139,7 @@ def build_fk(
     *axis frame* transform (after ``T_left[i]``, before the joint rotation) —
     exactly the data the geometric Jacobian needs.
     """
+    logger.info("Building symbolic FK transform.")
     q_syms: List[sp.Symbol] = []
     frames: List[sp.Matrix] = []
     t_cum = sp.eye(4)
@@ -238,6 +156,7 @@ def build_jacobian(
     t_ee: sp.Matrix, axes: List[sp.Matrix], frames: List[sp.Matrix]
 ) -> sp.Matrix:
     """Geometric Jacobian ``[Jv; Jw]`` (6 x N) for the all-revolute ssik chain."""
+    logger.info("Building geometric Jacobian.")
     p_e = t_ee[:3, 3]
     cols = []
     for axis, frame in zip(axes, frames):
@@ -622,23 +541,30 @@ def build_dynamics(
     ee_link: Optional[str] = None,
 ) -> Dynamics:
     """Derive gravity / mass-matrix / Coriolis / inverse-dynamics symbolically."""
+    logger.info("Starting symbolic dynamics derivation.")
     urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path), base_link, ee_link)
     bodies = build_bodies(axes, frames, t_rights, q_syms, urdf_chain)
     if not bodies:
-        raise ValueError(
+        error_msg = (
             f"URDF {urdf_path} has no positive-mass <inertial> blocks on the chain; "
             "cannot derive dynamics. Ensure each link in the URDF has an <inertial> "
             "block with a positive mass value."
         )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
     n = len(q_syms)
     qd_syms = [sp.Symbol(f"qd{i}") for i in range(n)]
     qdd_syms = [sp.Symbol(f"qdd{i}") for i in range(n)]
     gravity_syms = [sp.Symbol(f"g{i}") for i in range(3)]
 
+    logger.info("Deriving symbolic gravity vector.")
     grav = build_gravity(bodies, q_syms, gravity_syms)
+    logger.info("Deriving symbolic mass matrix.")
     mass = build_mass_matrix(bodies, q_syms, axes, frames)
+    logger.info("Deriving symbolic Coriolis matrix.")
     cor = build_coriolis(mass, q_syms, qd_syms)
+    logger.info("Deriving symbolic inverse dynamics.")
     qdd_vec = sp.Matrix(qdd_syms)
     inv_dyn = mass * qdd_vec + cor + grav
 
@@ -854,6 +780,7 @@ def generate_rust(
     out.append("")
 
     # --- fk ---
+    logger.info("Emitting forward kinematics.")
     out.append("/// Forward kinematics: base -> end-effector SE(3) pose.")
     out.append("///")
     out.append("/// Returns the 4x4 homogeneous transform as a row-major array.")
@@ -869,6 +796,7 @@ def generate_rust(
     )
 
     # --- jacobian ---
+    logger.info("Emitting geometric Jacobian.")
     out.append("/// Geometric Jacobian `[Jv; Jw]` (6 x DOF) of the end-effector.")
     out.append("///")
     out.append("/// Rows 0-2 are linear velocity, rows 3-5 are angular velocity.")
@@ -897,6 +825,7 @@ def _emit_dynamics(
     qd_unpack = _unpack_array("qd", dyn.qd_syms, printer)
     qdd_unpack = _unpack_array("qdd", dyn.qdd_syms, printer)
 
+    logger.info("Emitting gravity vector.")
     out.append("/// Gravity (holding) torque `tau = dU/dq` for each joint.")
     out.append("///")
     out.append("/// Derived from the total potential energy of the link masses.")
@@ -910,6 +839,7 @@ def _emit_dynamics(
         printer,
     )
 
+    logger.info("Emitting mass matrix.")
     out.append("/// Joint-space inertia (mass) matrix `M(q)` (symmetric, DOF x DOF).")
     _emit_fn_matrix(
         out,
@@ -922,6 +852,7 @@ def _emit_dynamics(
         printer,
     )
 
+    logger.info("Emitting Coriolis vector.")
     out.append("/// Coriolis & centrifugal torque `C(q, qd) qd` for each joint.")
     _emit_fn_vector(
         out,
@@ -933,6 +864,7 @@ def _emit_dynamics(
         printer,
     )
 
+    logger.info("Emitting inverse dynamics torque.")
     out.append("/// Inverse dynamics torque `tau = M(q) qdd + C(q, qd) qd + g(q)`.")
     out.append("///")
     out.append("/// MIT-mode feed-forward torque for a desired joint acceleration.")
@@ -953,53 +885,40 @@ def _emit_dynamics(
 # ---------------------------------------------------------------------------
 
 
-def generate(ssik_artifact, urdf, arm, output):
+def generate_rbd(ssik_info, urdf, arm, output, no_dynamics=False):
+    """Compile the arm's full rigid-body kinematics + dynamics in the crate root.
 
-    try:
-        mod = load_artifact(ssik_artifact)
-        t_lefts, axes, t_rights, n = extract_chain(mod)
-    except (ImportError, ValueError) as exc:
-        print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    stem = Path(ssik_artifact).stem
-    arm = arm or stem.removesuffix("_ik")
-    base_link, ee_link = extract_base_ee_links(mod)
-    print(f"[generate_dynamics] {arm}: {n} DOF from ssik artifact {stem!r}", file=sys.stderr)
+    dexforge is a rigid-body dynamics compiler, not just an IK one: after the
+    LLM produces the IK driver, this calls the built-in symbolic dynamics compiler
+    against the driver's ssik artifact to derive — symbolically with SymPy —
+    the exact forward kinematics and geometric Jacobian, emitted as ``#![no_std]``
+    Rust in the generated crate. When *urdf* carries ``<inertial>`` blocks, the
+    same pass also emits gravity / mass-matrix / Coriolis / inverse-dynamics so
+    the crate ships the complete kinematics **and** dynamics suite.
+    :param ssik_module: The ssik artifact module.
+    :param arm: Arm name whose driver was just generated.
+    :param urdf: Source URDF (supplies link masses/inertias for dynamics); the
+        dynamics functions are emitted only when it carries ``<inertial>`` data.
+    :param output: Generated crate root directory.
+    :returns: ``(success, combined_output)``.
+    """
+    axes, t_lefts, t_rights = _translate_chain(ssik_info.axes_raw, ssik_info.t_lefts_raw, ssik_info.t_rights_raw)
 
     t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
     jac = build_jacobian(t_ee, axes, frames)
 
     dynamics = None
-    if urdf is not None:
-        if not urdf.exists():
-            print(f"[generate_dynamics] ERROR: URDF not found: {urdf}", file=sys.stderr)
-            return 1
-        try:
-            dynamics = build_dynamics(
-                axes,
-                frames,
-                t_rights,
-                q_syms,
-                urdf,
-                base_link,
-                ee_link,
-            )
-        except ValueError as exc:
-            print(f"[generate_dynamics] ERROR: {exc}", file=sys.stderr)
-            return 1
-        print(
-            f"[generate_dynamics] {arm}: dynamics from {urdf} "
-            f"(runtime gravity, base={base_link!r}, ee={ee_link!r})",
-            file=sys.stderr,
+    if not no_dynamics:
+        dynamics = build_dynamics(
+            axes,
+            frames,
+            t_rights,
+            q_syms,
+            urdf,
+            ssik_info.base_link,
+            ssik_info.ee_link,
         )
 
-    rust = generate_rust(arm, n, t_ee, jac, q_syms, Path(__file__).name, dynamics)
-
-    if output is None:
-        sys.stdout.write(rust)
-    else:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rust)
-        print(f"[generate_dynamics] wrote {output}", file=sys.stderr)
-    return 0
+    rust = generate_rust(arm, ssik_info.dof, t_ee, jac, q_syms, Path(__file__).name, dynamics)
+    output.write_text(rust)
+    return None

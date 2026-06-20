@@ -88,6 +88,11 @@ def build_dataset(
 
     lower = np.asarray(model.lowerPositionLimit, dtype=np.float64)
     upper = np.asarray(model.upperPositionLimit, dtype=np.float64)
+    vel_limit = np.asarray(model.velocityLimit, dtype=np.float64)
+    effort_limit = np.asarray(model.effortLimit, dtype=np.float64)
+    qd_limit = qd_limit or vel_limit  or _DEFAULT_QD_LIMIT
+    qdd_limit = qdd_limit or _DEFAULT_QDD_LIMIT  
+
     # Guard against unbounded (continuous) joints that URDF reports as +/-inf.
     finite = np.isfinite(lower) & np.isfinite(upper)
     lower = np.where(finite, lower, -np.pi)

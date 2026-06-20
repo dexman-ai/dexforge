@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import ik_build  # noqa: E402
+import codegen.build_crate as build_crate  # noqa: E402
 
 
 class WriteGeneratedFilesTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class WriteGeneratedFilesTests(unittest.TestCase):
             source_urdf.write_text("<robot name='demo' />\n", encoding="utf-8")
             oem_name = "OEM"
 
-            written = ik_build.write_generated_files(
+            written = build_crate.write_generated_files(
                 output_dir=tmp_path,
                 repo_root=repo_root,
                 arm_name="demo",
@@ -55,7 +55,7 @@ class WriteGeneratedFilesTests(unittest.TestCase):
             (repo_root / "src" / "math").mkdir(parents=True, exist_ok=True)
             (repo_root / "src" / "math" / "mod.rs").write_text("// math mod\n", encoding="utf-8")
 
-            ik_build.write_generated_files(
+            build_crate.write_generated_files(
                 output_dir=output_dir,
                 repo_root=repo_root,
                 arm_name="demo",

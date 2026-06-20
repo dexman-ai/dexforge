@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import ik_prompt  # noqa: E402
+import codegen.generate_ik as generate_ik  # noqa: E402
 
 
 class GenerateContextTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class GenerateContextTests(unittest.TestCase):
         self.assertTrue(urdf_path.is_file(), f"Missing URDF fixture: {urdf_path}")
 
         with tempfile.TemporaryDirectory() as tmp:
-            entry = ik_prompt.generate_context(
+            entry = generate_ik.generate_context(
                 urdf_path=urdf_path,
                 base_link="base_link",
                 ee_link="tool0",
@@ -64,7 +64,7 @@ pub fn sp1_solve(k: &[f64; 3], p: &[f64; 3], q: &[f64; 3]) -> f64 {
             rust_file = Path(tmp) / "sample.rs"
             rust_file.write_text(rust_source, encoding="utf-8")
 
-            extracted = ik_prompt.extract_rust_signatures(rust_file)
+            extracted = generate_ik._extract_rust_signatures(rust_file)
 
         self.assertIn(
             "pub fn mat3_vec(m: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3]",
