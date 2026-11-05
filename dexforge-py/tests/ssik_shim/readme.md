@@ -1,2 +1,0 @@
-Tests in this directory are copied as_is from ssik. 
-The presence of folder ssik overrides the external package, so the ssik.prebuilt artifacts loaded are the wrappers on top of the dexforge rust ik solvers.

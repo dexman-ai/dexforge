@@ -113,12 +113,11 @@ For detailed translation guidance, refer to `codegen/translate_ssik_artifact.md`
 
 ## Build & Test
 
-The Rust crate lives under `src/` and is built only through maturin from
-`dexforge-py/`.
+Python bindings are built per OEM package under `repos/dexforge-*/python`.
 
-For Python bindings (dexforge-py):
+For Python bindings (example: UR):
 ```bash
-cd dexforge-py
+cd repos/dexforge-ur/python
 maturin develop --release
 pytest tests/
 ```
@@ -126,8 +125,8 @@ pytest tests/
 ## PR Checklist
 
 Before submitting a PR with new Rust IK code:
-- [ ] `cd dexforge-py && maturin develop --release` succeeds
-- [ ] `cd dexforge-py && pytest tests/` passes
+- [ ] `cd repos/dexforge-<oem>/python && maturin develop --release` succeeds
+- [ ] `pytest repos/dexforge-<oem>/python/tests -v` passes
 - [ ] No `unsafe`, no `Vec`/`Box`/`std` heap allocation outside `#[cfg(test)]`
 - [ ] All loops have hardcoded iteration ceilings
 - [ ] FK verification done for every solution candidate

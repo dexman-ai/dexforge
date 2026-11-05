@@ -1,0 +1,19 @@
+[package]
+name = "dexforge-flexiv-core"
+version = "0.1.0"
+edition = "2021"
+description = "Flexiv no_std driver crate extracted from dexforge."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_flexiv_core"
+path = "src/lib.rs"
+
+[dependencies]
+dexhal = { path = "../../dexhal" }
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

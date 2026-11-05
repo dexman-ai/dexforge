@@ -1,0 +1,18 @@
+[package]
+name = "dexhal"
+version = "0.1.0"
+edition = "2021"
+description = "Shared no_std runtime math and kinematics for dexforge OEM drivers."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexhal"
+path = "src/lib.rs"
+
+[dependencies]
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

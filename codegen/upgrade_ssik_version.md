@@ -87,7 +87,7 @@ Compare the new ssik implementation against the current Rust translation:
 If changes are required:
 1. Create a test file (e.g., `src/math/ssik_core_upgrade_test.rs`) to compare old vs. new behavior
 2. Update the Rust implementation to match the new ssik code
-3. Rebuild through `dexforge-py` with `maturin develop --release` and run `pytest dexforge-py/tests/ -v` to verify the updated kernels still behave correctly through the supported build path
+3. Rebuild the impacted OEM Python package(s) with `maturin develop --release` and run `pytest repos/dexforge-*/python/tests -v` to verify the updated kernels still behave correctly through the supported build path
 4. Document the changes in the function docstrings (e.g., "Updated in ssik 0.9.0 to handle...").
 
 ## Step 4: Analyze Impact on Arm Drivers
@@ -181,13 +181,12 @@ git status src/drivers/*/test_data.rs src/drivers/*/consts.rs src/drivers/*/pq.r
 
 ## Step 6: Run Tests
 
-The Rust crate under `src/` is not built directly from the repository root.
-Build and validate it only through `dexforge-py/`, where maturin consumes
-`src/Cargo.toml` transitively.
+Build and validate through the OEM Python packages under
+`repos/dexforge-*/python`.
 
 ### 6.1 Rebuild the Python extension
 ```bash
-cd /path/to/dexforge/dexforge-py
+cd /path/to/dexforge/repos/dexforge-ur/python
 maturin develop --release
 ```
 
@@ -198,15 +197,14 @@ Verify:
 ### 6.2 Run the Python test suite
 ```bash
 cd /path/to/dexforge
-pytest dexforge-py/tests/ -v
+pytest repos/dexforge-*/python/tests -v
 ```
 
 ### 6.3 Smoke tests on reference data
 If you regenerated test data or arm drivers, spot-check a few poses:
 ```bash
 cd /path/to/dexforge
-pytest dexforge-py/tests/test_dexforge_py.py --arm=piper --n=5 -v
-EOF
+pytest repos/dexforge-agilex/python/tests/test_shared_suite.py --arm=piper --n=5 -v
 ```
 
 ## Step 7: Update the Locked Version
@@ -273,8 +271,8 @@ Before finalizing an ssik upgrade, ensure:
 - [ ] Updated `kinematics.rs` (if needed)
 - [ ] Regenerated test data for all arms
 - [ ] Regenerated constants for applicable arms
-- [ ] `cd dexforge-py && maturin develop --release` succeeds
-- [ ] `pytest dexforge-py/tests/ -v` passes
+- [ ] `cd repos/dexforge-<oem>/python && maturin develop --release` succeeds
+- [ ] `pytest repos/dexforge-*/python/tests -v` passes
 - [ ] Smoke tests on reference data (if applicable)
 - [ ] Updated `SSIK_VERSION.txt` to the new version
 - [ ] Committed all changes with a clear commit message

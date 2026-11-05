@@ -140,28 +140,33 @@ needed.
 
 ## Python interface
 
-`dexforge-py` wraps the Rust solvers via [pyo3](https://pyo3.rs). Each arm is
-exposed as a submodule, mirroring the `ssik.prebuilt.<arm>_ik` module
+Each OEM Python package wraps its Rust solvers via [pyo3](https://pyo3.rs).
+Arms are exposed as submodules, mirroring the `ssik.prebuilt.<arm>_ik` module
 structure:
 
 ```python
 import numpy as np
-import dexforge_py
+import dexforge_ur
 
 T = np.eye(4)   # 4×4 SE(3) target pose (numpy array or list-of-lists)
 q = [0.0] * 6  # joint angles in radians
 
-solutions = dexforge_py.ur5.solve(T, respect_limits=False)
+solutions = dexforge_ur.ur5.solve(T, respect_limits=False)
 for q_sol in solutions:
     # q_sol is a list of floats, one per joint
     pass
 
-T_fk = dexforge_py.ur5.fk(q)  # returns a 4×4 list-of-lists
+T_fk = dexforge_ur.ur5.fk(q)  # returns a 4×4 list-of-lists
 ```
 
-Supported arm submodules: `dexforge_py.ur5`, `dexforge_py.piper`,
-`dexforge_py.franka_panda`, `dexforge_py.xarm7`, `dexforge_py.rizon4`,
-`dexforge_py.rizon10`.
+Package names are OEM-specific:
+
+- `dexforge_ur.ur5`
+- `dexforge_agilex.piper`
+- `dexforge_franka.franka_panda`
+- `dexforge_ufactory.xarm7`
+- `dexforge_flexiv.rizon4`
+- `dexforge_flexiv.rizon10`
 
 Each `solve` accepts the same optional keyword arguments as the Python ssik
 artifact: `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`,
@@ -240,9 +245,10 @@ your LLM backend (defaults work with local OpenAI-compatible servers).
 
 After the Rust driver is accepted:
 
-1. In `dexforge-py/src/lib.rs`, add `#[pyfunction]` + `#[pyo3(name = "fk")]` /
+1. In `repos/dexforge-<oem>/python/src/lib.rs`, add `#[pyfunction]` + `#[pyo3(name = "fk")]` /
    `#[pyo3(name = "solve")]` wrappers (copying an existing arm as a template),
-   then create a submodule block in `dexforge_py()` and call `m.add_submodule`.
+    then create a submodule block in the OEM module function (for example,
+    `dexforge_ur()`) and call `m.add_submodule`.
 
 ### Symbolic dynamics & kinematics code generation
 
@@ -326,42 +332,32 @@ Only [`nalgebra`](https://nalgebra.org) (with `serde` and `macros` disabled, in
 transcendentals.
 
 The Python bindings add [`pyo3`](https://pyo3.rs) as a dependency, isolated to
-the `dexforge-py` crate.
+each OEM Python crate under `repos/dexforge-*/python`.
 
 ### Building and testing
 
-The Rust crate under `src/` is built transitively by maturin from `dexforge-py/`.
-There is no top-level Cargo manifest.
+Each OEM Python package is built independently with maturin from
+`repos/dexforge-*/python`.
 
-To build and install the Python extension:
+To build and install an OEM Python extension (example: UR):
 
 ```sh
-cd dexforge-py
+cd repos/dexforge-ur/python
 pip install maturin
 maturin develop --release
-pip install -e .
 ```
 
 ### Python tests
 
-The `dexforge-py/tests/` directory contains three test layers:
+Shared ssik-derived tests are now centralized in `ssik_shared_tests/`.
 
-- **`test_dexforge_py.py`** — cross-validates the native `dexforge_py`
-  functions against the reference `ssik.prebuilt` artifacts side by side,
-  using random FK-seeded poses. This is the primary correctness gate for
-  dexforge.
-
-- **`test_prebuilt_sanity.py`** and **`test_prebuilt_uniform_fuzz.py`** — these
-  are verbatim copies from the `ssik` test suite (referenced from
-  `dexforge-py/tests/README.md`). They run the ssik reference solver and serve
-  as a baseline: if they fail, the reference is broken, not dexforge. The
-  Hypothesis strategies in `_hypothesis_strategies.py` are also copied verbatim
-  from ssik; `_hypothesis_strategies_dexforge.py` contains dexforge-specific
-  variants.
+- **Shared test source**: `ssik_shared_tests/`
+- **OEM execution points**: `repos/dexforge-*/python/tests/test_shared_suite.py`
+- **OEM-local wrappers/manifests**: `repos/dexforge-*/python/tests/ssik_shim/`
 
 ```sh
 pip install pytest scipy numpy ssik hypothesis
-pytest dexforge-py/tests/
+pytest repos/dexforge-*/python/tests/
 ```
 
 ### Regenerating the test data

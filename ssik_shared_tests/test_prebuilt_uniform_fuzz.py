@@ -1,0 +1,271 @@
+"""Uniform 500-pose Hypothesis bulletproof sweep across every shipped prebuilt (#267).
+
+Each prebuilt arm gets the same property-test shape: 500 random
+non-singular ``q*`` configurations, FK to ``T_target``, solve, assert
+every returned IK FK-closes within the arm's documented residual ceiling.
+
+Pre-#267 coverage was uneven: UR5 / Puma 560 had 500-pose roundtrip
+fuzz via `test_three_parallel` / `test_spherical_two_parallel` /
+`test_spherical_two_intersecting`; iiwa14 / Gen3 / Franka / Rizon 4 /
+Kassow KR810 / JACO 2 had only hand-picked seeded fuzz at max_examples=10
+or none. This file fills that gap uniformly.
+
+Tolerances are per-arm because the analytical paths achieve different
+numerical floors:
+- closed-form 6R (UR5, Puma, iiwa14): ~1e-12 to 1e-13
+- non-Pieper 6R (JACO 2 via RR): ~1e-6 (RR resultant has a structural
+  conditioning floor)
+- approximate-SRS / non-SRS 7R via jointlock + HP / cached-RR
+  (Gen3, Franka, Rizon, Kassow): ~1e-7 to 1e-9
+
+The universal bulletproof contract is ``max_fk < 1e-6`` for every
+returned candidate. Per-arm tighter ceilings come from ``MANIFEST.toml``.
+
+Per-arm parametrisation is driven by ``ssik.prebuilt._manifest``;
+known coverage gaps with a documented xfail reason (see manifest
+``known_gaps`` table) become xfailed automatically.
+"""
+
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pytest
+from hypothesis import HealthCheck, given, settings
+
+from ssik.prebuilt._manifest import load_manifest
+from ._hypothesis_strategies import non_singular_q6r, non_singular_q7r
+
+if TYPE_CHECKING:
+    from types import ModuleType
+
+_MANIFEST = load_manifest()
+
+
+# Each tuple: (prebuilt_module_name, fk_residual_ceiling).
+#
+# Ceilings come from each arm's ``fk_ceiling_fuzz`` field in MANIFEST.toml.
+# They are calibrated to the arm's *worst-case* FK residual under a 200-pose
+# Hypothesis-style sweep (the 500-pose @given run goes harder, so the
+# ceiling carries a 3-5x margin above what 200-pose sampling sees). The
+# README EAIK comparison table reports the *averaged* max FK across 100
+# canonical poses; for some 7R arms that average is materially better than
+# the worst case under aggressive non-singular fuzzing. The bulletproof
+# claim is "every returned IK FK-closes within the ceiling"; per-arm
+# precision floor reality is documented in docs/arm_coverage.md.
+PREBUILT_ARMS_6R: list[tuple[str, float]] = [
+    (arm.name, arm.fk_ceiling_fuzz) for arm in _MANIFEST.values() if arm.dof == 6
+]
+
+PREBUILT_ARMS_7R: list[tuple[str, float]] = [
+    (arm.name, arm.fk_ceiling_fuzz) for arm in _MANIFEST.values() if arm.dof == 7
+]
+
+
+def _params_or_skip_6r() -> list[tuple[str | None, float | None]]:
+    if PREBUILT_ARMS_6R:
+        return PREBUILT_ARMS_6R
+    return [pytest.param(None, None, marks=pytest.mark.skip(reason="No 6R arms in manifest"), id="none")]
+
+
+def _params_or_skip_7r() -> list[tuple[str | None, float | None]]:
+    if PREBUILT_ARMS_7R:
+        return PREBUILT_ARMS_7R
+    return [pytest.param(None, None, marks=pytest.mark.skip(reason="No 7R arms in manifest"), id="none")]
+
+
+def _tight_7r_or_skip() -> list[str | None]:
+    names = [a[0] for a in PREBUILT_ARMS_7R if a[0] not in ("iiwa14_ik", "gen3_ik")]
+    if names:
+        return names
+    return [pytest.param(None, marks=pytest.mark.skip(reason="No 7R tight-policy arms in manifest"), id="none")]
+
+
+def _load(module_name: str) -> ModuleType:
+    return importlib.import_module(f"ssik.prebuilt.{module_name}")
+
+
+def _maybe_xfail(arm_name: str) -> None:
+    """xfail if the manifest declares a known coverage gap.
+
+    ``strict=False`` semantics: a future improvement that closes the
+    gap surfaces as ``XPASS`` rather than silent regression.
+    """
+    arm = _MANIFEST[arm_name]
+    if arm.known_gaps is not None:
+        pytest.xfail(f"{arm_name}: {arm.known_gaps.xfail_reason}")
+
+
+# ---------------------------------------------------------------------------
+# 6R uniform sweep.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("arm_name", "fk_ceiling"),
+    _params_or_skip_6r(),
+)
+@given(q_star=non_singular_q6r())
+@settings(
+    max_examples=500,
+    deadline=None,
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.function_scoped_fixture],
+)
+def test_prebuilt_6r_random_q_roundtrip(
+    arm_name: str | None, fk_ceiling: float | None, q_star: np.ndarray
+) -> None:
+    """500 random non-singular 6R poses: solve(fk(q*)) returns at least one
+    IK, every returned IK FK-closes within the arm's documented ceiling.
+
+    This is the per-arm bulletproof contract for the "solver doesn't lie
+    about correctness" claim. Per-pose seed recovery (the seeded q*
+    appears in the returned set modulo wrap-to-pi) is not asserted here
+    -- branch-collapse poses on UR5/Puma drift q-space by O(1e-4) rad
+    while remaining T-space-correct; the dedicated tests in
+    test_three_parallel / test_spherical_two_parallel already cover
+    seed-recovery with the calibrated tolerance.
+
+    Manifest-declared coverage gaps (PiPER's RR / Z1's SP6 / etc.) are
+    xfailed via ``_maybe_xfail``.
+    """
+    if arm_name is None:
+        pytest.skip("No 6R arms in manifest")
+    assert fk_ceiling is not None
+    _maybe_xfail(arm_name)
+    mod = _load(arm_name)
+    T_target = mod.fk(q_star)
+    # respect_limits=False so we exercise the analytical solver's correctness
+    # independent of URDF joint-limit filtering; q* from the Hypothesis strategy
+    # is sampled in [-pi+0.3, pi-0.3] which routinely lands outside real arms'
+    # narrower URDF limits (Franka's joint 2 is +-1.76 rad, etc.).
+    sols = mod.solve(T_target, respect_limits=False)
+    assert sols, f"{arm_name}: reachable non-singular pose returned no IK"
+    max_fk = max(s.fk_residual for s in sols)
+    assert max_fk < fk_ceiling, (
+        f"{arm_name}: max FK residual {max_fk:.2e} > {fk_ceiling:.0e} ceiling at "
+        f"q*={q_star.tolist()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7R uniform sweep.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("arm_name", "fk_ceiling"),
+    _params_or_skip_7r(),
+)
+@given(q_star=non_singular_q7r())
+@settings(
+    max_examples=500,
+    deadline=None,
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.function_scoped_fixture],
+)
+def test_prebuilt_7r_random_q_roundtrip(
+    arm_name: str | None, fk_ceiling: float | None, q_star: np.ndarray
+) -> None:
+    """500 random non-singular 7R poses: solve(fk(q*)) returns at least one
+    IK, every returned IK FK-closes within the arm's documented ceiling.
+
+    7R IK returns a discretised 1-parameter family per pose (lock-sweep
+    samples x algebraic branches). Seed recovery isn't a clean assertion
+    -- the seed q* is unlikely to land exactly on a lock-sample value --
+    so the contract is FK-closure only. The corollary: a returned IK
+    might be far from q* in joint-space yet correct in T-space.
+    """
+    if arm_name is None:
+        pytest.skip("No 7R arms in manifest")
+    assert fk_ceiling is not None
+    _maybe_xfail(arm_name)
+    mod = _load(arm_name)
+    T_target = mod.fk(q_star)
+    # respect_limits=False so we exercise the analytical solver's correctness
+    # independent of URDF joint-limit filtering; q* from the Hypothesis strategy
+    # is sampled in [-pi+0.3, pi-0.3] which routinely lands outside real arms'
+    # narrower URDF limits (Franka's joint 2 is +-1.76 rad, etc.).
+    sols = mod.solve(T_target, respect_limits=False)
+    assert sols, f"{arm_name}: reachable non-singular pose returned no IK"
+    max_fk = max(s.fk_residual for s in sols)
+    assert max_fk < fk_ceiling, (
+        f"{arm_name}: max FK residual {max_fk:.2e} > {fk_ceiling:.0e} ceiling at "
+        f"q*={q_star.tolist()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tight-policy + refinement opt-in: machine-precision contract (#271).
+# ---------------------------------------------------------------------------
+
+
+# Investigation result on #271: the worst-case ~1e-5 FK floor on jointlock
+# 7R arms (Franka, Rizon 4, Kassow) is NOT a solver bug -- it's the result
+# of the default ``subproblem_numerical = 1e-5`` policy threshold. Inner
+# solvers honestly report full-arm FK residuals; with the default policy,
+# candidates as loose as ~5e-6 pass the threshold. Users who want machine
+# precision can opt in via ``policy=tight + allow_refinement=True``;
+# LM polish closes the gap to ~1e-10 across the affected arms.
+#
+# This test pins that contract: with tight policy + allow_refinement,
+# every returned IK FK-closes to 1e-7 or tighter on the affected arms.
+
+
+@pytest.mark.parametrize(
+    "arm_name",
+    _tight_7r_or_skip(),
+)
+@given(q_star=non_singular_q7r())
+@settings(
+    max_examples=100,  # tighter than the default-policy sweep; LM polish adds latency
+    deadline=None,
+    suppress_health_check=[HealthCheck.filter_too_much, HealthCheck.function_scoped_fixture],
+)
+def test_prebuilt_7r_tight_policy_machine_precision(arm_name: str | None, q_star: np.ndarray) -> None:
+    """7R jointlock arms (Franka, Rizon 4, Kassow KR810, xArm7, Rizon 10)
+    reach machine precision under the ``tight policy + allow_refinement=True``
+    opt-in.
+
+    Without the opt-in, the default ``subproblem_numerical = 1e-5``
+    accepts candidates as loose as ~5e-6 (see ``test_prebuilt_7r_random_
+    q_roundtrip`` above). With the opt-in, LM polish brings every
+    candidate to <=1e-7 -- typically much tighter (~1e-10).
+
+    Verifies the user-facing contract: 'if you want machine-precision IK
+    on a 7R jointlock arm, here's the policy that gets you there.'
+
+    iiwa14 and Gen3 are excluded -- their default policy already produces
+    machine-precision FK (closed-form SRS / SRS-polished). The opt-in is
+    only meaningful on the jointlock-with-inner-LS arms.
+    """
+    if arm_name is None:
+        pytest.skip("No 7R tight-policy arms in manifest")
+    _maybe_xfail(arm_name)
+    from ssik import TolerancePolicy
+
+    mod = _load(arm_name)
+    T_target = mod.fk(q_star)
+    tight_policy = TolerancePolicy(
+        axis_parallel=1e-8,
+        axis_intersect=1e-8,
+        subproblem_feasibility=1e-9,
+        subproblem_numerical=1e-9,
+        subproblem_degeneracy=1e-12,
+        subproblem_dedup=1e-3,
+    )
+    sols = mod.solve(
+        T_target,
+        respect_limits=False,
+        policy=tight_policy,
+        allow_refinement=True,
+    )
+    assert sols, f"{arm_name}: reachable pose under tight policy returned no IK"
+    max_fk = max(s.fk_residual for s in sols)
+    # 1e-7 ceiling: comfortable margin above LM's typical converged residual
+    # (~1e-10) without being so tight we fail on edge-case poses where polish
+    # converges to a local minimum a few orders worse.
+    assert max_fk < 1e-7, (
+        f"{arm_name}: tight-policy max FK {max_fk:.2e} > 1e-7 at q*={q_star.tolist()}"
+    )
+

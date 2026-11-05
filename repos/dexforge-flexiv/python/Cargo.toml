@@ -1,0 +1,15 @@
+[package]
+name = "dexforge-flexiv-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the dexforge Flexiv OEM repo."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_flexiv"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+dexforge-flexiv-core = { path = "../rust" }
+nalgebra = { version = "0.33", default-features = false, features = ["libm"] }

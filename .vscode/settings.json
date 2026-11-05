@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "cargo check": true,
+        "maturin": true,
+        "Get-Process": true
+    }
+}

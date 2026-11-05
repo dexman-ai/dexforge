@@ -15,8 +15,17 @@ env:
 
 jobs:
   python-bindings:
-    name: Python Bindings
+    name: Python Bindings (${{ matrix.oem }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        oem:
+          - dexforge-ur
+          - dexforge-agilex
+          - dexforge-franka
+          - dexforge-ufactory
+          - dexforge-flexiv
     steps:
       - uses: actions/checkout@v4
 
@@ -65,10 +74,10 @@ jobs:
       - name: Build and install Python bindings
         run: |
           source .venv/bin/activate
-          cd dexforge-py
+          cd repos/${{ matrix.oem }}/python
           python -m maturin develop --release
 
       - name: Run Python tests
         run: |
           source .venv/bin/activate
-          python -m pytest dexforge-py/tests/ -v
+          python -m pytest repos/${{ matrix.oem }}/python/tests -v

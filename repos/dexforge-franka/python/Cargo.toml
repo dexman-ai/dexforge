@@ -1,0 +1,15 @@
+[package]
+name = "dexforge-franka-py"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for the dexforge Franka OEM repo."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_franka"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+dexforge-franka-core = { path = "../rust" }
+nalgebra = { version = "0.33", default-features = false, features = ["libm"] }
