@@ -13,7 +13,8 @@ required by the issue:
 Usage::
 
     pip install ssik
-    python codegen/generate_test_data.py   # writes src/drivers/ur5/test_data.rs
+    python repos/dexforge-ur/rust/src/drivers/ur5/codegen/generate_test_data.py
+    # writes …/ur5/test_data.rs (sibling of ik_solver.rs)
 
 The RNG seed is fixed so regenerating the file is deterministic.
 """
@@ -66,8 +67,9 @@ for tf, qs in cases:
     out.write("]),\n")
 out.write("];\n")
 data=out.getvalue()
-dest=os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "ur5", "test_data.rs")
-dest=os.path.normpath(dest)
+# Script lives at …/ur5/codegen/; write test_data.rs next to ik_solver.rs.
+dest=os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "test_data.rs"))
+os.makedirs(os.path.dirname(dest), exist_ok=True)
 with open(dest,"w") as f:
     f.write(data)
 print("wrote", dest, "bytes", len(data))

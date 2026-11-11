@@ -129,6 +129,11 @@ license = "BSD-3-Clause"
 # parent Cargo workspace (e.g. the dexforge monorepo checkout).
 [workspace]
 
+[lib]
+# Vendored dexhal sources keep ``dexhal::…`` doctests; those do not apply here.
+# Driver correctness is gated by ``#[cfg(test)]`` unit tests.
+doctest = false
+
 # Self-contained: depends only on libm + nalgebra (no_std), never on the
 # dexforge repository or the dexforge Python package.
 [dependencies]
@@ -361,7 +366,14 @@ def write_export(export: Export) -> List[Path]:
         if not src.is_file():
             raise FileNotFoundError(f"missing source file: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
+        # Vendored math kernels must not keep ``dexhal::math::`` doctest paths.
+        if "math" in dst.parts and dst.suffix == ".rs":
+            text = src.read_text(encoding="utf-8").replace(
+                "dexhal::math::", "crate::math::"
+            )
+            dst.write_text(text, encoding="utf-8")
+        else:
+            shutil.copyfile(src, dst)
     for dst, content in export.generated:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(content, encoding="utf-8")
@@ -369,17 +381,33 @@ def write_export(export: Export) -> List[Path]:
 
 
 def verify_crate(out_dir: Path) -> tuple:
-    """Build the generated crate to prove it is standalone.
+    """Build and unit-test the generated crate (includes dynamics_parity when present).
 
     :returns: ``(success, combined_output)``.
     """
-    result = subprocess.run(
+    build = subprocess.run(
         ["cargo", "build", "--release"],
         capture_output=True,
         text=True,
         cwd=str(out_dir),
     )
-    return result.returncode == 0, (result.stderr + result.stdout).strip()
+    if build.returncode != 0:
+        return False, (build.stderr + build.stdout).strip()
+
+    # ``--lib`` skips doctests (disabled on stand-alone crates anyway) and runs
+    # IK reference tests plus Pinocchio dynamics_parity when wired into mod.rs.
+    tests = subprocess.run(
+        ["cargo", "test", "--lib"],
+        capture_output=True,
+        text=True,
+        cwd=str(out_dir),
+    )
+    combined = (
+        (build.stderr + build.stdout).strip()
+        + "\n"
+        + (tests.stderr + tests.stdout).strip()
+    ).strip()
+    return tests.returncode == 0, combined
 
 
 # ===========================================================================
@@ -563,6 +591,42 @@ def generate_ik(
             urdf,
         )
 
+        # --- Step 6b: Symbolic FK/Jacobian/dynamics BEFORE cargo build ---
+        # arm.rs / lib.rs re-export generated_kinematics + generated_dynamics;
+        # those modules come from SymPy, not the LLM. Generate them once and
+        # reuse across LLM retries so we do not pay the SymPy cost repeatedly.
+        driver_dir = output_dir / "src" / "drivers" / arm_name
+        dyn_rs = driver_dir / "generated_dynamics.rs"
+        if not dyn_rs.is_file():
+            print(
+                f"[ik_generator] Step 6b: Compiling symbolic kinematics + "
+                f"dynamics for '{arm_name}' …"
+            )
+            ok_dyn, dyn_msg = generate_dynamics_for_arm(
+                arm_name, Path(urdf), output_dir, ssik_artifact=None
+            )
+            if not ok_dyn:
+                return False, arm_name, dyn_msg
+            print(f"[ik_generator]   ✓ {dyn_msg}")
+        else:
+            _wire_generated_dynamics_module(driver_dir)
+            print(
+                "[ik_generator] Step 6b: Reusing existing generated_dynamics.rs "
+                "(skip SymPy on retry)."
+            )
+
+        # --- Step 6c: Pinocchio golden data + dynamics_parity before cargo test ---
+        print(
+            f"[ik_generator] Step 6c: Ensuring Pinocchio dynamics parity for "
+            f"'{arm_name}' …"
+        )
+        ok_parity, parity_msg = ensure_dynamics_parity(
+            arm_name, Path(urdf), output_dir
+        )
+        if not ok_parity:
+            return False, arm_name, parity_msg
+        print(f"[ik_generator]   ✓ {parity_msg}")
+
         # --- Step 7/8/9: scripts + build + test ---
         error = build_and_verify(
             generator_scripts=written,
@@ -589,29 +653,77 @@ generate_driver_from_urdf = generate_ik
 
 
 def _wire_generated_dynamics_module(driver_dir: Path) -> None:
-    """Ensure the per-arm ``mod.rs`` compiles ``generated_dynamics``."""
+    """Ensure the per-arm ``mod.rs`` compiles kinematics + dynamics kernels."""
     mod_path = driver_dir / "mod.rs"
+    required = (
+        "pub mod arm;",
+        "pub mod generated_dynamics;",
+        "pub mod generated_kinematics;",
+        "pub mod ik_solver;",
+    )
     if not mod_path.is_file():
         mod_path.write_text(
             "//! Auto-generated driver module index.\n\n"
-            "pub mod arm;\n"
-            "pub mod generated_dynamics;\n"
-            "pub mod generated_kinematics;\n"
-            "pub mod ik_solver;\n",
+            + "\n".join(required)
+            + "\n\n#[cfg(test)]\nmod dynamics_parity;\n",
             encoding="utf-8",
         )
         return
     text = mod_path.read_text(encoding="utf-8")
-    if "mod generated_dynamics" in text:
-        return
-    needle = "pub mod generated_kinematics;"
-    if needle in text:
-        text = text.replace(
-            needle, "pub mod generated_dynamics;\n" + needle, 1
-        )
-    else:
-        text = text.rstrip() + "\n\npub mod generated_dynamics;\n"
+    additions = [line for line in required if line.split(";")[0] not in text]
+    if additions:
+        # Insert public kernel modules after ik_solver when present; else append.
+        if "pub mod ik_solver;" in text:
+            insert_at = text.index("pub mod ik_solver;") + len("pub mod ik_solver;")
+            text = text[:insert_at] + "\n" + "\n".join(additions) + text[insert_at:]
+        else:
+            text = text.rstrip() + "\n\n" + "\n".join(additions) + "\n"
+    if "mod dynamics_parity" not in text:
+        text = text.rstrip() + "\n\n#[cfg(test)]\nmod dynamics_parity;\n"
     mod_path.write_text(text, encoding="utf-8")
+
+
+def ensure_dynamics_parity(
+    arm: str,
+    urdf: Path,
+    crate_root: Path,
+    samples: int = 10_000,
+    seed: int = 0,
+    force: bool = False,
+) -> tuple:
+    """Emit Pinocchio golden data + ``dynamics_parity`` tests into the crate.
+
+    Skips regeneration when ``dynamics_test_data.bin`` already exists unless
+    *force* is set (LLM retries reuse the golden file).
+
+    :returns: ``(success, message)``.
+    """
+    from generate_dynamics_test_data import write_ground_truth
+
+    driver_dir = crate_root / "src" / "drivers" / arm
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = driver_dir / "dynamics_test_data.bin"
+    parity_rs = driver_dir / "dynamics_parity.rs"
+
+    if bin_path.is_file() and parity_rs.is_file() and not force:
+        _wire_generated_dynamics_module(driver_dir)
+        return True, f"reusing existing Pinocchio golden data under {driver_dir}"
+
+    try:
+        write_ground_truth(
+            urdf=Path(urdf),
+            output_dir=driver_dir,
+            arm=arm,
+            samples=samples,
+            seed=seed,
+        )
+    except ImportError as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Pinocchio ground-truth generation failed: {exc}"
+
+    _wire_generated_dynamics_module(driver_dir)
+    return True, f"wrote Pinocchio golden data + dynamics_parity under {driver_dir}"
 
 
 def generate_dynamics_for_arm(
@@ -662,14 +774,13 @@ def generate_dynamics_for_arm(
     if code != 0:
         return False, f"generate_dynamics failed for {arm} (exit {code})"
 
-    # Kinematics-only consumers still import generated_kinematics; keep a
-    # sibling copy so both module paths stay valid after a rebuild.
+    # Kinematics-only consumers import generated_kinematics; mirror the same
+    # SymPy output so flange_jacobian / crate re-exports resolve.
     kin_rs = driver_dir / "generated_kinematics.rs"
-    if not kin_rs.is_file():
-        kin_rs.write_text(out_rs.read_text(encoding="utf-8"), encoding="utf-8")
+    kin_rs.write_text(out_rs.read_text(encoding="utf-8"), encoding="utf-8")
 
     _wire_generated_dynamics_module(driver_dir)
-    return True, f"wrote {out_rs}"
+    return True, f"wrote {out_rs} and {kin_rs}"
 
 def _build(args: argparse.Namespace) -> int:
     """Handle ``dexforge build --urdf``: translate a URDF, then verify the crate."""
@@ -750,15 +861,32 @@ def _build(args: argparse.Namespace) -> int:
             return 1
         print(f"[dexforge]   \u2713 generated '{arm}' driver under {base}.")
 
-    print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
-    ok, output = generate_dynamics_for_arm(arm, Path(urdf), base)
+    dyn_rs = base / "src" / "drivers" / arm / "generated_dynamics.rs"
+    if dyn_rs.is_file():
+        print(
+            f"[dexforge]   \u2713 kinematics/dynamics already present for '{arm}' "
+            f"(skipping SymPy recompile)."
+        )
+    else:
+        print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
+        ok, output = generate_dynamics_for_arm(arm, Path(urdf), base)
+        if not ok:
+            print(
+                f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under {base}.")
+
+    print(f"[dexforge] ensuring Pinocchio dynamics parity for '{arm}' …")
+    ok, output = ensure_dynamics_parity(arm, Path(urdf), base)
     if not ok:
         print(
-            f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
+            f"[dexforge] ERROR: Pinocchio dynamics parity setup failed:\n{output}",
             file=sys.stderr,
         )
         return 1
-    print(f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under {base}.")
+    print(f"[dexforge]   \u2713 {output}")
 
     if args.verify:
         print("[dexforge]   verifying standalone build (cargo build --release) …")

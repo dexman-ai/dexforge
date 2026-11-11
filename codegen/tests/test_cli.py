@@ -42,6 +42,16 @@ def _mock_generate_dynamics(*args, **kwargs):
     return True, "ok"
 
 
+def _mock_ensure_parity(*args, **kwargs):
+    crate_root = args[2] if len(args) > 2 else kwargs.get("crate_root")
+    driver = Path(crate_root) / "src" / "drivers" / "ur5"
+    driver.mkdir(parents=True, exist_ok=True)
+    (driver / "dynamics_test_data.bin").write_bytes(b"\0" * 8)
+    (driver / "dynamics_test_data.rs").write_text("// data\n", encoding="utf-8")
+    (driver / "dynamics_parity.rs").write_text("// parity\n", encoding="utf-8")
+    return True, "ok"
+
+
 class PlanExportTests(unittest.TestCase):
     def test_plan_copies_math_kernels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,6 +117,7 @@ class PlanExportTests(unittest.TestCase):
         cargo = next(c for d, c in export.generated if d.name == "Cargo.toml")
         self.assertIn("libm", cargo)
         self.assertIn("nalgebra", cargo)
+        self.assertIn("doctest = false", cargo)
         # No path/git dependency on dexforge itself.
         self.assertNotIn("path =", cargo)
 
@@ -204,6 +215,8 @@ class CliMainTests(unittest.TestCase):
                 cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
+            ), mock.patch.object(
+                cli, "ensure_dynamics_parity", side_effect=_mock_ensure_parity
             ), mock.patch.object(cli, "verify_crate", return_value=(True, "ok")):
                 with redirect_stdout(io.StringIO()):
                     code = cli.main(
@@ -222,6 +235,8 @@ class CliMainTests(unittest.TestCase):
                 cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
+            ), mock.patch.object(
+                cli, "ensure_dynamics_parity", side_effect=_mock_ensure_parity
             ):
                 with mock.patch.object(cli, "verify_crate") as vc:
                     with redirect_stdout(io.StringIO()):
@@ -242,6 +257,8 @@ class CliMainTests(unittest.TestCase):
                 cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
+            ), mock.patch.object(
+                cli, "ensure_dynamics_parity", side_effect=_mock_ensure_parity
             ):
                 with mock.patch.object(cli, "verify_crate", return_value=(False, "boom")):
                     with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
@@ -269,7 +286,9 @@ class UrdfBuildTests(unittest.TestCase):
                 cli, "generate_ik", side_effect=_mock_generate_driver
             ) as gen, mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
-            ) as dyn:
+            ) as dyn, mock.patch.object(
+                cli, "ensure_dynamics_parity", side_effect=_mock_ensure_parity
+            ) as parity:
                 with redirect_stdout(io.StringIO()):
                     code = cli.main(
                         ["build", "--urdf", str(urdf), "--base", "base_link",
@@ -279,6 +298,7 @@ class UrdfBuildTests(unittest.TestCase):
             gen.assert_called_once()
             # dexforge is a kinematics + dynamics compiler: dynamics must run.
             dyn.assert_called_once()
+            parity.assert_called_once()
             self.assertTrue((out / "Cargo.toml").is_file())
             self.assertTrue((out / "src" / "lib.rs").is_file())
 
@@ -346,6 +366,8 @@ class UrdfBuildTests(unittest.TestCase):
             with mock.patch.object(cli, "generate_ik") as gen, mock.patch.object(
                 cli, "generate_dynamics_for_arm", return_value=(True, "ok")
             ) as dyn, mock.patch.object(
+                cli, "ensure_dynamics_parity", side_effect=_mock_ensure_parity
+            ) as parity, mock.patch.object(
                 cli, "verify_crate", return_value=(True, "ok")
             ):
                 with redirect_stdout(io.StringIO()):
@@ -366,7 +388,13 @@ class UrdfBuildTests(unittest.TestCase):
                     )
             self.assertEqual(code, 0)
             gen.assert_not_called()
-            dyn.assert_called_once()
+            # Dynamics may already be seeded by plan_export; SymPy is skipped then.
+            dyn_rs = out / "src" / "drivers" / "ur5" / "generated_dynamics.rs"
+            self.assertTrue(
+                dyn.called or dyn_rs.is_file(),
+                "expected generate_dynamics_for_arm or a seeded generated_dynamics.rs",
+            )
+            parity.assert_called_once()
             self.assertTrue((out / "Cargo.toml").is_file())
             self.assertTrue((out / "src" / "drivers" / "ur5" / "ik_solver.rs").is_file())
             self.assertIn("[workspace]", (out / "Cargo.toml").read_text())

@@ -58,6 +58,10 @@ cd repos/dexforge-ur && cargo test -p dexforge-ur-core dynamics_parity
 
 Expect three tests: conventions, four-term Pinocchio match, and `τ = M q̈ + C q̇ + g`.
 
+`dexforge build` (LLM or `--from-existing`) runs the same Pinocchio golden +
+`dynamics_parity` setup automatically before `cargo test --lib`, so a successful
+end-to-end build already includes this gate.
+
 ## Driver wiring checklist (copy for the next arm)
 
 1. Confirm the arm URDF has real `<inertial>` masses on every moving link.

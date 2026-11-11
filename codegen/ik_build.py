@@ -14,6 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
+import re
 
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
@@ -37,13 +38,24 @@ def _driver_dir(output_root: Path, oem_name: str, arm_name: str) -> Path:
     return output_root / "src" / "drivers" / arm_name
 
 
+def _vendor_math_source(text: str) -> str:
+    """Rewrite dexhal-crate paths so vendored math compiles in a stand-alone crate.
+
+    Doctests and comments in ``repos/dexhal`` correctly say ``dexhal::math::…``.
+    After copy into a ``dexforge build`` output crate there is no ``dexhal``
+    dependency, so those paths become ``crate::math::…``.
+    """
+    return text.replace("dexhal::math::", "crate::math::")
+
+
 def _copy_math_kernels(repo_root: Path, output_root: Path) -> None:
     """Copy the shared math kernels into the generated crate tree."""
     src = _math_src(repo_root)
     dst = output_root / "src" / "math"
     dst.mkdir(parents=True, exist_ok=True)
     for rs in sorted(src.glob("*.rs")):
-        shutil.copyfile(rs, dst / rs.name)
+        text = rs.read_text(encoding="utf-8")
+        (dst / rs.name).write_text(_vendor_math_source(text), encoding="utf-8")
 
 
 def _cargo_toml(cargo_suffix: str, arm_name: str) -> str:
@@ -58,6 +70,11 @@ license = "BSD-3-Clause"
 
 # Keep the generated crate out of any parent Cargo workspace.
 [workspace]
+
+[lib]
+# Vendored dexhal sources keep ``dexhal::…`` doctests; those do not apply in a
+# stand-alone driver crate. Unit tests under ``#[cfg(test)]`` are the gate.
+doctest = false
 
 [dependencies]
 libm = "0.2"
@@ -233,7 +250,34 @@ def write_generated_files(
     return written
 
 
-def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list[tuple[str, str]]:
+def _normalize_helper_script_paths(script_path: Path) -> None:
+    """Rewrite legacy dest paths so helpers work under ``src/drivers/<arm>/codegen/``.
+
+    Older prompts told the LLM to write::
+
+        join(__file__, "..", "src", "drivers", "<arm>", "test_data.rs")
+
+    which is correct only when the script lives at repo-root ``codegen/``.
+    Stand-alone crates place helpers next to the driver, so the dest must be
+    ``join(__file__, "..", "test_data.rs")``.
+    """
+    text = script_path.read_text(encoding="utf-8")
+    rewritten = re.sub(
+        r'os\.path\.join\(\s*os\.path\.dirname\(__file__\)\s*,\s*"\.\."\s*,\s*"src"\s*,\s*"drivers"\s*,\s*"[^"]+"\s*,\s*("[^"]+\.rs")\s*\)',
+        r'os.path.join(os.path.dirname(__file__), "..", \1)',
+        text,
+    )
+    if rewritten != text:
+        script_path.write_text(rewritten, encoding="utf-8")
+        print(
+            f"[ik_generator]   Normalized output paths in {script_path.name} "
+            "for stand-alone driver layout."
+        )
+
+
+def run_py_scripts(
+    generator_scripts: dict[str, Path], output_dir: Path
+) -> Optional[Tuple[str, str]]:
     """Run all ``generate_*.py`` files that were written to ``codegen/``.
 
     Each script is executed with the current Python interpreter from the
@@ -242,13 +286,16 @@ def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list
 
     :param generator_scripts: The ``{filename: path}`` dict returned by
         :func:`write_generated_files`.
-    :returns:  ``(script_name, error_output)`` tuple when a script fails.
-        None means all scripts succeeded.
+    :returns: ``(script_name, error_output)`` when a script fails, else ``None``.
     """
 
     for filename, path in sorted(generator_scripts.items()):
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
+
+        _normalize_helper_script_paths(path)
+        # Ensure the driver directory exists for scripts that write ``../foo.rs``.
+        (path.parent.parent).mkdir(parents=True, exist_ok=True)
 
         print(f"[ik_generator]   Running {path.relative_to(output_dir)} …")
         result = subprocess.run(
@@ -260,9 +307,8 @@ def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list
         if result.returncode != 0:
             error = (result.stderr + result.stdout).strip()
             print(f"[ik_generator]   ✗ {filename} failed:\n{error}")
-            return [(filename, error)]
-        else:
-            print(f"[ik_generator]   ✓ {filename} succeeded.")
+            return (filename, error)
+        print(f"[ik_generator]   ✓ {filename} succeeded.")
 
     return None
 
@@ -283,12 +329,15 @@ def build_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
 
 
 def test_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
-    """Run ``cargo test`` from *cwd*.
+    """Run library unit tests from *cwd* (``cargo test --lib``).
+
+    Doctests are disabled on stand-alone crates (see ``doctest = false``); the
+    IK/dynamics gate is the ``#[cfg(test)]`` suite.
 
     :returns: ``(success, output)`` where *output* is combined stdout+stderr.
     """
     result = subprocess.run(
-        ["cargo", "test"],
+        ["cargo", "test", "--lib"],
         capture_output=True,
         text=True,
         cwd=str(cwd),

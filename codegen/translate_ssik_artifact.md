@@ -68,8 +68,10 @@ You must also generate one or more Python helper scripts that regenerate the aux
 
 Each generated script must:
 1. Import the relevant `ssik.prebuilt.<arm>_ik` artifact.
-2. Produce a Rust source file written to `src/drivers/<arm>/<filename>.rs`, computing the path with `os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "<arm>", "<filename>.rs")` so it works when run from the `codegen/` directory.
-3. Print a confirmation line such as `"wrote src/drivers/<arm>/<filename>.rs"`.
+2. Live under `src/drivers/<arm>/codegen/` and write the Rust file **one directory up** (next to `ik_solver.rs`), e.g. `test_data.rs`, using:
+   `os.path.join(os.path.dirname(__file__), "..", "test_data.rs")`
+   (Do **not** insert another `src/drivers/<arm>/` segment — that doubles the path in stand-alone crates.)
+3. Print a confirmation line such as `"wrote …/test_data.rs"`.
 
 ### **7. Output Format (CRITICAL)**
 

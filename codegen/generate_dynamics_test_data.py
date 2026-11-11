@@ -293,6 +293,207 @@ def emit_rust_loader(
     return "\n".join(out)
 
 
+def emit_dynamics_parity_rs(arm: str, dof: int) -> str:
+    """Emit a DOF-parameterized ``dynamics_parity`` unit-test module."""
+    return f"""//! Pinocchio ground-truth parity for the symbolic {arm} dynamics.
+//!
+//! Compares `generated_dynamics::{{gravity, mass_matrix, coriolis,
+//! inverse_dynamics}}` against the independent Newton-Euler reference in
+//! [`dynamics_test_data`] (produced by `codegen/generate_dynamics_test_data.py`).
+//!
+//! Before treating a mismatch as a dynamics bug, confirm:
+//! * joint order matches [`dynamics_test_data::JOINT_NAMES`]
+//! * gravity vector matches [`dynamics_test_data::GRAVITY`]
+
+#![cfg(test)]
+
+#[path = "dynamics_test_data.rs"]
+mod dynamics_test_data;
+
+use super::generated_dynamics::{{coriolis, gravity, inverse_dynamics, mass_matrix}};
+
+/// Absolute torque / inertia tolerance. Lagrangian vs. recursive Newton-Euler
+/// from the same URDF agree to well below this on commodity `f64`.
+const ATOL: f64 = 1e-6;
+
+fn max_abs_diff_vec(a: &[f64; {dof}], b: &[f64; {dof}]) -> f64 {{
+    let mut m = 0.0f64;
+    for i in 0..{dof} {{
+        let d = libm::fabs(a[i] - b[i]);
+        if d > m {{
+            m = d;
+        }}
+    }}
+    m
+}}
+
+fn max_abs_diff_mat(a: &[[f64; {dof}]; {dof}], b: &[[f64; {dof}]; {dof}]) -> f64 {{
+    let mut m = 0.0f64;
+    for i in 0..{dof} {{
+        for j in 0..{dof} {{
+            let d = libm::fabs(a[i][j] - b[i][j]);
+            if d > m {{
+                m = d;
+            }}
+        }}
+    }}
+    m
+}}
+
+#[test]
+fn conventions_match_pinocchio_dataset() {{
+    assert_eq!(dynamics_test_data::DOF, {dof});
+    assert_eq!(
+        dynamics_test_data::GRAVITY,
+        [0.0, 0.0, -9.81],
+        "gravity sign/convention drift — update generator --gravity or the test"
+    );
+    assert_eq!(dynamics_test_data::JOINT_NAMES.len(), {dof});
+    assert!(dynamics_test_data::N_CASES > 0);
+    assert_eq!(
+        dynamics_test_data::RAW.len(),
+        dynamics_test_data::N_CASES * dynamics_test_data::FLOATS_PER_CASE * 8
+    );
+}}
+
+#[test]
+fn matches_pinocchio_gravity_mass_coriolis_and_inverse_dynamics() {{
+    let g_world = dynamics_test_data::GRAVITY;
+    let mut worst = [0.0f64; 4]; // g, M, C, tau
+    let mut worst_idx = [0usize; 4];
+
+    for idx in 0..dynamics_test_data::N_CASES {{
+        let c = dynamics_test_data::case(idx);
+
+        let g_got = gravity(&c.q, &g_world);
+        let m_got = mass_matrix(&c.q);
+        let c_got = coriolis(&c.q, &c.qd);
+        let tau_got = inverse_dynamics(&c.q, &c.qd, &c.qdd, &g_world);
+
+        let dg = max_abs_diff_vec(&g_got, &c.gravity_torque);
+        let dm = max_abs_diff_mat(&m_got, &c.mass_matrix);
+        let dc = max_abs_diff_vec(&c_got, &c.coriolis_torque);
+        let dtau = max_abs_diff_vec(&tau_got, &c.inverse_dynamics_torque);
+
+        for (slot, d) in [(0, dg), (1, dm), (2, dc), (3, dtau)] {{
+            if d > worst[slot] {{
+                worst[slot] = d;
+                worst_idx[slot] = idx;
+            }}
+        }}
+
+        assert!(
+            dg < ATOL,
+            "case {{idx}}: gravity mismatch max|Δ|={{dg:e}}\\n got={{g_got:?}}\\n ref={{:?}}",
+            c.gravity_torque
+        );
+        assert!(
+            dm < ATOL,
+            "case {{idx}}: mass_matrix mismatch max|Δ|={{dm:e}}"
+        );
+        assert!(
+            dc < ATOL,
+            "case {{idx}}: coriolis mismatch max|Δ|={{dc:e}}\\n got={{c_got:?}}\\n ref={{:?}}",
+            c.coriolis_torque
+        );
+        assert!(
+            dtau < ATOL,
+            "case {{idx}}: inverse_dynamics mismatch max|Δ|={{dtau:e}}\\n got={{tau_got:?}}\\n ref={{:?}}",
+            c.inverse_dynamics_torque
+        );
+    }}
+
+    assert!(
+        worst.iter().all(|&d| d < ATOL),
+        "worst Δ: g={{:e}} (case {{}}), M={{:e}} (case {{}}), C={{:e}} (case {{}}), τ={{:e}} (case {{}})",
+        worst[0],
+        worst_idx[0],
+        worst[1],
+        worst_idx[1],
+        worst[2],
+        worst_idx[2],
+        worst[3],
+        worst_idx[3],
+    );
+}}
+
+#[test]
+fn inverse_dynamics_equals_m_qdd_plus_c_plus_g() {{
+    let g_world = dynamics_test_data::GRAVITY;
+    let n_check = dynamics_test_data::N_CASES.min(64);
+    for idx in 0..n_check {{
+        let c = dynamics_test_data::case(idx);
+        let m = mass_matrix(&c.q);
+        let cor = coriolis(&c.q, &c.qd);
+        let g = gravity(&c.q, &g_world);
+        let tau = inverse_dynamics(&c.q, &c.qd, &c.qdd, &g_world);
+
+        let mut composed = [0.0f64; {dof}];
+        for i in 0..{dof} {{
+            let mut mqdd = 0.0;
+            for j in 0..{dof} {{
+                mqdd += m[i][j] * c.qdd[j];
+            }}
+            composed[i] = mqdd + cor[i] + g[i];
+        }}
+        let d = max_abs_diff_vec(&tau, &composed);
+        assert!(
+            d < ATOL,
+            "case {{idx}}: τ ≠ M qdd + C qd + g (max|Δ|={{d:e}})"
+        );
+    }}
+}}
+"""
+
+
+def write_ground_truth(
+    urdf: Path,
+    output_dir: Path,
+    arm: Optional[str] = None,
+    samples: int = _DEFAULT_SAMPLES,
+    seed: int = 0,
+    qd_limit: float = _DEFAULT_QD_LIMIT,
+    qdd_limit: float = _DEFAULT_QDD_LIMIT,
+    gravity: Tuple[float, float, float] = _DEFAULT_GRAVITY,
+) -> Tuple[Path, Path, Path]:
+    """Generate Pinocchio golden data + parity tests into *output_dir*.
+
+    :returns: ``(bin_path, loader_rs, parity_rs)``.
+    """
+    try:
+        import pinocchio  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Pinocchio not installed. Install with `pip install pin`."
+        ) from exc
+
+    arm_name = arm or urdf.stem
+    dof, joint_names, cases = build_dataset(
+        urdf, samples, seed, qd_limit, qdd_limit, gravity
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    bin_name = "dynamics_test_data.bin"
+    bin_path = output_dir / bin_name
+    loader_rs = output_dir / "dynamics_test_data.rs"
+    parity_rs = output_dir / "dynamics_parity.rs"
+
+    blob = _pack_cases(dof, cases)
+    bin_path.write_bytes(blob)
+    loader_rs.write_text(
+        emit_rust_loader(
+            arm_name, dof, len(cases), gravity, joint_names, bin_name
+        ),
+        encoding="utf-8",
+    )
+    parity_rs.write_text(emit_dynamics_parity_rs(arm_name, dof), encoding="utf-8")
+    print(
+        f"[generate_dynamics_test_data] wrote {bin_path} ({len(blob)} bytes), "
+        f"{loader_rs}, and {parity_rs}",
+        file=sys.stderr,
+    )
+    return bin_path, loader_rs, parity_rs
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n", 1)[0],
@@ -350,50 +551,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[generate_dynamics_test_data] ERROR: URDF not found: {args.urdf}", file=sys.stderr)
         return 1
 
-    try:
-        import pinocchio  # noqa: F401
-    except ImportError:
-        print(
-            "[generate_dynamics_test_data] ERROR: Pinocchio not installed. "
-            "Install with `pip install pin`.",
-            file=sys.stderr,
-        )
-        return 1
-
     out_dir = args.output_dir
     # Legacy: if someone still passes --output pointing at a .rs file, use its parent.
     if args.output is not None:
         out_dir = args.output.parent if args.output.suffix == ".rs" else args.output
 
-    arm = args.arm or args.urdf.stem
-    dof, joint_names, cases = build_dataset(
-        args.urdf,
-        args.samples,
-        args.seed,
-        args.qd_limit,
-        args.qdd_limit,
-        tuple(args.gravity),
-    )
-    print(
-        f"[generate_dynamics_test_data] {arm}: {len(cases)} states, {dof} DOF "
-        f"from {args.urdf} (gravity={tuple(args.gravity)})",
-        file=sys.stderr,
-    )
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    bin_name = "dynamics_test_data.bin"
-    bin_path = out_dir / bin_name
-    rs_path = out_dir / "dynamics_test_data.rs"
-
-    blob = _pack_cases(dof, cases)
-    bin_path.write_bytes(blob)
-    rs_path.write_text(
-        emit_rust_loader(arm, dof, len(cases), tuple(args.gravity), joint_names, bin_name)
-    )
-    print(
-        f"[generate_dynamics_test_data] wrote {bin_path} ({len(blob)} bytes) and {rs_path}",
-        file=sys.stderr,
-    )
+    try:
+        write_ground_truth(
+            urdf=args.urdf,
+            output_dir=out_dir,
+            arm=args.arm,
+            samples=args.samples,
+            seed=args.seed,
+            qd_limit=args.qd_limit,
+            qdd_limit=args.qdd_limit,
+            gravity=tuple(args.gravity),
+        )
+    except ImportError as exc:
+        print(f"[generate_dynamics_test_data] ERROR: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 — surface Pinocchio/URDF failures
+        print(f"[generate_dynamics_test_data] ERROR: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
