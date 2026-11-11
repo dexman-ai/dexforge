@@ -22,6 +22,8 @@ from typing import NamedTuple, Optional, Tuple
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
 
 
 class IKGenerationEntrypoint(NamedTuple):
@@ -236,13 +238,13 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
 
 
 def _resolve_repo_driver_dir(repo_root: Path, arm: str) -> Optional[Path]:
-    """Resolve a driver directory in the repo for an arm name.
-    """
-    drivers_root = repo_root / "src" / "drivers"
-    for candidate in sorted(drivers_root.glob(f"*/drivers/{arm}")):
-        if candidate.is_dir():
-            return candidate
-    return None
+    """Resolve a driver directory in the repo for an arm name."""
+    try:
+        from repo_paths import resolve_arm_driver_dir
+    except ImportError:  # pragma: no cover - package import path
+        from codegen.repo_paths import resolve_arm_driver_dir  # type: ignore
+
+    return resolve_arm_driver_dir(repo_root, str(arm))
 
 
 def generate_context(
@@ -283,11 +285,12 @@ def generate_context(
 
     print("[ik_generator] Step 1: Detecting kinematic family …")
     best_guess_example_arm, max_solutions, dof = find_best_example(ssik_artifact)
-    example_arm = example_arm or _resolve_repo_driver_dir(repo_root,best_guess_example_arm)
-    
-    # Fall back gracefully when the chosen example arm has no Rust driver yet.
+    # Keep *example_arm* as a bare arm name (string); resolve the path only when
+    # loading example sources. Assigning a Path here used to break later lookups.
     if example_arm is None:
-        fallback = "franka_panda"
+        example_arm = best_guess_example_arm
+    if _resolve_repo_driver_dir(repo_root, example_arm) is None:
+        fallback = "ur5"
         if _resolve_repo_driver_dir(repo_root, fallback) is not None:
             print(
                 f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
@@ -297,7 +300,7 @@ def generate_context(
         else:
             print(
                 f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
-                "or fallback 'franka_panda'. The one-shot example will be empty.",
+                f"or fallback '{fallback}'. The one-shot example will be empty.",
                 file=sys.stderr,
             )
     print(
@@ -450,12 +453,14 @@ def assemble_context(
     prompt_template = prompt_path.read_text(encoding="utf-8")
 
     # --- Rust API headers ---
-    ssik_core_sigs = extract_rust_signatures(
-        _REPO_ROOT / "src" / "math" / "ssik_core.rs"
-    )
-    kinematics_sigs = extract_rust_signatures(
-        _REPO_ROOT / "src" / "math" / "kinematics.rs"
-    )
+    try:
+        from repo_paths import math_src
+    except ImportError:  # pragma: no cover
+        from codegen.repo_paths import math_src  # type: ignore
+
+    math_dir = math_src(repo_root)
+    ssik_core_sigs = extract_rust_signatures(math_dir / "ssik_core.rs")
+    kinematics_sigs = extract_rust_signatures(math_dir / "kinematics.rs")
 
     # --- One-shot example (Python source + Rust translation + helper scripts) ---
     example_py = _load_example_py_source(example_arm)

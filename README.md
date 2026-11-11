@@ -273,7 +273,7 @@ python codegen/generate_dynamics.py --artifact ur5_ik
 
 # From a local artifact .py file, writing to a driver module:
 python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
-    --output src/drivers/<arm>/dynamics.rs
+    --output repos/dexforge-<oem>/rust/src/drivers/<arm>/generated_dynamics.rs
 ```
 
 The emitted module exposes `fk(q: &[f64; N]) -> [[f64; 4]; 4]` (the 4×4
@@ -301,12 +301,12 @@ generator additionally emits, via the energy (Lagrangian) method:
 | `inverse_dynamics(q, qd, qdd)` | `[f64; N]` | MIT-mode feed-forward `τ = M q̈ + C q̇ + g` |
 
 ```sh
-# Kinematics from the artifact, masses/inertias from a URDF; default gravity
-# is (0, 0, −9.81), override with --gravity GX GY GZ:
+# Kinematics from the artifact, masses/inertias from a URDF.
+# Runtime gravity is an argument to the emitted gravity/inverse_dynamics
+# functions (default test vector is (0, 0, −9.81)):
 python codegen/generate_dynamics.py --artifact ur5_ik \
-    --urdf src/drivers/ur5/ur5_inertial.urdf \
-    --gravity 0 0 -9.81 \
-    --output src/drivers/ur5/dynamics.rs
+    --urdf repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf \
+    --output repos/dexforge-ur/rust/src/drivers/ur5/generated_dynamics.rs
 ```
 
 `dexforge build` runs this symbolic compiler as part of the end-to-end URDF
@@ -362,15 +362,37 @@ pytest repos/dexforge-*/python/tests/
 
 ### Regenerating the test data
 
+IK reference datasets (ssik):
+
 ```sh
 pip install $(grep ssik SSIK_VERSION.txt)
-python src/drivers/ur5/codegen/generate_test_data.py
-python src/drivers/franka_panda/codegen/generate_test_data.py
-python src/drivers/xarm7/codegen/generate_test_data.py
-python src/drivers/piper/codegen/generate_test_data.py
-python src/drivers/rizon4/codegen/generate_test_data.py
-python src/drivers/rizon10/codegen/generate_test_data.py
+python repos/dexforge-ur/rust/src/drivers/ur5/codegen/generate_test_data.py
+# …analogous scripts under other OEM driver `codegen/` dirs
 ```
+
+### Pinocchio dynamics ground truth (UR5)
+
+`codegen/generate_dynamics_test_data.py` is a **one-time** generator. It loads
+the same URDF the driver was built from, samples 10 000 random `(q, qd, qdd)`
+states, and asks Pinocchio for gravity torque, mass matrix, Coriolis torque and
+inverse-dynamics torque. Results are saved as
+`repos/dexforge-ur/rust/src/drivers/ur5/dynamics_test_data.bin` plus a thin
+Rust loader `dynamics_test_data.rs`. After that, `cargo test` does **not** need
+Pinocchio.
+
+```sh
+pip install pin numpy
+python codegen/generate_dynamics_test_data.py \
+    --urdf repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf \
+    --output-dir repos/dexforge-ur/rust/src/drivers/ur5 \
+    --arm ur5 --samples 10000 --seed 0
+cd repos/dexforge-ur && cargo test -p dexforge-ur-core dynamics_parity
+```
+
+**Conventions** (check these before trusting a mismatch): joint order is the
+URDF/Pinocchio actuated order printed at generation time; gravity is the same
+base-frame vector on both sides (default `[0, 0, -9.81]`). See the module docs
+in `dynamics_test_data.rs` and the script docstring.
 
 ### ssik Version Locking
 

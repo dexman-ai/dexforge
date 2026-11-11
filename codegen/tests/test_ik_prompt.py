@@ -14,7 +14,16 @@ import ik_prompt  # noqa: E402
 class GenerateContextTests(unittest.TestCase):
     def test_generate_context_ur5_has_non_empty_sections(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
-        urdf_path = repo_root / "src" / "drivers" / "ur" / "drivers" / "ur5" / "ur5.urdf"
+        urdf_path = (
+            repo_root
+            / "repos"
+            / "dexforge-ur"
+            / "rust"
+            / "src"
+            / "drivers"
+            / "ur5"
+            / "ur5.urdf"
+        )
 
         self.assertTrue(urdf_path.is_file(), f"Missing URDF fixture: {urdf_path}")
 
@@ -22,7 +31,7 @@ class GenerateContextTests(unittest.TestCase):
             entry = ik_prompt.generate_context(
                 urdf_path=urdf_path,
                 base_link="base_link",
-                ee_link="tool0",
+                ee_link="ee_link",
                 output_dir=Path(tmp),
                 repo_root=repo_root,
                 example_arm="ur5",

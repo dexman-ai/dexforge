@@ -13,23 +13,34 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
+
+from repo_paths import math_src as _math_src  # noqa: E402
+
 
 def _driver_dir(output_root: Path, oem_name: str, arm_name: str) -> Path:
-    """Return the driver directory rooted at *root* for *arm_name*."""
-    return output_root / "drivers" / oem_name / arm_name
+    """Return the driver directory inside a generated crate for *arm_name*.
+
+    Layout matches ``dexforge build`` / ``plan_export``::
+
+        <crate>/src/drivers/<arm>/
+
+    *oem_name* is retained for provenance naming but no longer nests the path.
+    """
+    del oem_name  # crate layout is flat under src/drivers/<arm>
+    return output_root / "src" / "drivers" / arm_name
 
 
 def _copy_math_kernels(repo_root: Path, output_root: Path) -> None:
     """Copy the shared math kernels into the generated crate tree."""
-    src = repo_root / "src" / "math"
-    dst = output_root / "math"
-    if not src.is_dir():
-        raise FileNotFoundError(f"missing math kernels: {src}")
+    src = _math_src(repo_root)
+    dst = output_root / "src" / "math"
     dst.mkdir(parents=True, exist_ok=True)
     for rs in sorted(src.glob("*.rs")):
         shutil.copyfile(rs, dst / rs.name)
@@ -44,6 +55,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Rigid Body Kinematics and Dynamics driver for {cargo_suffix} arms, compiled by dexforge."
 license = "BSD-3-Clause"
+
+# Keep the generated crate out of any parent Cargo workspace.
+[workspace]
 
 [dependencies]
 libm = "0.2"
@@ -71,27 +85,32 @@ pub mod math;
 
 pub use drivers::{arm_name}::ik_solver::{{fk, solve, TolerancePolicy}};
 pub use drivers::{arm_name}::generated_kinematics;
+pub use drivers::{arm_name}::generated_dynamics;
 """
 
-def _ensure_arm_mod_rs(output_root: Path, oem_name:str, arm_name: str, rust_files: list[str]) -> None:
+def _ensure_arm_mod_rs(output_root: Path, oem_name: str, arm_name: str, rust_files: list[str]) -> None:
     """Create the arm module files in the generated crate if missing."""
-    mod_path = _driver_dir(output_root, oem_name, "") / "mod.rs"
-    mod_path.parent.mkdir(parents=True, exist_ok=True)
-    mod_path.write_text(f"pub mod {arm_name};\n\n", encoding="utf-8")
-    print(f"[ik_generator]   Created {mod_path.relative_to(output_root)}")
+    drivers_mod = output_root / "src" / "drivers" / "mod.rs"
+    drivers_mod.parent.mkdir(parents=True, exist_ok=True)
+    drivers_mod.write_text(
+        "//! Driver module index (compiled by dexforge build).\n\n"
+        f"pub mod {arm_name};\n",
+        encoding="utf-8",
+    )
+    print(f"[ik_generator]   Created {drivers_mod.relative_to(output_root)}")
 
     mod_path = _driver_dir(output_root, oem_name, arm_name) / "mod.rs"
     mod_path.parent.mkdir(parents=True, exist_ok=True)
 
-    lines: list[str] = [f"//! {arm_name} IK driver.\n"]
-    lines.append("")
-    lines.append("pub mod ik_solver;")
+    lines: list[str] = [f"//! {arm_name} IK driver.\n", "", "pub mod ik_solver;"]
     for fname in sorted(rust_files):
         stem = Path(fname).stem
         if stem in ("ik_solver", "mod", "test_data"):
             continue
-        if stem == "arm":
-            lines.append("pub mod arm;")
+        # Dynamics / kinematics kernels and the ArmModel marker must be public
+        # so crate-root re-exports and flange_* overrides can reach them.
+        if stem in ("arm", "generated_dynamics", "generated_kinematics"):
+            lines.append(f"pub mod {stem};")
         else:
             lines.append(f"mod {stem};")
     mod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

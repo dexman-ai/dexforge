@@ -24,15 +24,21 @@ def _write_minimal_crate(root: Path) -> None:
 
 
 def _mock_generate_driver(*args, **kwargs):
-    output_root = args[4]
-    _write_minimal_crate(output_root)
+    output_root = kwargs.get("output_dir")
+    if output_root is None and len(args) > 4:
+        output_root = args[4]
+    if output_root is None:
+        raise AssertionError("mock generate_ik expected output_dir")
+    _write_minimal_crate(Path(output_root))
     return True, "ur5", "ok"
 
 
 def _mock_generate_dynamics(*args, **kwargs):
     crate_root = args[2]
-    (crate_root / "src" / "drivers" / "ur5").mkdir(parents=True, exist_ok=True)
-    (crate_root / "src" / "drivers" / "ur5" / "generated_kinematics.rs").write_text("// dyn\n", encoding="utf-8")
+    driver = crate_root / "src" / "drivers" / "ur5"
+    driver.mkdir(parents=True, exist_ok=True)
+    (driver / "generated_kinematics.rs").write_text("// kin\n", encoding="utf-8")
+    (driver / "generated_dynamics.rs").write_text("// dyn\n", encoding="utf-8")
     return True, "ok"
 
 
@@ -54,6 +60,8 @@ class PlanExportTests(unittest.TestCase):
         self.assertIn("generated_kinematics.rs", dsts)
 
     def test_rizon_pulls_in_shared_module(self) -> None:
+        if cli._resolve_arm_driver_dir(_REPO_ROOT, "rizon4") is None:
+            self.skipTest("rizon4 driver not visible in this checkout/sandbox")
         with tempfile.TemporaryDirectory() as tmp:
             export = cli.plan_export("rizon4", Path(tmp), _REPO_ROOT)
         copied = {src.name for src, _ in export.copies}
@@ -76,6 +84,12 @@ class PlanExportTests(unittest.TestCase):
         self.assertIn("pub struct FrankaPanda;", rendered)
         self.assertIn("impl ArmModel<7, 128> for FrankaPanda", rendered)
         self.assertIn("crate::drivers::franka_panda::ik_solver::fk(q)", rendered)
+        self.assertIn(
+            "crate::drivers::franka_panda::generated_dynamics::gravity(q, gravity)",
+            rendered,
+        )
+        self.assertIn("fn flange_mass_matrix", rendered)
+        self.assertIn("fn flange_coriolis", rendered)
 
     def test_lib_rs_reexports_arm_entrypoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +98,7 @@ class PlanExportTests(unittest.TestCase):
         self.assertIn("pub use drivers::ur5::ik_solver::{fk, solve, TolerancePolicy};", lib)
         # Full kinematics + dynamics suite re-exported at the crate root.
         self.assertIn("pub use drivers::ur5::generated_kinematics;", lib)
+        self.assertIn("pub use drivers::ur5::generated_dynamics;", lib)
         self.assertIn("#![no_std]", lib)
 
     def test_cargo_toml_has_only_minimal_deps(self) -> None:
@@ -105,11 +120,15 @@ class PlanExportTests(unittest.TestCase):
         self.assertIn("--urdf", str(ctx.exception))
 
     def test_shared_modules_recorded_for_rizon(self) -> None:
+        if cli._resolve_arm_driver_dir(_REPO_ROOT, "rizon4") is None:
+            self.skipTest("rizon4 driver not visible in this checkout/sandbox")
         with tempfile.TemporaryDirectory() as tmp:
             export = cli.plan_export("rizon4", Path(tmp), _REPO_ROOT)
         self.assertIn("rizon_common", export.shared_modules)
 
     def test_drivers_mod_declares_shared_modules(self) -> None:
+        if cli._resolve_arm_driver_dir(_REPO_ROOT, "rizon4") is None:
+            self.skipTest("rizon4 driver not visible in this checkout/sandbox")
         with tempfile.TemporaryDirectory() as tmp:
             export = cli.plan_export("rizon4", Path(tmp), _REPO_ROOT)
         mod = next(c for d, c in export.generated if d.name == "mod.rs")
@@ -164,7 +183,7 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "out"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(True, "ur5", "ok")
+                cli, "generate_ik", return_value=(True, "ur5", "ok")
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", return_value=(True, "ok")
             ) as dyn:
@@ -182,7 +201,7 @@ class CliMainTests(unittest.TestCase):
             inside = Path(tmp) / "build_out"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
+                cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ), mock.patch.object(cli, "verify_crate", return_value=(True, "ok")):
@@ -200,7 +219,7 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "ur5"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
+                cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ):
@@ -220,7 +239,7 @@ class CliMainTests(unittest.TestCase):
             out = Path(tmp) / "ur5"
             urdf = self._urdf(tmp)
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
+                cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ):
@@ -247,7 +266,7 @@ class UrdfBuildTests(unittest.TestCase):
             urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
             out = Path(tmp) / "driver"
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
+                cli, "generate_ik", side_effect=_mock_generate_driver
             ) as gen, mock.patch.object(
                 cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
             ) as dyn:
@@ -269,7 +288,7 @@ class UrdfBuildTests(unittest.TestCase):
             urdf.write_text("<robot name='ur5'></robot>", encoding="utf-8")
             out = Path(tmp) / "driver"
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", side_effect=_mock_generate_driver
+                cli, "generate_ik", side_effect=_mock_generate_driver
             ), mock.patch.object(
                 cli, "generate_dynamics_for_arm", return_value=(False, "kaboom")
             ):
@@ -308,7 +327,7 @@ class UrdfBuildTests(unittest.TestCase):
             urdf = Path(tmp) / "ur5.urdf"
             urdf.write_text("<robot/>", encoding="utf-8")
             with mock.patch.object(
-                cli, "generate_driver_from_urdf", return_value=(False, "ur5", "boom")
+                cli, "generate_ik", return_value=(False, "ur5", "boom")
             ):
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     code = cli.main(
@@ -316,6 +335,41 @@ class UrdfBuildTests(unittest.TestCase):
                          "-o", str(Path(tmp) / "o")]
                     )
             self.assertEqual(code, 1)
+
+    def test_from_existing_skips_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Use the real in-repo ur5.urdf stem so plan_export can resolve the driver.
+            urdf = _REPO_ROOT / "repos" / "dexforge-ur" / "rust" / "src" / "drivers" / "ur5" / "ur5.urdf"
+            if not urdf.is_file():
+                self.skipTest("ur5.urdf not available")
+            out = Path(tmp) / "seeded"
+            with mock.patch.object(cli, "generate_ik") as gen, mock.patch.object(
+                cli, "generate_dynamics_for_arm", return_value=(True, "ok")
+            ) as dyn, mock.patch.object(
+                cli, "verify_crate", return_value=(True, "ok")
+            ):
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        [
+                            "build",
+                            "--urdf",
+                            str(urdf),
+                            "--base",
+                            "base_link",
+                            "--ee",
+                            "ee_link",
+                            "-o",
+                            str(out),
+                            "--from-existing",
+                            "--no-verify",
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            gen.assert_not_called()
+            dyn.assert_called_once()
+            self.assertTrue((out / "Cargo.toml").is_file())
+            self.assertTrue((out / "src" / "drivers" / "ur5" / "ik_solver.rs").is_file())
+            self.assertIn("[workspace]", (out / "Cargo.toml").read_text())
 
 
 if __name__ == "__main__":

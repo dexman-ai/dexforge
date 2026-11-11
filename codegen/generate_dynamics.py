@@ -287,6 +287,8 @@ class UrdfJoint:
     parent: str
     child: str
     axis: Tuple[float, float, float]
+    origin_xyz: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    origin_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     child_inertial: Optional[Inertial] = field(default=None)
 
     @property
@@ -348,6 +350,9 @@ def parse_urdf_joints(path: Path) -> List[UrdfJoint]:
             raise ValueError(f"joint {j.get('name')!r} missing parent/child")
         axis_el = j.find("axis")
         axis = _parse_triple(axis_el.get("xyz") if axis_el is not None else None, (0.0, 0.0, 1.0))
+        origin = j.find("origin")
+        origin_xyz = _parse_triple(origin.get("xyz") if origin is not None else None, (0.0, 0.0, 0.0))
+        origin_rpy = _parse_triple(origin.get("rpy") if origin is not None else None, (0.0, 0.0, 0.0))
         child_link = child.get("link")
         joints.append(
             UrdfJoint(
@@ -356,6 +361,8 @@ def parse_urdf_joints(path: Path) -> List[UrdfJoint]:
                 parent=parent.get("link"),
                 child=child_link,
                 axis=axis,
+                origin_xyz=origin_xyz,
+                origin_rpy=origin_rpy,
                 child_inertial=inertials.get(child_link),
             )
         )
@@ -474,22 +481,37 @@ class RigidBody:
     n_preceding: int          # number of actuated joints that move this body
 
 
+def _urdf_origin_transform(jt: UrdfJoint) -> sp.Matrix:
+    """Homogeneous joint ``<origin>``: ``T = Trans(xyz) · RPY(rpy)``."""
+    t = sp.eye(4)
+    t[:3, :3] = _snap_matrix(_rpy_to_rot(*jt.origin_rpy))
+    t[0, 3] = _snap(jt.origin_xyz[0])
+    t[1, 3] = _snap(jt.origin_xyz[1])
+    t[2, 3] = _snap(jt.origin_xyz[2])
+    return t
+
+
 def build_bodies(
     axes: List[sp.Matrix],
     frames: List[sp.Matrix],
     t_rights: List[sp.Matrix],
     q_syms: List[sp.Symbol],
     urdf_chain: List[UrdfJoint],
-) -> List[RigidBody]:
-    """Pair the artifact's per-joint link frames with the URDF inertial blocks.
+) -> Tuple[List[RigidBody], List[sp.Matrix], List[sp.Matrix]]:
+    """Place URDF inertials with **URDF** joint kinematics (not ssik frames).
 
-    The artifact joint ``i`` and URDF actuated joint ``i`` describe the same
-    revolute axis.  The child link of URDF joint ``i`` is rigidly attached to
-    that joint, so its body frame is ``frames[i] . Rot(axis_i, q_i)`` (the joint
-    frame after the joint rotates).  The URDF inertial ``<origin>`` (centre of
-    mass) is expressed in that child-link frame, hence ``T_right[i]`` — which
-    only translates on towards the *next* joint — is intentionally not applied.
+    The ssik artifact and a raw URDF can disagree on intermediate link-frame
+    axes even when end-effector FK matches up to a fixed base offset. Pinocchio
+    loads the URDF directly, so COM poses and joint axes used for the energy
+    method must follow the URDF product ``T = ∏ Origin_i · Rot(axis_i, q_i)``.
+
+    :returns: ``(bodies, urdf_axes, urdf_frames)`` where ``urdf_frames[i]`` is
+        the base→joint-i frame *after* ``Origin_i`` and *before* the joint
+        rotation, and ``urdf_axes[i]`` is the joint axis in that local frame.
+        The ssik ``axes`` / ``frames`` / ``t_rights`` arguments are only used
+        to validate DOF count.
     """
+    del frames, t_rights
     actuated = [jt for jt in urdf_chain if jt.actuated]
     if len(actuated) != len(axes):
         raise ValueError(
@@ -500,36 +522,55 @@ def build_bodies(
         )
 
     bodies: List[RigidBody] = []
-    for i, (axis, frame, q, jt) in enumerate(zip(axes, frames, q_syms, actuated)):
-        inertial = jt.child_inertial
-        if inertial is None or inertial.mass <= 0.0:
+    urdf_axes: List[sp.Matrix] = []
+    urdf_frames: List[sp.Matrix] = []
+    t_cum = sp.eye(4)
+    qi = 0
+    for jt in urdf_chain:
+        t_cum = t_cum * _urdf_origin_transform(jt)
+        if not jt.actuated:
             continue
-        link_t = frame * _axis_angle_rot(axis, q)
-        r_link = link_t[:3, :3]
-        p_link = link_t[:3, 3]
-        com_local = sp.Matrix([_snap(v) for v in inertial.com_xyz])
-        r_com = _snap_matrix(_rpy_to_rot(*inertial.com_rpy))
-        p_com = p_link + r_link * com_local
-        r_inertia = r_link * r_com
-        inertia_local = _snap_matrix(
-            sp.Matrix(
-                [
-                    [inertial.ixx, inertial.ixy, inertial.ixz],
-                    [inertial.ixy, inertial.iyy, inertial.iyz],
-                    [inertial.ixz, inertial.iyz, inertial.izz],
-                ]
+        if qi >= len(q_syms):
+            raise ValueError("URDF actuated joints exceed artifact DOF while walking the chain")
+        q = q_syms[qi]
+        axis_local = sp.Matrix([_snap(v) for v in jt.axis])
+        urdf_frames.append(t_cum)
+        urdf_axes.append(axis_local)
+        t_cum = t_cum * _axis_angle_rot(axis_local, q)
+
+        inertial = jt.child_inertial
+        if inertial is not None and inertial.mass > 0.0:
+            r_link = t_cum[:3, :3]
+            p_link = t_cum[:3, 3]
+            com_local = sp.Matrix([_snap(v) for v in inertial.com_xyz])
+            r_com = _snap_matrix(_rpy_to_rot(*inertial.com_rpy))
+            p_com = p_link + r_link * com_local
+            r_inertia = r_link * r_com
+            inertia_local = _snap_matrix(
+                sp.Matrix(
+                    [
+                        [inertial.ixx, inertial.ixy, inertial.ixz],
+                        [inertial.ixy, inertial.iyy, inertial.iyz],
+                        [inertial.ixz, inertial.iyz, inertial.izz],
+                    ]
+                )
             )
-        )
-        bodies.append(
-            RigidBody(
-                mass=_snap(inertial.mass),
-                p_com=p_com,
-                r_inertia=r_inertia,
-                inertia_local=inertia_local,
-                n_preceding=i + 1,
+            bodies.append(
+                RigidBody(
+                    mass=_snap(inertial.mass),
+                    p_com=p_com,
+                    r_inertia=r_inertia,
+                    inertia_local=inertia_local,
+                    n_preceding=qi + 1,
+                )
             )
+        qi += 1
+
+    if qi != len(q_syms):
+        raise ValueError(
+            f"walked {qi} actuated URDF joints but artifact has DOF={len(q_syms)}"
         )
-    return bodies
+    return bodies, urdf_axes, urdf_frames
 
 
 def build_gravity(
@@ -623,7 +664,9 @@ def build_dynamics(
 ) -> Dynamics:
     """Derive gravity / mass-matrix / Coriolis / inverse-dynamics symbolically."""
     urdf_chain = order_urdf_chain(parse_urdf_joints(urdf_path), base_link, ee_link)
-    bodies = build_bodies(axes, frames, t_rights, q_syms, urdf_chain)
+    bodies, urdf_axes, urdf_frames = build_bodies(
+        axes, frames, t_rights, q_syms, urdf_chain
+    )
     if not bodies:
         raise ValueError(
             f"URDF {urdf_path} has no positive-mass <inertial> blocks on the chain; "
@@ -637,7 +680,7 @@ def build_dynamics(
     gravity_syms = [sp.Symbol(f"g{i}") for i in range(3)]
 
     grav = build_gravity(bodies, q_syms, gravity_syms)
-    mass = build_mass_matrix(bodies, q_syms, axes, frames)
+    mass = build_mass_matrix(bodies, q_syms, urdf_axes, urdf_frames)
     cor = build_coriolis(mass, q_syms, qd_syms)
     qdd_vec = sp.Matrix(qdd_syms)
     inv_dyn = mass * qdd_vec + cor + grav
@@ -665,6 +708,9 @@ class NoStdRustPrinter(RustCodePrinter):
     ``core`` exposes neither ``f64::sin``/``cos``/``sqrt`` nor ``powi``/``powf``,
     so every transcendental becomes a free ``libm::*`` call and integer powers
     expand into plain multiplications.
+
+    Every ``Add`` / ``Mul`` is parenthesized so chains like ``a*b*-c+d`` keep
+    SymPy's association under Rust unary-minus / product precedence.
     """
 
     _LIBM = {
@@ -685,9 +731,6 @@ class NoStdRustPrinter(RustCodePrinter):
     }
 
     def _print_Function(self, expr):  # noqa: N802 (SymPy API)
-        # Map transcendentals SymPy would otherwise emit as `std`-only method
-        # calls (e.g. `x.sin()`) to free `libm::*` functions so the output
-        # compiles under `#![no_std]`.
         name = expr.func.__name__
         if name in self._LIBM:
             args = ", ".join(self._print(a) for a in expr.args)
@@ -698,12 +741,16 @@ class NoStdRustPrinter(RustCodePrinter):
         return f"libm::fabs({self._print(expr.args[0])})"
 
     def _print_Integer(self, expr):  # noqa: N802
-        # `core` arrays are `[f64; _]`; bare integer literals do not coerce to
-        # f64 in Rust, so every integer must carry a decimal point.
         return f"{int(expr)}.0"
 
     def _print_Rational(self, expr):  # noqa: N802
         return f"({int(expr.p)}.0 / {int(expr.q)}.0)"
+
+    def _print_Mul(self, expr):  # noqa: N802
+        return "(" + " * ".join(self._print(arg) for arg in expr.args) + ")"
+
+    def _print_Add(self, expr):  # noqa: N802
+        return "(" + " + ".join(self._print(a) for a in expr.args) + ")"
 
     def _print_Pow(self, expr):  # noqa: N802
         base = self._print(expr.base)
@@ -716,10 +763,6 @@ class NoStdRustPrinter(RustCodePrinter):
             n = int(exp)
             if n == 0:
                 return "1.0"
-            # Unroll small integer powers into repeated multiplication (cheaper
-            # and `core`-safe, unlike `powi`). 8 is an arbitrary cap that keeps
-            # the emitted expression compact; larger exponents fall back to
-            # `libm::pow`. FK/Jacobian exponents are almost always 1 or 2.
             if 1 <= n <= 8:
                 return "(" + " * ".join([base] * n) + ")"
             if -8 <= n <= -1:
@@ -933,19 +976,33 @@ def _emit_dynamics(
         printer,
     )
 
+    # Compose inverse dynamics from the three kernels above. Fully expanding
+    # `M qdd + C qd + g` through SymPy CSE for 6+ DOF is prohibitively slow and
+    # has historically produced printer-precedence bugs; composition is exact.
     out.append("/// Inverse dynamics torque `tau = M(q) qdd + C(q, qd) qd + g(q)`.")
     out.append("///")
     out.append("/// MIT-mode feed-forward torque for a desired joint acceleration.")
-    _emit_fn_vector(
-        out,
-        f"pub fn inverse_dynamics(q: &[f64; {n}], qd: &[f64; {n}], qdd: &[f64; {n}], gravity: &[f64; 3]) "
-        f"-> [f64; {n}] {{",
-        "tau",
-        n,
-        dyn.inverse_dynamics,
-        q_unpack + qd_unpack + qdd_unpack + gravity_unpack,
-        printer,
+    out.append("///")
+    out.append("/// `g_world` is the base-frame gravitational acceleration (e.g.")
+    out.append("/// `[0.0, 0.0, -9.81]`). Named so it does not shadow [`gravity`].")
+    out.append(
+        f"pub fn inverse_dynamics(q: &[f64; {n}], qd: &[f64; {n}], qdd: &[f64; {n}], g_world: &[f64; 3]) "
+        f"-> [f64; {n}] {{"
     )
+    out.append("    let m = mass_matrix(q);")
+    out.append("    let c = coriolis(q, qd);")
+    out.append("    let g = gravity(q, g_world);")
+    out.append(f"    let mut tau = [0.0f64; {n}];")
+    out.append(f"    for i in 0..{n} {{")
+    out.append("        let mut mqdd = 0.0;")
+    out.append(f"        for j in 0..{n} {{")
+    out.append("            mqdd += m[i][j] * qdd[j];")
+    out.append("        }")
+    out.append("        tau[i] = mqdd + c[i] + g[i];")
+    out.append("    }")
+    out.append("    tau")
+    out.append("}")
+    out.append("")
 
 
 # ---------------------------------------------------------------------------
@@ -1003,3 +1060,44 @@ def generate(ssik_artifact, urdf, arm, output):
         output.write_text(rust)
         print(f"[generate_dynamics] wrote {output}", file=sys.stderr)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument(
+        "--artifact",
+        required=True,
+        help="ssik artifact name (e.g. 'ur5_ik') or path to a *_ik.py file.",
+    )
+    parser.add_argument(
+        "--arm",
+        default=None,
+        help="Human-readable arm name for the doc comment (default: artifact stem).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Destination .rs file (default: write to stdout).",
+    )
+    parser.add_argument(
+        "--urdf",
+        type=Path,
+        default=None,
+        help=(
+            "Optional URDF carrying <inertial> blocks (link masses/inertias). When "
+            "given, also emit gravity/mass_matrix/coriolis/inverse_dynamics. The "
+            "URDF's actuated-joint order must match the kinematics artifact."
+        ),
+    )
+    args = parser.parse_args(argv)
+    return generate(args.artifact, args.urdf, args.arm, args.output)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

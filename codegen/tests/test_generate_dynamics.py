@@ -28,7 +28,7 @@ import sympy as sp  # noqa: E402  (after importorskip)
 
 _CODEGEN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_CODEGEN))
-import dexforge_build as G  # noqa: E402
+import generate_dynamics as G  # noqa: E402
 
 # Planar RR geometry shared between the generator fixtures and the reference.
 L1, LC1, M1, IZ1 = 0.5, 0.25, 2.0, 0.03

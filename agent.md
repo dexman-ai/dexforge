@@ -2,6 +2,21 @@
 
 This document captures core tenets for contributors working on dexforge, a zero-allocation, `#![no_std]` analytical inverse kinematics solver library.
 
+## Agent Scope
+
+Unless the user explicitly asks otherwise, **work only in these paths**:
+
+- `repos/dexhal/`
+- `repos/dexforge-ur/`
+- `ssik_shared_tests/`
+- `codegen/` (when regenerating dynamics / test data)
+
+**Ignore** the other OEM trees (`repos/dexforge-agilex/`, `repos/dexforge-flexiv/`,
+`repos/dexforge-franka/`, `repos/dexforge-ufactory/`). They deliberately share the
+same filenames (`ik_solver.rs`, `arm.rs`, `generated_kinematics.rs`,
+`test_shared_suite.py`, …), which confuses search and edits. `.cursorignore`
+excludes those folders for the same reason.
+
 ## Core Invariants
 
 Every contribution must preserve:
