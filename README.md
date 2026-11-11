@@ -394,6 +394,9 @@ URDF/Pinocchio actuated order printed at generation time; gravity is the same
 base-frame vector on both sides (default `[0, 0, -9.81]`). See the module docs
 in `dynamics_test_data.rs` and the script docstring.
 
+Full UR5 wiring + regenerate recipe (template for the next arm):
+[`codegen/ur5_dynamics_template.md`](codegen/ur5_dynamics_template.md).
+
 ### ssik Version Locking
 
 dexforge uses a **locked version** of the `ssik` library (`personalrobotics/ssik`)
