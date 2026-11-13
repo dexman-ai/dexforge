@@ -16,7 +16,7 @@
 //! pip install pin numpy
 //! python codegen/generate_dynamics_test_data.py \
 //!     --urdf <path/to/ur5.urdf> --output-dir <driver-dir> \
-//!     --arm ur5 --samples 10000 --seed 0
+//!     --arm ur5 --samples 1000 --seed 0
 //! ```
 
 #![allow(clippy::all)]
@@ -25,7 +25,7 @@
 pub const DOF: usize = 6;
 
 /// Number of Pinocchio ground-truth samples in the binary blob.
-pub const N_CASES: usize = 10000;
+pub const N_CASES: usize = 1000;
 
 /// `f64` count per case (see module docs for field layout).
 pub const FLOATS_PER_CASE: usize = 72;

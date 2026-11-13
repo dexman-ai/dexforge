@@ -567,10 +567,11 @@ mod tests {
 
     #[test]
     fn matches_ssik_reference_dataset() {
+        assert!(!test_data::ssik_version().is_empty());
         let tol = 1e-5;
         let mut total_expected = 0usize;
         let mut case_idx = 0usize;
-        for (tf_arr, expected) in test_data::CASES {
+        for (tf_arr, expected) in &test_data::cases() {
             let tf = tf_from_row_major(tf_arr);
             let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
             let got: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();

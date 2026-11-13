@@ -39,11 +39,17 @@ Run from the repository root:
 from __future__ import annotations
 
 import importlib
-import os
-import subprocess
+from pathlib import Path
 import sys
 
 import numpy as np
+
+_DRIVERS_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = _DRIVERS_ROOT.parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from codegen.ik_test_data import IKCase, write_ik_test_data  # noqa: E402
 
 N_POSES = 500
 SEED = 7
@@ -51,7 +57,6 @@ SEED = 7
 # solution (count + value) of the unrefined `allow_refinement=False` output to
 # within this tolerance.
 REPRO_TOL = 1e-6
-REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 
 ARMS = ("rizon4", "rizon10")
 
@@ -94,7 +99,7 @@ def _reproduces(ref, mine, tol=REPRO_TOL):
 
 def _generate(arm) -> None:
     mod = importlib.import_module(f"ssik.prebuilt.{arm}_ik")
-    dest = os.path.join(REPO_ROOT, "src", "drivers", arm, "test_data.rs")
+    driver_dir = _DRIVERS_ROOT / arm
 
     rng = np.random.default_rng(SEED)
     lims = mod._JOINT_LIMITS
@@ -105,72 +110,53 @@ def _generate(arm) -> None:
         ref_false = [s.q for s in mod.solve(t, respect_limits=False)]
         if len(ref_false) <= 1:
             continue
-        candidates.append((t, ref_false))
+        candidates.append((q, t, ref_false))
 
-    poses = [t for t, _ in candidates]
+    poses = [t for _, t, _ in candidates]
     rust = _rust_solutions(arm, poses)
 
     cases = []
     singular = 0
-    for (t, ref_false), mine in zip(candidates, rust):
+    for (q, t, ref_false), mine in zip(candidates, rust):
         if _reproduces(ref_false, mine):
-            cases.append((t, ref_false, False))
+            sols = [list(map(float, s)) for s in ref_false]
+            cases.append(
+                IKCase(
+                    q_fk=q.tolist(),
+                    tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
+                    solutions=sols,
+                    singular=False,
+                )
+            )
         else:
             ref_true = [
                 s.q for s in mod.solve(t, respect_limits=False, allow_refinement=True)
             ]
-            cases.append((t, ref_true, True))
+            sols = [list(map(float, s)) for s in ref_true]
+            cases.append(
+                IKCase(
+                    q_fk=q.tolist(),
+                    tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
+                    solutions=sols,
+                    singular=True,
+                )
+            )
             singular += 1
 
-    _write_rust(arm, dest, cases)
+    bin_path, rs_path = write_ik_test_data(
+        driver_dir=driver_dir,
+        arm=arm,
+        dof=7,
+        cases=cases,
+        has_singular_tuple=True,
+        allow_refinement=False,
+        refinement_max_iters=15,
+    )
     print(
         f"[{arm}] kept {len(cases)}/{len(candidates)} multi-solution poses "
-        f"(of {N_POSES} sampled) to {dest}; "
+        f"(of {N_POSES} sampled) to {bin_path} and {rs_path}; "
         f"{len(cases) - singular} strict, {singular} singular"
     )
-
-
-def _fmt(x: float) -> str:
-    return repr(float(x))
-
-
-def _write_rust(arm, dest, cases) -> None:
-    pretty = "Rizon 4" if arm == "rizon4" else "Rizon 10"
-    lines = [
-        f"//! Auto-generated {pretty} IK regression data. Regenerate with",
-        "//! `python codegen/generate_test_data.py`.",
-        "//!",
-        "//! Each entry is `(row-major 4x4 pose, &[expected joint solutions],",
-        "//! singular)`, captured by running the reference solver and retaining",
-        "//! every multi-solution pose:",
-        "//!",
-        "//! * `singular == false` — the Rust pipeline reproduces the unrefined",
-        f"//!   `ssik.prebuilt.{arm}_ik.solve(T, respect_limits=False)` output",
-        "//!   exactly (count + value); the test asserts an exact joint-space",
-        "//!   match.",
-        "//! * `singular == true` — the deterministic Raghavan-Roth kernel and",
-        "//!   the reference husty_pfurner path resolve near-singular lock",
-        "//!   samples differently (the kernel surfaces extra genuine roots and",
-        "//!   may miss others). The stored solutions are the *complete*",
-        "//!   `allow_refinement=True` reference set, kept for inspection; the",
-        "//!   driver test asserts only FK-closure soundness for these poses",
-        "//!   (completeness is asserted strictly only for `singular == false`).",
-        "//!   See `ik_solver`'s test module.",
-        "",
-        "/// `(pose, solutions, singular)` regression cases.",
-        "pub static CASES: &[(&[f64; 16], &[[f64; 7]], bool)] = &[",
-    ]
-    for t, sols, singular in cases:
-        pose = ", ".join(_fmt(v) for v in np.asarray(t, dtype=np.float64).reshape(-1))
-        lines.append(f"    (&[{pose}], &[")
-        for q in sols:
-            joints = ", ".join(_fmt(v) for v in np.asarray(q, dtype=np.float64))
-            lines.append(f"        [{joints}],")
-        lines.append(f"    ], {'true' if singular else 'false'}),")
-    lines.append("];")
-    lines.append("")
-    with open(dest, "w") as f:
-        f.write("\n".join(lines))
 
 
 def main(argv) -> None:

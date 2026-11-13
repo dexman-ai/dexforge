@@ -125,6 +125,10 @@ class PlanExportTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             cli.plan_export("nope", Path("/tmp"), _REPO_ROOT)
 
+    def test_driver_dir_unknown_arm_raises(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            cli._driver_dir(_REPO_ROOT, "nope")
+
     def test_missing_driver_error_points_at_urdf(self) -> None:
         with self.assertRaises(FileNotFoundError) as ctx:
             cli.plan_export("nope", Path("/tmp"), _REPO_ROOT)

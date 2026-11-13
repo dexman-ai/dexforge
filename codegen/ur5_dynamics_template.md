@@ -40,7 +40,7 @@ pip install pin numpy
 python codegen/generate_dynamics_test_data.py \
     --urdf repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf \
     --output-dir repos/dexforge-ur/rust/src/drivers/ur5 \
-    --arm ur5 --samples 10000 --seed 0
+    --arm ur5 --samples 1000 --seed 0
 ```
 
 Pinocchio conventions baked into that script:

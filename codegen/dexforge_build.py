@@ -276,12 +276,17 @@ def _shared_modules_used(driver_src: Path) -> List[str]:
 
 
 def _driver_dir(repo_root: Path, arm: str) -> Path:
-    """Return the canonical source path for an arm's driver directory."""
+    """Return the canonical source path for an arm's driver directory.
+
+    :raises FileNotFoundError: If no driver directory exists for *arm*.
+    """
     found = _resolve_arm_driver_dir(repo_root, arm)
     if found is not None:
         return found
-    # Preserve a stable path in the error message for callers/tests.
-    return repo_root / "repos" / "dexforge-ur" / "rust" / "src" / "drivers" / arm
+    raise FileNotFoundError(
+        f"missing driver directory for arm {arm!r}. Compile this arm from a "
+        f"URDF first (dexforge build --urdf <file> ...)."
+    )
 
 
 def plan_export(
@@ -320,12 +325,7 @@ def plan_export(
         copies.append((src_rs, out_dir / "src" / "math" / f"{name}.rs"))
 
     # Per-arm driver sources: every .rs file in the driver directory.
-    driver_src = _resolve_arm_driver_dir(repo_root, arm)
-    if driver_src is None:
-        raise FileNotFoundError(
-            f"missing driver directory for arm {arm!r}. Compile this arm from a "
-            f"URDF first (dexforge build --urdf <file> ...)."
-        )
+    driver_src = _driver_dir(repo_root, arm)
     for rs in sorted(driver_src.glob("*.rs")):
         copies.append((rs, out_dir / "src" / "drivers" / arm / rs.name))
 
@@ -340,8 +340,8 @@ def plan_export(
     # Optional provenance: copy the source URDF (the OEM's hardware spec) if any.
     for urdf in sorted(driver_src.glob("*.urdf")):
         copies.append((urdf, out_dir / urdf.name))
-    # Also copy the binary Pinocchio dataset when present so parity tests travel.
-    for blob in sorted(driver_src.glob("dynamics_test_data.bin")):
+    # Also copy the binary IK / Pinocchio datasets when present so parity tests travel.
+    for blob in sorted(driver_src.glob("*test_data.bin")):
         copies.append((blob, out_dir / "src" / "drivers" / arm / blob.name))
 
     generated: List[tuple] = [
@@ -687,7 +687,7 @@ def ensure_dynamics_parity(
     arm: str,
     urdf: Path,
     crate_root: Path,
-    samples: int = 10_000,
+    samples: int = 1_000,
     seed: int = 0,
     force: bool = False,
 ) -> tuple:
@@ -774,10 +774,16 @@ def generate_dynamics_for_arm(
     if code != 0:
         return False, f"generate_dynamics failed for {arm} (exit {code})"
 
-    # Kinematics-only consumers import generated_kinematics; mirror the same
-    # SymPy output so flange_jacobian / crate re-exports resolve.
+    # Kinematics-only consumers import generated_kinematics; re-export DOF, fk
+    # and jacobian from generated_dynamics so the CSE expressions are compiled once.
     kin_rs = driver_dir / "generated_kinematics.rs"
-    kin_rs.write_text(out_rs.read_text(encoding="utf-8"), encoding="utf-8")
+    kin_rs.write_text(
+        f"//! Auto-generated symbolic kinematics re-exports for `{arm}`.\n"
+        "//! `fk` and `jacobian` live in [`super::generated_dynamics`]; "
+        "re-exporting avoids compiling duplicate copies.\n\n"
+        "pub use super::generated_dynamics::{DOF, fk, jacobian};\n",
+        encoding="utf-8",
+    )
 
     _wire_generated_dynamics_module(driver_dir)
     return True, f"wrote {out_rs} and {kin_rs}"

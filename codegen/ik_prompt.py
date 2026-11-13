@@ -285,24 +285,12 @@ def generate_context(
 
     print("[ik_generator] Step 1: Detecting kinematic family …")
     best_guess_example_arm, max_solutions, dof = find_best_example(ssik_artifact)
-    # Keep *example_arm* as a bare arm name (string); resolve the path only when
-    # loading example sources. Assigning a Path here used to break later lookups.
     if example_arm is None:
         example_arm = best_guess_example_arm
     if _resolve_repo_driver_dir(repo_root, example_arm) is None:
-        fallback = "ur5"
-        if _resolve_repo_driver_dir(repo_root, fallback) is not None:
-            print(
-                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
-                f"falling back to '{fallback}' as structural template."
-            )
-            example_arm = fallback
-        else:
-            print(
-                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
-                f"or fallback '{fallback}'. The one-shot example will be empty.",
-                file=sys.stderr,
-            )
+        raise FileNotFoundError(
+            f"missing example driver directory for arm {example_arm!r}"
+        )
     print(
         f"[ik_generator]   → example arm: '{example_arm}', "
         f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"

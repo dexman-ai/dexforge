@@ -155,11 +155,11 @@ def _emit_consts(arm: str) -> None:
     o.append("];")
     o.append("")
 
-    dest = os.path.join(cg.REPO_ROOT, "src", "drivers", arm, "consts.rs")
+    dest = os.path.join(cg.DRIVERS_ROOT, arm, "consts.rs")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "w") as fh:
         fh.write("\n".join(o))
-    print("wrote", os.path.relpath(dest, cg.REPO_ROOT))
+    print("wrote", dest)
 
 
 def _emit_pq(arm: str) -> None:
@@ -192,11 +192,11 @@ def _emit_pq(arm: str) -> None:
     o.append("];")
     o.append("")
 
-    dest = os.path.join(cg.REPO_ROOT, "src", "drivers", arm, "pq.rs")
+    dest = os.path.join(cg.DRIVERS_ROOT, arm, "pq.rs")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "w") as fh:
         fh.write("\n".join(o))
-    print("wrote", os.path.relpath(dest, cg.REPO_ROOT))
+    print("wrote", dest)
 
 
 def main() -> None:

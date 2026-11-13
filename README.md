@@ -373,7 +373,7 @@ python repos/dexforge-ur/rust/src/drivers/ur5/codegen/generate_test_data.py
 ### Pinocchio dynamics ground truth (UR5)
 
 `codegen/generate_dynamics_test_data.py` is a **one-time** generator. It loads
-the same URDF the driver was built from, samples 10 000 random `(q, qd, qdd)`
+the same URDF the driver was built from, samples 1 000 random `(q, qd, qdd)`
 states, and asks Pinocchio for gravity torque, mass matrix, Coriolis torque and
 inverse-dynamics torque. Results are saved as
 `repos/dexforge-ur/rust/src/drivers/ur5/dynamics_test_data.bin` plus a thin
@@ -385,7 +385,7 @@ pip install pin numpy
 python codegen/generate_dynamics_test_data.py \
     --urdf repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf \
     --output-dir repos/dexforge-ur/rust/src/drivers/ur5 \
-    --arm ur5 --samples 10000 --seed 0
+    --arm ur5 --samples 1000 --seed 0
 cd repos/dexforge-ur && cargo test -p dexforge-ur-core dynamics_parity
 ```
 

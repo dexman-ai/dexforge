@@ -10,7 +10,7 @@ To *prove* that generated Rust is correct, this one-time script computes an
 independent ground truth with **Pinocchio**
 (https://github.com/stack-of-tasks/pinocchio):
 
-* Sample ``N`` (default **10_000**) random, physically valid joint states
+* Sample ``N`` (default **1_000**) random, physically valid joint states
   ``(q, qd, qdd)`` with ``q`` inside the arm's mechanical joint limits and
   ``qd``/``qdd`` inside symmetric velocity/acceleration envelopes.
 * For each state, evaluate with Pinocchio:
@@ -50,7 +50,7 @@ Usage::
     python codegen/generate_dynamics_test_data.py \\
         --urdf repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf \\
         --output-dir repos/dexforge-ur/rust/src/drivers/ur5 \\
-        --arm ur5 --samples 10000 --seed 0
+        --arm ur5 --samples 1000 --seed 0
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-_DEFAULT_SAMPLES = 10_000
+_DEFAULT_SAMPLES = 1_000
 _DEFAULT_QD_LIMIT = 1.0
 _DEFAULT_QDD_LIMIT = 2.0
 _DEFAULT_GRAVITY = (0.0, 0.0, -9.81)

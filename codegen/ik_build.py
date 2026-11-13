@@ -250,31 +250,6 @@ def write_generated_files(
     return written
 
 
-def _normalize_helper_script_paths(script_path: Path) -> None:
-    """Rewrite legacy dest paths so helpers work under ``src/drivers/<arm>/codegen/``.
-
-    Older prompts told the LLM to write::
-
-        join(__file__, "..", "src", "drivers", "<arm>", "test_data.rs")
-
-    which is correct only when the script lives at repo-root ``codegen/``.
-    Stand-alone crates place helpers next to the driver, so the dest must be
-    ``join(__file__, "..", "test_data.rs")``.
-    """
-    text = script_path.read_text(encoding="utf-8")
-    rewritten = re.sub(
-        r'os\.path\.join\(\s*os\.path\.dirname\(__file__\)\s*,\s*"\.\."\s*,\s*"src"\s*,\s*"drivers"\s*,\s*"[^"]+"\s*,\s*("[^"]+\.rs")\s*\)',
-        r'os.path.join(os.path.dirname(__file__), "..", \1)',
-        text,
-    )
-    if rewritten != text:
-        script_path.write_text(rewritten, encoding="utf-8")
-        print(
-            f"[ik_generator]   Normalized output paths in {script_path.name} "
-            "for stand-alone driver layout."
-        )
-
-
 def run_py_scripts(
     generator_scripts: dict[str, Path], output_dir: Path
 ) -> Optional[Tuple[str, str]]:
@@ -293,7 +268,6 @@ def run_py_scripts(
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
 
-        _normalize_helper_script_paths(path)
         # Ensure the driver directory exists for scripts that write ``../foo.rs``.
         (path.parent.parent).mkdir(parents=True, exist_ok=True)
 

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
 from ssik.prebuilt._manifest import load_manifest
+from codegen.ik_test_data import get_locked_ssik_version, load_arm_test_data
 
 _MANIFEST = load_manifest()
 
@@ -29,6 +30,7 @@ _NATIVE_PACKAGE_BY_ARM = {
     "xarm7_ik": "dexforge_ufactory",
     "rizon4_ik": "dexforge_flexiv",
     "rizon10_ik": "dexforge_flexiv",
+    "z1_ik": "dexforge_unitree",
 }
 
 TWO_PI = 2.0 * math.pi
@@ -37,7 +39,7 @@ DEDUP_TOL = 1e-3
 FK_MATCH_TOL = 1e-5
 
 # Arms where deterministic branch policy should be exact against reference.
-EXACT_BASE_ARMS = {"ur5", "franka_panda"}
+EXACT_BASE_ARMS = {"ur5", "franka_panda", "z1"}
 
 # 7R jointlock implementations that may return FK-valid supersets near singularities.
 SOUNDNESS_ONLY_ARMS = {"rizon4", "rizon10"}
@@ -118,26 +120,43 @@ def _first_arm_by_dof(dof: int) -> str | None:
     return None
 
 
+def test_reference_data_ssik_version(request: pytest.FixtureRequest) -> None:
+    locked_version = get_locked_ssik_version()
+    for arm_name in _iter_manifest_arm_names(request):
+        base = _base_name(arm_name)
+        dataset = load_arm_test_data(base)
+        assert dataset.ssik_version == locked_version, (
+            f"{arm_name}: reference dataset ssik_version={dataset.ssik_version!r} "
+            f"does not match SSIK_VERSION.txt ({locked_version!r})"
+        )
+
+
 def test_cross_validate_solve(request: pytest.FixtureRequest) -> None:
     n = int(request.config.getoption("--n"))
+    locked_version = get_locked_ssik_version()
 
     for arm_name in _iter_manifest_arm_names(request):
         base = _base_name(arm_name)
         exact_arm = base in EXACT_BASE_ARMS
 
-        ssik_artifact = _load_ssik_artifact(arm_name)
+        dataset = load_arm_test_data(base)
+        assert dataset.ssik_version == locked_version
         native = _load_native_module(arm_name)
         native_solve = native.solve
         native_fk = native.fk
-        poses = _random_poses(ssik_artifact, n)
+        cases = dataset.cases[:n] if n > 0 else dataset.cases
 
         mismatches = 0
-        for T in poses:
-            T_target = np.array(T, dtype=np.float64)
-            py_sols = ssik_artifact.solve(T, respect_limits=False, allow_refinement=False)
-            py_qs = [list(map(float, s.q)) for s in py_sols]
+        for case in cases:
+            T_target = np.asarray(case.tf, dtype=np.float64).reshape(4, 4)
+            py_qs = case.solutions
 
-            rust_qs = native_solve(T, respect_limits=False, allow_refinement=False)
+            rust_qs = native_solve(
+                T_target,
+                respect_limits=False,
+                allow_refinement=dataset.allow_refinement,
+                refinement_max_iters=dataset.refinement_max_iters,
+            )
 
             if exact_arm:
                 if len(py_qs) != len(rust_qs):
@@ -172,7 +191,7 @@ def test_cross_validate_solve(request: pytest.FixtureRequest) -> None:
             if pose_failed:
                 continue
 
-            if len(py_qs) == len(rust_qs):
+            if not case.singular and len(py_qs) == len(rust_qs):
                 for ref_q in py_qs:
                     if not any(
                         _q_close_mod(ref_q, r_q, tol=STRICT_TOL)
@@ -183,25 +202,26 @@ def test_cross_validate_solve(request: pytest.FixtureRequest) -> None:
                         break
 
         assert mismatches == 0, (
-            f"{arm_name}: {mismatches}/{len(poses)} poses had mismatched solution sets"
+            f"{arm_name}: {mismatches}/{len(cases)} poses had mismatched solution sets"
         )
 
 
 def test_cross_validate_fk(request: pytest.FixtureRequest) -> None:
     n = int(request.config.getoption("--n"))
+    locked_version = get_locked_ssik_version()
 
     for arm_name in _iter_manifest_arm_names(request):
-        ssik_artifact = _load_ssik_artifact(arm_name)
+        base = _base_name(arm_name)
+        dataset = load_arm_test_data(base)
+        assert dataset.ssik_version == locked_version
         native = _load_native_module(arm_name)
         native_fk = native.fk
+        cases = dataset.cases[:n] if n > 0 else dataset.cases
 
-        rng = np.random.default_rng(99)
-        lims = ssik_artifact._JOINT_LIMITS
-
-        for _ in range(n):
-            q = np.array([rng.uniform(lo, hi) for lo, hi in lims])
-            T_py = ssik_artifact.fk(q)
-            T_rust = np.array(native_fk(q.tolist()), dtype=np.float64)
+        for case in cases:
+            q = case.q_fk
+            T_py = np.asarray(case.tf, dtype=np.float64).reshape(4, 4)
+            T_rust = np.array(native_fk(q), dtype=np.float64)
             np.testing.assert_allclose(
                 T_rust, T_py, atol=1e-12,
                 err_msg=f"{arm_name}: fk mismatch at q={q}",
