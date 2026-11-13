@@ -597,7 +597,7 @@ def generate_ik(
         # reuse across LLM retries so we do not pay the SymPy cost repeatedly.
         driver_dir = output_dir / "src" / "drivers" / arm_name
         dyn_rs = driver_dir / "generated_dynamics.rs"
-        if not dyn_rs.is_file():
+        if attempt == 0 or not dyn_rs.is_file():
             print(
                 f"[ik_generator] Step 6b: Compiling symbolic kinematics + "
                 f"dynamics for '{arm_name}' …"
@@ -629,6 +629,7 @@ def generate_ik(
             arm_name,
             Path(urdf),
             output_dir,
+            force=(attempt == 0),
             base_link=base_link,
             ee_link=ee_link,
         )

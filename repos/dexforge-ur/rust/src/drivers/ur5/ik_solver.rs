@@ -38,6 +38,12 @@ mod test_data;
 /// Degrees of freedom of the UR5.
 pub const DOF: usize = 6;
 
+/// Base link name in the URDF.
+pub const BASE_LINK: &str = "base_link";
+
+/// End-effector link name in the URDF.
+pub const EE_LINK: &str = "ee_link";
+
 // --- algebraic-block degeneracy constants from ur5_ik.py ---
 const TWO_PI: f64 = 2.0 * PI;
 

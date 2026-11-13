@@ -38,6 +38,12 @@ pub const SOLVER_NAME: &str = "jointlock.seven_r";
 /// Solver tier — mirrors `SOLVER_TIER` in the Python artifact.
 pub const SOLVER_TIER: u32 = 1;
 
+/// Base link name in the URDF.
+pub const BASE_LINK: &str = "base_link";
+
+/// End-effector link name in the URDF.
+pub const EE_LINK: &str = "flange";
+
 /// Home pose: 4×4 SE(3) of the flange in `base_link` at `q = [0; 7]`.
 /// Mirrors `T_HOME` in the Python artifact.
 pub const T_HOME: [[f64; 4]; 4] = consts::T_HOME;

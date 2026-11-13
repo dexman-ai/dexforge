@@ -62,6 +62,12 @@ mod test_data;
 /// Degrees of freedom of the Piper.
 pub const DOF: usize = 6;
 
+/// Base link name in the URDF.
+pub const BASE_LINK: &str = "base_link";
+
+/// End-effector link name in the URDF.
+pub const EE_LINK: &str = "link6";
+
 const TWO_PI: f64 = 2.0 * PI;
 
 /// 2-norm condition number of the equilibrated leading matrix `A_eq` above

@@ -168,6 +168,10 @@ def test_cross_validate_solve(request: pytest.FixtureRequest) -> None:
                         break
                 continue
 
+            if not rust_qs:
+                mismatches += 1
+                continue
+
             pose_failed = False
             for r_q in rust_qs:
                 fk_residual = np.max(
