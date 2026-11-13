@@ -18,6 +18,23 @@ layers:
 `ArmModel` is unchanged for existing drivers: the three new associated
 constants have defaults.
 
+## What the OEM supplies and what they get
+
+OEMs own their driver. The driver depends on dexhal only, and dexhal owns the
+whole driver contract.
+
+| OEM provides | Produced by | Lands in |
+| :-- | :-- | :-- |
+| URDF | dexforge codegen + coding agent | `ArmModel` impl: FK, Jacobian, IK, dynamics, joint limits, nominal chain |
+| Driver manifest (rates, modes, latencies, sensing, limits) | hand-written or generated data | `ArmManifest` |
+| Hardware API or protocol spec | coding agent | `connect`, `disconnect`, `read_state`, `write_command` |
+
+Everything else — TCP, payload, calibration, host fallbacks, buffer layouts —
+is provided by dexhal.
+
+This is the target workflow; parts of it are not in place yet. See
+[`workitems.md`](workitems.md).
+
 ## Using an arm
 
 ```rust
