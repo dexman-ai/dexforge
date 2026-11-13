@@ -220,3 +220,72 @@ def test_dynamics_matches_planar_rr_reference(tmp_path):
                 * qd[k]
             )
         assert abs(qd @ (m_dot @ qd) - 2 * qd @ c_sym) < 1e-6
+
+
+def test_pinocchio_chain_xml_strips_world_transform_and_gripper_joints(tmp_path):
+    import generate_dynamics_test_data as GD
+    import xml.etree.ElementTree as ET
+
+    urdf = tmp_path / "with_gripper.urdf"
+    urdf.write_text(
+        f"""<robot name="rr_gripper">
+  <link name="world"/>
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/><child link="base"/>
+    <origin xyz="0 0 1.0" rpy="1.5707963267948966 0 0"/>
+  </joint>
+  <link name="base"/>
+  <link name="l1">
+    <inertial>
+      <origin xyz="{LC1} 0 0" rpy="0 0 0"/>
+      <mass value="{M1}"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="{IZ1}"/>
+    </inertial>
+  </link>
+  <link name="l2">
+    <inertial>
+      <origin xyz="{LC2} 0 0" rpy="0 0 0"/>
+      <mass value="{M2}"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.006" iyz="0" izz="{IZ2}"/>
+    </inertial>
+  </link>
+  <link name="finger">
+    <inertial>
+      <origin xyz="0.02 0 0" rpy="0 0 0"/>
+      <mass value="0.2"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <joint name="j0" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+  </joint>
+  <joint name="j1" type="revolute">
+    <parent link="l1"/><child link="l2"/>
+    <origin xyz="{L1} 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+  </joint>
+  <joint name="finger_joint" type="prismatic">
+    <parent link="l2"/><child link="finger"/>
+    <origin xyz="{L2} 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+  </joint>
+</robot>
+""",
+        encoding="utf-8",
+    )
+
+    xml_str = GD._build_chain_urdf_xml(urdf, base_link="base", ee_link="l2")
+    root = ET.fromstring(xml_str)
+    joint_names = [j.get("name") for j in root.findall("joint")]
+    link_names = [l.get("name") for l in root.findall("link")]
+    assert joint_names == ["j0", "j1"]
+    assert link_names == ["base", "l1", "l2"]
+
+
+def test_emit_dynamics_parity_rs_checks_finiteness_and_custom_gravity():
+    import generate_dynamics_test_data as GD
+
+    rs = GD.emit_dynamics_parity_rs("demo", 6)
+    assert 'assert!(d.is_finite(), "non-finite dynamics comparison");' in rs
+    assert 'dynamics_test_data::GRAVITY.iter().all(|g| g.is_finite())' in rs
+    assert "[0.0, 0.0, -9.81]" not in rs
+

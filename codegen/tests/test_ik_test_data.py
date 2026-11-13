@@ -86,6 +86,21 @@ class IkTestDataTests(unittest.TestCase):
             self.assertIn("1.2.3", str(ctx.exception))
             self.assertIn("9.9.9", str(ctx.exception))
 
+    def test_unverifiable_ssik_producer_version_raises(self) -> None:
+        import types
+        from unittest import mock
+
+        fake_ssik = types.ModuleType("ssik")
+        with mock.patch.dict(sys.modules, {"ssik": fake_ssik}):
+            with self.assertRaises(RuntimeError) as ctx:
+                ik_test_data.get_installed_ssik_version(_REPO_ROOT)
+            self.assertIn("__version__", str(ctx.exception))
+
+        fake_ssik.__version__ = "unknown"
+        with mock.patch.dict(sys.modules, {"ssik": fake_ssik}):
+            with self.assertRaises(RuntimeError):
+                ik_test_data.get_installed_ssik_version(_REPO_ROOT)
+
 
 if __name__ == "__main__":
     unittest.main()

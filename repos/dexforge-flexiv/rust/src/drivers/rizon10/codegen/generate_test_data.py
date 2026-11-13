@@ -45,7 +45,7 @@ import sys
 import numpy as np
 
 _DRIVERS_ROOT = Path(__file__).resolve().parents[2]
-_REPO_ROOT = _DRIVERS_ROOT.parents[3]
+_REPO_ROOT = _DRIVERS_ROOT.parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 

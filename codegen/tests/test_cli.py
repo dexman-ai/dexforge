@@ -403,6 +403,46 @@ class UrdfBuildTests(unittest.TestCase):
             self.assertTrue((out / "src" / "drivers" / "ur5" / "ik_solver.rs").is_file())
             self.assertIn("[workspace]", (out / "Cargo.toml").read_text())
 
+    def test_from_existing_regenerates_when_urdf_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_urdf = _REPO_ROOT / "repos" / "dexforge-ur" / "rust" / "src" / "drivers" / "ur5" / "ur5.urdf"
+            if not src_urdf.is_file():
+                self.skipTest("ur5.urdf not available")
+            modified_urdf = Path(tmp) / "ur5.urdf"
+            modified_urdf.write_text(
+                src_urdf.read_text(encoding="utf-8") + "\n<!-- modified -->\n",
+                encoding="utf-8",
+            )
+            out = Path(tmp) / "seeded_modified"
+            with mock.patch.object(cli, "generate_ik") as gen, mock.patch.object(
+                cli, "generate_dynamics_for_arm", side_effect=_mock_generate_dynamics
+            ) as dyn, mock.patch.object(
+                cli, "ensure_dynamics_parity", side_effect=_mock_ensure_parity
+            ) as parity, mock.patch.object(
+                cli, "verify_crate", return_value=(True, "ok")
+            ):
+                with redirect_stdout(io.StringIO()):
+                    code = cli.main(
+                        [
+                            "build",
+                            "--urdf",
+                            str(modified_urdf),
+                            "--base",
+                            "base_link",
+                            "--ee",
+                            "ee_link",
+                            "-o",
+                            str(out),
+                            "--from-existing",
+                            "--no-verify",
+                        ]
+                    )
+            self.assertEqual(code, 0)
+            gen.assert_not_called()
+            dyn.assert_called_once()
+            parity.assert_called_once()
+            self.assertTrue(parity.call_args.kwargs.get("force"))
+
 
 if __name__ == "__main__":
     unittest.main()

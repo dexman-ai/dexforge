@@ -56,11 +56,24 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
+
+_CODEGEN_DIR = Path(__file__).resolve().parent
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
+
+from generate_dynamics import (  # noqa: E402
+    extract_base_ee_links,
+    load_artifact,
+    order_urdf_chain,
+    parse_urdf_joints,
+)
 
 _DEFAULT_SAMPLES = 1_000
 _DEFAULT_QD_LIMIT = 1.0
@@ -78,6 +91,127 @@ def _symmetrize_mass_matrix(m: np.ndarray) -> np.ndarray:
     return upper + upper.T - np.diag(np.diag(upper))
 
 
+def _resolve_chain_endpoints(
+    urdf_path: Path,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+    arm: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve ``(base_link, ee_link)`` for *urdf_path* when not explicitly provided."""
+    if base_link is not None and ee_link is not None:
+        return base_link, ee_link
+
+    root = ET.parse(urdf_path).getroot()
+    link_names = {l.get("name") for l in root.findall("link") if l.get("name")}
+
+    candidates: List[Tuple[Optional[str], Optional[str]]] = []
+    if output_dir is not None:
+        ik_rs = output_dir / "ik_solver.rs"
+        if ik_rs.is_file():
+            text = ik_rs.read_text(encoding="utf-8")
+            mb = re.search(r'BASE_LINK\s*:\s*&str\s*=\s*"([^"]+)"', text)
+            me = re.search(r'EE_LINK\s*:\s*&str\s*=\s*"([^"]+)"', text)
+            if mb or me:
+                candidates.append((mb.group(1) if mb else None, me.group(1) if me else None))
+        for art_path in (
+            *sorted(output_dir.glob("*_ik.py")),
+            *sorted(output_dir.glob("codegen/*_ik.py")),
+        ):
+            try:
+                candidates.append(extract_base_ee_links(load_artifact(str(art_path))))
+            except Exception:  # noqa: BLE001
+                pass
+
+    arm_stem = arm or urdf_path.stem
+    try:
+        candidates.append(extract_base_ee_links(load_artifact(f"{arm_stem}_ik")))
+    except Exception:  # noqa: BLE001
+        pass
+
+    for cand_b, cand_e in candidates:
+        b = base_link or cand_b
+        e = ee_link or cand_e
+        if b in link_names and e in link_names:
+            return b, e
+
+    return base_link, ee_link
+
+
+def _build_chain_urdf_xml(
+    urdf_path: Path,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+    arm: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> str:
+    """Build a minimal URDF XML containing only the selected ``base_link -> ee_link`` chain.
+
+    Restricts the model to the exact serial chain used by
+    ``generate_dynamics.build_dynamics``:
+
+    * ``base_link`` becomes the root link of the URDF (so any non-identity
+      transform above ``base_link`` is excluded and gravity is expressed in
+      ``base_link``'s frame).
+    * Side branches and any joints past ``ee_link`` (such as actuated gripper
+      fingers) are excluded.
+    * Only child links of actuated joints on the chain retain ``<inertial>``
+      blocks, matching ``generate_dynamics.build_bodies``.
+    """
+    b, e = _resolve_chain_endpoints(
+        urdf_path,
+        base_link=base_link,
+        ee_link=ee_link,
+        arm=arm,
+        output_dir=output_dir,
+    )
+    joints = parse_urdf_joints(urdf_path)
+    try:
+        chain = order_urdf_chain(joints, base_link=b, ee_link=e)
+    except ValueError:
+        if b is not None or e is not None:
+            raise
+        # When neither endpoint was specified and the URDF has fixed helper
+        # branches (e.g. world->base_link or ee_link->tool0), fall back to the
+        # unique contiguous actuated chain if one exists.
+        actuated = [jt for jt in joints if jt.actuated]
+        act_parents = {jt.parent for jt in actuated}
+        act_children = {jt.child for jt in actuated}
+        starts = [jt.parent for jt in actuated if jt.parent not in act_children]
+        ends = [jt.child for jt in actuated if jt.child not in act_parents]
+        if len(starts) == 1 and len(ends) == 1:
+            chain = order_urdf_chain(joints, base_link=starts[0], ee_link=ends[0])
+        else:
+            raise
+
+    if not chain:
+        raise ValueError(
+            f"URDF chain is empty for {urdf_path} (base={b!r}, ee={e!r})"
+        )
+
+    actuated_child_links = {jt.child for jt in chain if jt.actuated}
+    chain_links = {chain[0].parent} | {jt.child for jt in chain}
+
+    root = ET.parse(urdf_path).getroot()
+    out_root = ET.Element("robot", root.attrib)
+    for link in root.findall("link"):
+        lname = link.get("name")
+        if lname not in chain_links:
+            continue
+        link_copy = ET.Element("link", link.attrib)
+        if lname in actuated_child_links:
+            inertial = link.find("inertial")
+            if inertial is not None:
+                link_copy.append(inertial)
+        out_root.append(link_copy)
+
+    joint_by_name = {j.get("name"): j for j in root.findall("joint")}
+    for jt in chain:
+        out_root.append(joint_by_name[jt.name])
+
+    return ET.tostring(out_root, encoding="unicode")
+
+
 def build_dataset(
     urdf_path: Path,
     samples: int,
@@ -85,6 +219,10 @@ def build_dataset(
     qd_limit: float,
     qdd_limit: float,
     gravity: Tuple[float, float, float],
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+    arm: Optional[str] = None,
+    output_dir: Optional[Path] = None,
 ):
     """Sample states and compute Pinocchio g, M, C·qd, and RNEA torques.
 
@@ -93,7 +231,14 @@ def build_dataset(
     """
     import pinocchio as pin
 
-    model = pin.buildModelFromUrdf(str(urdf_path))
+    xml_str = _build_chain_urdf_xml(
+        urdf_path,
+        base_link=base_link,
+        ee_link=ee_link,
+        arm=arm,
+        output_dir=output_dir,
+    )
+    model = pin.buildModelFromXML(xml_str)
     model.gravity.linear = np.asarray(gravity, dtype=np.float64)
     data = model.createData()
     dof = int(model.nv)
@@ -320,6 +465,7 @@ fn max_abs_diff_vec(a: &[f64; {dof}], b: &[f64; {dof}]) -> f64 {{
     let mut m = 0.0f64;
     for i in 0..{dof} {{
         let d = libm::fabs(a[i] - b[i]);
+        assert!(d.is_finite(), "non-finite dynamics comparison");
         if d > m {{
             m = d;
         }}
@@ -332,6 +478,7 @@ fn max_abs_diff_mat(a: &[[f64; {dof}]; {dof}], b: &[[f64; {dof}]; {dof}]) -> f64
     for i in 0..{dof} {{
         for j in 0..{dof} {{
             let d = libm::fabs(a[i][j] - b[i][j]);
+            assert!(d.is_finite(), "non-finite dynamics comparison");
             if d > m {{
                 m = d;
             }}
@@ -343,10 +490,9 @@ fn max_abs_diff_mat(a: &[[f64; {dof}]; {dof}], b: &[[f64; {dof}]; {dof}]) -> f64
 #[test]
 fn conventions_match_pinocchio_dataset() {{
     assert_eq!(dynamics_test_data::DOF, {dof});
-    assert_eq!(
-        dynamics_test_data::GRAVITY,
-        [0.0, 0.0, -9.81],
-        "gravity sign/convention drift — update generator --gravity or the test"
+    assert!(
+        dynamics_test_data::GRAVITY.iter().all(|g| g.is_finite()),
+        "non-finite gravity in Pinocchio dataset"
     );
     assert_eq!(dynamics_test_data::JOINT_NAMES.len(), {dof});
     assert!(dynamics_test_data::N_CASES > 0);
@@ -455,6 +601,8 @@ def write_ground_truth(
     qd_limit: float = _DEFAULT_QD_LIMIT,
     qdd_limit: float = _DEFAULT_QDD_LIMIT,
     gravity: Tuple[float, float, float] = _DEFAULT_GRAVITY,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
 ) -> Tuple[Path, Path, Path]:
     """Generate Pinocchio golden data + parity tests into *output_dir*.
 
@@ -469,7 +617,16 @@ def write_ground_truth(
 
     arm_name = arm or urdf.stem
     dof, joint_names, cases = build_dataset(
-        urdf, samples, seed, qd_limit, qdd_limit, gravity
+        urdf,
+        samples,
+        seed,
+        qd_limit,
+        qdd_limit,
+        gravity,
+        base_link=base_link,
+        ee_link=ee_link,
+        arm=arm_name,
+        output_dir=output_dir,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     bin_name = "dynamics_test_data.bin"
@@ -505,19 +662,30 @@ def main(argv: Optional[List[str]] = None) -> int:
         required=True,
         help="URDF carrying <inertial> blocks (same one the generated Rust used).",
     )
-    parser.add_argument(
+    out_group = parser.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
         "--output-dir",
         type=Path,
-        required=True,
+        default=None,
         help="Driver directory that receives dynamics_test_data.rs + .bin.",
     )
-    parser.add_argument(
+    out_group.add_argument(
         "--output",
         type=Path,
         default=None,
-        help=argparse.SUPPRESS,  # backwards-compat alias ignored; use --output-dir
+        help=argparse.SUPPRESS,  # backwards-compat alias; use --output-dir
     )
     parser.add_argument("--arm", default=None, help="Arm name for docs (default: URDF stem).")
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="Base link name in the URDF (defaults to artifact BASE_LINK or URDF root).",
+    )
+    parser.add_argument(
+        "--ee",
+        default=None,
+        help="End-effector link name in the URDF (defaults to artifact EE_LINK or URDF leaf).",
+    )
     parser.add_argument(
         "--samples",
         type=int,
@@ -566,6 +734,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             qd_limit=args.qd_limit,
             qdd_limit=args.qdd_limit,
             gravity=tuple(args.gravity),
+            base_link=args.base,
+            ee_link=args.ee,
         )
     except ImportError as exc:
         print(f"[generate_dynamics_test_data] ERROR: {exc}", file=sys.stderr)

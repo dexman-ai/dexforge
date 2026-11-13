@@ -603,7 +603,12 @@ def generate_ik(
                 f"dynamics for '{arm_name}' …"
             )
             ok_dyn, dyn_msg = generate_dynamics_for_arm(
-                arm_name, Path(urdf), output_dir, ssik_artifact=None
+                arm_name,
+                Path(urdf),
+                output_dir,
+                ssik_artifact=None,
+                base_link=base_link,
+                ee_link=ee_link,
             )
             if not ok_dyn:
                 return False, arm_name, dyn_msg
@@ -621,7 +626,11 @@ def generate_ik(
             f"'{arm_name}' …"
         )
         ok_parity, parity_msg = ensure_dynamics_parity(
-            arm_name, Path(urdf), output_dir
+            arm_name,
+            Path(urdf),
+            output_dir,
+            base_link=base_link,
+            ee_link=ee_link,
         )
         if not ok_parity:
             return False, arm_name, parity_msg
@@ -683,6 +692,63 @@ def _wire_generated_dynamics_module(driver_dir: Path) -> None:
     mod_path.write_text(text, encoding="utf-8")
 
 
+def _cached_driver_inputs_match(
+    driver_src: Path,
+    urdf: Path,
+    base_link: Optional[str],
+    ee_link: Optional[str],
+) -> bool:
+    """Return ``True`` iff *urdf* and ``(base_link, ee_link)`` match *driver_src*'s cached inputs."""
+    import re
+    from generate_dynamics import extract_base_ee_links
+
+    arm = driver_src.name
+    cached_urdf = driver_src / f"{arm}.urdf"
+    if not cached_urdf.is_file():
+        urdfs = sorted(driver_src.glob("*.urdf"))
+        if len(urdfs) != 1:
+            return False
+        cached_urdf = urdfs[0]
+
+    try:
+        if Path(urdf).read_bytes() != cached_urdf.read_bytes():
+            return False
+    except OSError:
+        return False
+
+    cached_base: Optional[str] = None
+    cached_ee: Optional[str] = None
+    ik_rs = driver_src / "ik_solver.rs"
+    if ik_rs.is_file():
+        text = ik_rs.read_text(encoding="utf-8")
+        mb = re.search(r'BASE_LINK\s*:\s*&str\s*=\s*"([^"]+)"', text)
+        me = re.search(r'EE_LINK\s*:\s*&str\s*=\s*"([^"]+)"', text)
+        if mb:
+            cached_base = mb.group(1)
+        if me:
+            cached_ee = me.group(1)
+
+    if cached_base is None or cached_ee is None:
+        for cand in (
+            *sorted(driver_src.glob("*_ik.py")),
+            *sorted(driver_src.glob("codegen/*_ik.py")),
+            f"{arm}_ik",
+        ):
+            try:
+                mod = load_artifact(str(cand))
+                art_b, art_e = extract_base_ee_links(mod)
+                cached_base = cached_base or art_b
+                cached_ee = cached_ee or art_e
+                if cached_base and cached_ee:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+    if cached_base is None or cached_ee is None:
+        return False
+    return base_link == cached_base and ee_link == cached_ee
+
+
 def ensure_dynamics_parity(
     arm: str,
     urdf: Path,
@@ -690,6 +756,8 @@ def ensure_dynamics_parity(
     samples: int = 1_000,
     seed: int = 0,
     force: bool = False,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
 ) -> tuple:
     """Emit Pinocchio golden data + ``dynamics_parity`` tests into the crate.
 
@@ -716,6 +784,8 @@ def ensure_dynamics_parity(
             arm=arm,
             samples=samples,
             seed=seed,
+            base_link=base_link,
+            ee_link=ee_link,
         )
     except ImportError as exc:
         return False, str(exc)
@@ -731,6 +801,8 @@ def generate_dynamics_for_arm(
     urdf: Path,
     crate_root: Path,
     ssik_artifact: Optional[Path] = None,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
 ) -> tuple:
     """Compile the arm's full rigid-body kinematics + dynamics in the crate root.
 
@@ -770,7 +842,14 @@ def generate_dynamics_for_arm(
             artifact = f"{arm}_ik"
 
     out_rs = driver_dir / "generated_dynamics.rs"
-    code = generate(str(artifact), Path(urdf), arm, out_rs)
+    code = generate(
+        str(artifact),
+        Path(urdf),
+        arm,
+        out_rs,
+        base_link=base_link,
+        ee_link=ee_link,
+    )
     if code != 0:
         return False, f"generate_dynamics failed for {arm} (exit {code})"
 
@@ -820,6 +899,7 @@ def _build(args: argparse.Namespace) -> int:
         return 0
 
     arm = urdf.stem
+    reuse_cached_dynamics = True
     if getattr(args, "from_existing", False):
         # Package the already-translated in-repo driver as a stand-alone crate.
         # Used to prove the packaging / dynamics half of the pipeline (and to
@@ -829,6 +909,10 @@ def _build(args: argparse.Namespace) -> int:
             f"(--from-existing) …"
         )
         try:
+            driver_src = _driver_dir(repo_root, arm)
+            reuse_cached_dynamics = _cached_driver_inputs_match(
+                driver_src, Path(urdf), args.base, args.ee
+            )
             export = plan_export(
                 arm,
                 base,
@@ -836,6 +920,18 @@ def _build(args: argparse.Namespace) -> int:
                 crate_name=args.name,
             )
             write_export(export)
+            if not reuse_cached_dynamics:
+                shutil.copyfile(urdf, base / urdf.name)
+                seeded_driver = base / "src" / "drivers" / arm
+                for stale in (
+                    "generated_dynamics.rs",
+                    "dynamics_test_data.bin",
+                    "dynamics_test_data.rs",
+                    "dynamics_parity.rs",
+                ):
+                    stale_path = seeded_driver / stale
+                    if stale_path.is_file():
+                        stale_path.unlink()
         except FileNotFoundError as exc:
             print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
             return 1
@@ -868,14 +964,16 @@ def _build(args: argparse.Namespace) -> int:
         print(f"[dexforge]   \u2713 generated '{arm}' driver under {base}.")
 
     dyn_rs = base / "src" / "drivers" / arm / "generated_dynamics.rs"
-    if dyn_rs.is_file():
+    if reuse_cached_dynamics and dyn_rs.is_file():
         print(
             f"[dexforge]   \u2713 kinematics/dynamics already present for '{arm}' "
             f"(skipping SymPy recompile)."
         )
     else:
         print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
-        ok, output = generate_dynamics_for_arm(arm, Path(urdf), base)
+        ok, output = generate_dynamics_for_arm(
+            arm, Path(urdf), base, base_link=args.base, ee_link=args.ee
+        )
         if not ok:
             print(
                 f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
@@ -885,7 +983,14 @@ def _build(args: argparse.Namespace) -> int:
         print(f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under {base}.")
 
     print(f"[dexforge] ensuring Pinocchio dynamics parity for '{arm}' …")
-    ok, output = ensure_dynamics_parity(arm, Path(urdf), base)
+    ok, output = ensure_dynamics_parity(
+        arm,
+        Path(urdf),
+        base,
+        force=not reuse_cached_dynamics,
+        base_link=args.base,
+        ee_link=args.ee,
+    )
     if not ok:
         print(
             f"[dexforge] ERROR: Pinocchio dynamics parity setup failed:\n{output}",

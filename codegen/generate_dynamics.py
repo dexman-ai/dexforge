@@ -1010,7 +1010,14 @@ def _emit_dynamics(
 # ---------------------------------------------------------------------------
 
 
-def generate(ssik_artifact, urdf, arm, output):
+def generate(
+    ssik_artifact,
+    urdf,
+    arm,
+    output,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+):
 
     try:
         mod = load_artifact(ssik_artifact)
@@ -1021,7 +1028,9 @@ def generate(ssik_artifact, urdf, arm, output):
 
     stem = Path(ssik_artifact).stem
     arm = arm or stem.removesuffix("_ik")
-    base_link, ee_link = extract_base_ee_links(mod)
+    art_base, art_ee = extract_base_ee_links(mod)
+    base_link = base_link or art_base
+    ee_link = ee_link or art_ee
     print(f"[generate_dynamics] {arm}: {n} DOF from ssik artifact {stem!r}", file=sys.stderr)
 
     t_ee, q_syms, frames = build_fk(t_lefts, axes, t_rights)
@@ -1095,8 +1104,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             "URDF's actuated-joint order must match the kinematics artifact."
         ),
     )
+    parser.add_argument(
+        "--base",
+        default=None,
+        help="Optional base link override in the URDF (defaults to artifact BASE_LINK).",
+    )
+    parser.add_argument(
+        "--ee",
+        default=None,
+        help="Optional end-effector link override in the URDF (defaults to artifact EE_LINK).",
+    )
     args = parser.parse_args(argv)
-    return generate(args.artifact, args.urdf, args.arm, args.output)
+    return generate(
+        args.artifact,
+        args.urdf,
+        args.arm,
+        args.output,
+        base_link=args.base,
+        ee_link=args.ee,
+    )
 
 
 if __name__ == "__main__":

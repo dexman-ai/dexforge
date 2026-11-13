@@ -91,11 +91,11 @@ def get_installed_ssik_version(repo_root: Optional[Path] = None) -> str:
     locked = get_locked_ssik_version(repo_root)
     try:
         import ssik
-    except ImportError:
-        return locked
+    except ImportError as exc:
+        raise RuntimeError("Cannot verify ssik version: ssik is not installed") from exc
     installed = getattr(ssik, "__version__", None)
     if not installed or installed == "unknown":
-        return locked
+        raise RuntimeError("Cannot verify ssik version: ssik.__version__ is unavailable")
     if installed != locked:
         raise RuntimeError(
             f"Installed ssik version ({installed}) does not match "
