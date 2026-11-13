@@ -2,7 +2,8 @@
 name = "dexhal"
 version = "0.1.0"
 edition = "2021"
-description = "Shared no_std runtime math and kinematics for dexforge OEM drivers."
+rust-version = "1.82"
+description = "Driver contract and shared no_std math for dexforge OEM drivers."
 license = "BSD-3-Clause"
 
 [lib]

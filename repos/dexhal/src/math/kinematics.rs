@@ -121,7 +121,7 @@ pub fn norm12(r: &[f64; 12]) -> f64 {
 /// A rigid-body transform stored as a rotation block and translation vector.
 ///
 /// Equivalent to the upper 3×4 block of a 4×4 SE(3) homogeneous matrix.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform {
     pub r: [[f64; 3]; 3],
     pub t: [f64; 3],

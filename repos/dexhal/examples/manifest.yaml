@@ -1,0 +1,53 @@
+# dexhal driver manifest — annotated example.
+#
+# Loaded by `ArmManifest::from_text::<Model, DOF, MAX>(include_str!("manifest.yaml"))`.
+# The format is a strict subset of YAML: `key: value`, one level of indented
+# sections, `[a, b]` lists and `#` comments. Unknown or repeated keys are errors.
+#
+# This file is the manifest of dexhal's test stand-in arm and is loaded by the
+# unit tests, so it always matches the parser.
+
+driver: six-r                 # required; must equal the model's ArmModel::NAME
+version: "0.2"                # required; contract version the driver targets
+control_freq_hz: 500          # required; rate at which the hardware expects commands
+control_modes: [joint_pos, joint_vel, cartesian_pose]   # required; natively executed targets:
+                              #   joint_pos, joint_vel, joint_torque,
+                              #   cartesian_pose, cartesian_twist, cartesian_wrench
+realtime: true                # optional (false); the driver needs a real-time thread
+
+latency:                      # required; delays measured in control cycles
+  state_staleness_cycles: 1   #   hardware sampling its state -> read_state returning
+  command_dispatch_cycles: 2  #   write_command returning -> hardware acting
+
+limits:
+  # Required, one value per joint, finite and > 0. Take them from the URDF
+  # <limit velocity= effort=> attributes and the vendor data sheet.
+  velocity: [3.15, 3.15, 3.15, 3.2, 3.2, 3.2]        # rad/s
+  acceleration: [15.0, 15.0, 15.0, 15.0, 15.0, 15.0] # rad/s^2
+  effort: [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]    # N*m
+  # Optional; default to the model's ArmModel::JOINT_LIMITS. `.inf` marks a
+  # continuous joint.
+  position_min: [-3.0, -6.2, -6.2, -6.2, -6.2, -.inf] # rad
+  position_max: [3.0, 6.2, 6.2, 6.2, 6.2, .inf]
+
+sensing:                      # optional section; every key defaults to false
+  torque: true                #   joint torques (native or from motor currents)
+  wrench: false               #   6-axis force/torque sensor at the wrist
+  gripper: false              #   integrated gripper on the same bus
+
+native:                       # optional section; every key defaults to false
+  cartesian_impedance: false  #   features the robot controller executes itself;
+  cartesian_admittance: true  #   the kernel computes whatever is false here
+  joint_impedance: false
+  joint_admittance: false
+  contact_detection: false
+  reflexes: false
+  payload: true               #   controller accepts set_payload
+  tcp_offset: true            #   controller accepts set_tcp_offset
+
+aux:                          # optional; fields following CoreState in the state buffer
+  - name: motor_temp
+    type: f64                 #   optional, only f64 is supported
+    count: 6                  #   number of f64 slots
+  - name: bus_voltage
+    count: 1

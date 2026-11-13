@@ -1,64 +1,118 @@
 # dexhal
 
-The common abstraction every dexforge arm is surfaced through: forward and
-inverse kinematics, Jacobian, dynamics, runtime configuration (TCP, payload,
-gravity, per-robot calibration), a capability manifest and a control API.
+The contract every dexforge arm is surfaced through, the math all drivers
+share, and the tests for both.
 
 `#![no_std]`, `#![forbid(unsafe_code)]`, no allocation, every loop bounded.
+Minimum Rust version: 1.82.
 
-The contract surface is [`src/math/arm.rs`](src/math/arm.rs). It has three
-layers:
+## What lives where
 
-| Layer | Type | Who implements it | What it is |
-| :-- | :-- | :-- | :-- |
-| Model | `ArmModel<DOF, MAX>` | driver crate (generated) | Nominal, stateless flange FK / Jacobian / analytic IK / dynamics, plus `NAME`, `JOINT_LIMITS`, `HAS_DYNAMICS` |
-| Arm | `Arm<A, DOF, MAX>` | dexhal | One physical arm: a model plus its TCP, payload, gravity vector and calibration |
-| Contract | `ArmMath`, `ArmDriver`, `ArmManifest`, `CoreState`, `CoreCommand` | dexhal (math) + hardware driver (I/O) | `MAX_DOF`-padded, object-safe form consumed by the DexZero kernel |
+dexhal contains no arm-specific code. An arm's forward kinematics, Jacobian,
+inverse kinematics and dynamics are generated into its driver crate; dexhal
+fixes their shape and supplies what is identical for every arm.
 
-`ArmModel` is unchanged for existing drivers: the three new associated
-constants have defaults.
+| In the driver crate | In dexhal |
+| :-- | :-- |
+| `ik_solver.rs`: `fk`, `solve` — the arm's own IK, including FK verification, refinement, de-duplication, joint limits and seed ordering | The trait the driver implements: `ArmModel` |
+| `generated_kinematics.rs`: `jacobian` | TCP re-referencing, tool-frame quantities, pseudo-inverse |
+| `generated_dynamics.rs`: `gravity`, `mass_matrix`, `coriolis`, `inverse_dynamics` of the arm's own links | Payload contribution to each of them |
+| `arm.rs`: `impl ArmModel for <Arm>` delegating to the three files above | `Arm`: the model plus runtime TCP, payload, gravity and calibration |
+| `manifest.yaml`, `connect`, `disconnect`, `read_state`, `write_command` | `ArmManifest`, the buffer layouts, `ArmDriver` |
+| Tests against the real solver | Tests of the contract and the shared math, on a stand-in arm |
 
-## What the OEM supplies and what they get
+`repos/dexforge-ur` is the reference for the driver side.
 
-OEMs own their driver. The driver depends on dexhal only, and dexhal owns the
-whole driver contract.
+## Modules
 
-| OEM provides | Produced by | Lands in |
-| :-- | :-- | :-- |
-| URDF | dexforge codegen + coding agent | `ArmModel` impl: FK, Jacobian, IK, dynamics, joint limits, nominal chain |
-| Driver manifest (rates, modes, latencies, sensing, limits) | hand-written or generated data | `ArmManifest` |
-| Hardware API or protocol spec | coding agent | `connect`, `disconnect`, `read_state`, `write_command` |
+| Module | Contents |
+| :-- | :-- |
+| `math::model` | `ArmModel<DOF, MAX>`, `Pose` — what a driver implements |
+| `math::arm` | `Arm<A, DOF, MAX>` — one physical arm |
+| `math::contract` | `ArmDriver`, `ArmMath`, `ArmManifest`, `CoreState` / `CoreCommand` and their views, `CalibrationData` — what a kernel sees |
+| `math::spatial` | Jacobian re-referencing, `J̇ q̇`, pseudo-inverse, base ↔ tool frame helpers |
+| `math::payload` | `Payload` and its gravity / inertia / Coriolis / inverse-dynamics terms |
+| `math::chain` | `KinematicChain` — per-robot calibrated kinematics, DH import |
+| `math::identify` | `ChainIdentifier` — calibration from tracked motion |
+| `math::ssik_core`, `kinematics`, `postprocess`, `tolerances` | Numeric kernels used by the drivers' IK solvers |
 
-Everything else — TCP, payload, calibration, host fallbacks, buffer layouts —
-is provided by dexhal.
+## Implementing a driver's model
 
-This is the target workflow; parts of it are not in place yet. See
-[`workitems.md`](workitems.md).
+```rust
+use dexhal::math::model::{ArmModel, Pose};
+use dexhal::math::postprocess::JointLimit;
+use dexhal::math::tolerances::TolerancePolicy;
+
+pub struct Ur5;
+
+impl ArmModel<6, 16> for Ur5 {
+    const NAME: &'static str = "ur5";
+    const JOINT_LIMITS: [JointLimit; 6] = /* from the URDF */;
+    const HAS_DYNAMICS: bool = true;
+
+    fn flange_fk(q: &[f64; 6]) -> Pose { ik_solver::fk(q) }
+    fn flange_jacobian(q: &[f64; 6]) -> [[f64; 6]; 6] { generated_kinematics::jacobian(q) }
+    fn flange_solve(/* target, max_solutions, q_seed, respect_limits, … */) -> [Option<[f64; 6]>; 16] {
+        ik_solver::solve(/* … */)
+    }
+
+    fn flange_gravity(q: &[f64; 6], g: &[f64; 3]) -> [f64; 6] { generated_dynamics::gravity(q, g) }
+    fn flange_mass_matrix(q: &[f64; 6]) -> [[f64; 6]; 6] { generated_dynamics::mass_matrix(q) }
+    fn flange_coriolis(q: &[f64; 6], qd: &[f64; 6]) -> [f64; 6] { generated_dynamics::coriolis(q, qd) }
+    fn flange_inverse_dynamics(q: &[f64; 6], qd: &[f64; 6], qdd: &[f64; 6], g: &[f64; 3]) -> [f64; 6] {
+        generated_dynamics::inverse_dynamics(q, qd, qdd, g)
+    }
+}
+```
+
+Only the three kinematic functions are required. The dynamics hooks default
+to zero and are ignored unless `HAS_DYNAMICS` is set; dexhal never assembles
+one hook from the others.
+
+dexhal relies on two properties of `flange_solve`: with a seed the solutions
+are ordered nearest-first, and with `respect_limits` they lie inside the arm's
+limits. All dexforge solvers already behave this way.
 
 ## Using an arm
 
 ```rust
-use dexhal::math::arm::{Arm, Payload, Pose};
+use dexhal::math::arm::Arm;
+use dexhal::math::payload::Payload;
 use dexhal::math::tolerances::TolerancePolicy;
 
-let mut arm = Arm::<Ur5, 6, 16>::new();          // Ur5: the driver's ArmModel
+let mut arm = Arm::<Ur5, 6, 16>::new();
 arm.set_tcp(&tcp)?;                               // flange -> TCP
 arm.set_payload(Payload::new(2.5, [0.0, 0.0, 0.06]))?;
-arm.set_gravity([0.0, 0.0, -9.80665])?;           // base frame; wall/ceiling mounts
+arm.set_gravity([0.0, 0.0, -9.80665])?;           // base frame; wall / ceiling mounts
 
 let pose = arm.fk(&q);                            // base -> TCP
-let jac = arm.jacobian(&q);                       // [Jv; Jw] at the TCP
-let q_next = arm.ik_nearest(&target, &q, TolerancePolicy::DEFAULT);
+let jac = arm.jacobian(&q);                       // [Jv; Jw] at the TCP, base axes
+let jac_tool = arm.jacobian_tool(&q);             // same, TCP axes
 let all = arm.ik(&target, None, None, true, true, TolerancePolicy::DEFAULT, 15);
+let q_next = arm.ik_nearest(&target, &q, TolerancePolicy::DEFAULT);
 let dynamics = arm.dynamics(&q, &qd);             // M, C·qd, G incl. payload
+let tau = arm.inverse_dynamics(&q, &qd, &qdd);    // incl. payload
 ```
 
 Setters validate their input and leave the arm unchanged on error.
-`dynamics` returns `None` unless the model declares `HAS_DYNAMICS`; the
-payload-only terms (`payload_gravity`, `payload_mass_matrix`,
-`payload_coriolis`) are always available. `set_payload` also accepts a
-`RigidPayload`, which adds a rotational inertia tensor
-(`RigidPayload::new(..).with_inertia(..)`); `Payload` itself is unchanged.
+
+**Inverse kinematics.** `ik` retargets the TCP and returns the driver's
+solutions. `ik_nearest` is the servo form: it asks the driver for the one
+solution nearest the seed, moves each joint to the 2π turn nearest the seed
+when the limits allow, and returns `None` if any joint would still lie more
+than `ik_max_joint_step` (default π/2, `set_ik_max_joint_step`) from the seed.
+Near a singularity or a joint limit the nearest remaining solution is on
+another branch; the bound turns that into "no solution" instead of a jump.
+
+**Dynamics.** `dynamics` and `inverse_dynamics` return `None` unless the
+driver declares `HAS_DYNAMICS`. The payload terms (`payload_gravity`,
+`payload_mass_matrix`, `payload_coriolis`) are always available; they are
+closed-form in the flange Jacobian. `Payload` carries an optional rotational
+inertia (`Payload::new(..).with_inertia(..)`).
+
+**Tool frame.** `math::spatial` moves wrenches and diagonal stiffness /
+damping between base and tool axes (`wrench_base_to_tool`,
+`diagonal_gain_tool_to_base`, …).
 
 ## Calibration
 
@@ -67,22 +121,30 @@ Generated drivers bake in the nominal geometry. A per-robot calibration is a
 which is a superset of standard DH, modified DH and URDF joint origins.
 
 ```rust
-use dexhal::math::arm::{apply_dh_deltas, DhConvention, KinematicChain};
+use dexhal::math::chain::{apply_dh_deltas, DhConvention, KinematicChain};
 
-// UR: nominal DH + the deltas from the robot's calibration.conf
-let rows = apply_dh_deltas(&UR5_NOMINAL_DH, &deltas);
+// Nominal DH + the per-robot deltas from the vendor's calibration file.
+let rows = apply_dh_deltas(&NOMINAL_DH, &deltas);
 let chain = KinematicChain::from_dh(DhConvention::Standard, &rows)?
     .with_base(&dh_base_in_driver_base)?          // only if the driver's frames
     .with_flange(&dh_flange_in_driver_flange)?;   // differ from the DH ones
 arm.set_calibration(chain)?;
 ```
 
+Reading a vendor file (for example UR's `calibration.conf`) and knowing the
+arm's nominal DH table and frame adapters is the driver's job. DH rows with
+`d` terms of hundreds of metres that cancel across near-parallel axes, as UR
+files contain, keep full precision.
+
 What changes once a calibration is installed, and what it costs:
 
 - **FK / Jacobian** come from the chain: one fixed `DOF` loop.
-- **IK** runs the nominal analytic solver, then polishes each solution onto the
-  calibrated chain with at most `CHAIN_IK_MAX_ITERS` (12) damped Newton steps
-  and re-verifies it against `CALIBRATED_FK_ATOL` (1e-5).
+- **`ik`** takes the driver's full nominal solution set, polishes each
+  solution onto the calibrated chain with at most `CHAIN_IK_MAX_ITERS` (12)
+  damped Newton steps, re-verifies it against the caller's
+  `policy.subproblem_numerical`, re-applies the limits, de-duplicates and then
+  truncates to `max_solutions`.
+- **`ik_nearest`** polishes only the one solution the driver returned.
 - **Dynamics** of the arm's own links stay nominal; payload terms use the
   calibrated flange.
 - **Uncalibrated arms** take the generated path and pay nothing.
@@ -90,66 +152,139 @@ What changes once a calibration is installed, and what it costs:
 `set_calibration` compares the chain with the nominal model at six fixed
 configurations and rejects it (`ModelError::ExcessiveDeviation`) beyond
 `CALIBRATION_MAX_DEVIATION`. This catches a chain expressed in the wrong base
-or flange frame — for example UR's DH base, which is rotated by π about z
-relative to the URDF `base_link`.
+or flange frame.
+
+`Arm::fk_residual(q, reported_tcp)` — and `ArmDriver::calibration_residual`
+on a state buffer — measure the distance between the host model and the TCP
+pose the hardware reports. A residual above the robot's repeatability means
+the two disagree on calibration or TCP.
 
 Limitation: a target reachable only by the calibrated geometry (within about a
-millimetre of the workspace boundary) has no nominal seed and returns no
-solution.
+millimetre of the workspace boundary) has no nominal solution to start from
+and returns none.
 
 ### Arms without vendor calibration
 
-The same chain can be identified from tracked motion with
-`math::identify::ChainIdentifier`: move the arm through a few dozen
-configurations while an external tracker measures a flange-mounted target
-(full pose or position only), then
+`math::identify::ChainIdentifier` fits a chain to tracked motion: move the arm
+through a few dozen configurations while an external tracker measures a
+flange-mounted target (full pose or position only).
 
 ```rust
-let mut ident = ChainIdentifier::new(initial_chain);
+// tracker -> base and flange -> target, as well as they are known
+let initial = nominal_chain.with_base(&tracker_to_base)?.with_flange(&flange_to_target)?;
+let mut ident = ChainIdentifier::new(initial)
+    .with_rotation_weight(0.1)                    // metres per radian
+    .with_outlier_gate(0.01);                     // skip samples off by > 1 cm
 for _ in 0..PASSES {                              // 3-6 passes
     for (q, measured) in samples { ident.add_sample(q, measured); }
-    ident.step();                                 // reports the pass RMS
+    let report = ident.step();                    // RMS, rejected, observable
 }
-arm.set_calibration(*ident.chain())?;
 ```
 
 The caller owns the samples; the identifier accumulates normal equations, so
 it allocates nothing. It is a commissioning tool (≈ 23 kB of state), not a
 control-loop routine. An external reference is required — joint encoders alone
-cannot observe link geometry. See the module docs for frames and observability.
+cannot observe link geometry.
+
+The fitted chain is a tracker → target map. It is *not* in the driver's
+frames, so it cannot be handed to `set_calibration` as is, and removing the
+initial guesses of tracker → base and flange → target leaves their errors
+inside the chain. To get a chain that is exact in the driver's frames, measure
+those two transforms independently and hold them with `fix_base()` /
+`fix_flange()`. The report's `observable` count tells whether the motion
+excited every joint (`4·DOF + 6` for pose samples). See the module docs.
 
 ## Driver contract
 
-`arm.rs` mirrors DexZero's `docs/specs/driver_contract.md`:
+`math::contract` is the driver contract DexZero consumes:
 
 | DexZero spec | dexhal |
 | :-- | :-- |
 | `MAX_DOF`, `ContractVersion`, `ControlMode` | `MAX_DOF`, `ContractVersion`, `control_mode` |
-| `DriverManifest` | `ArmManifest` (`ArmManifest::for_model` fills name, DOF, limits, model capabilities) |
+| `DriverManifest` | `ArmManifest` |
 | `CoreDriverState`, `CoreDriverCommand` | `CoreState` (52 × f64), `CoreCommand` (89 × f64) |
 | `DynamicsState` | `DynamicsState` |
 | `DexArmDriver` | `ArmDriver` |
 
 A hardware driver implements `manifest`, `connect`, `disconnect`, `read_state`,
-`write_command` and returns its `Arm` from `arm()` / `arm_mut()`. FK, Jacobian,
-IK, dynamics and the payload / TCP fallbacks are then provided.
+`write_command` and returns its `Arm` from `arm()` / `arm_mut()`. Everything
+else is provided: FK, Jacobian (base and tool axes), pseudo-inverse, IK,
+dynamics, inverse dynamics, and the configuration plane.
 
-Deliberate differences from the spec, proposed for adoption there:
+### Manifest
 
-- **Errors** are an `ArmError` enum rather than `&'static str`, so the kernel
-  can match on `NotSupported` instead of comparing strings.
-- **`set_payload` / `set_tcp_offset`** return `Applied::Native` or
-  `Applied::Host`. The driver overrides only `set_payload_native` /
-  `set_tcp_offset_native`; the provided method validates, offers the change to
-  the controller and updates the host model, so the two cannot drift apart. The
-  manifest also states `native_payload` / `native_tcp_offset` up front.
-- **Aux schema** is a `&'static [AuxField]` instead of `Vec<String>` /
-  `Vec<u32>`.
+The manifest is a data file next to the driver, loaded once at start-up:
+
+```rust
+static MANIFEST: &str = include_str!("../manifest.yaml");
+let manifest = ArmManifest::from_text::<Ur5, 6, 16>(MANIFEST)?;
+```
+
+[`examples/manifest.yaml`](examples/manifest.yaml) documents every key; the
+format is a strict subset of YAML and unknown keys are errors. Name, DOF,
+position limits and model capabilities come from the `ArmModel`. Velocity,
+acceleration and effort limits have no default: the file (or
+`ArmManifest::for_model` with a `JointRatings`) must give a finite, positive
+value per joint.
+
+### Buffers
+
+`CoreState` and `CoreCommand` are `#[repr(C)]` all-`f64` structs whose layout
+is the wire layout. The data plane works in place through views:
+
+```rust
+fn read_state(&mut self, buffer: &mut [f64]) -> Result<(), ArmError> {
+    let mut state = CoreStateViewMut::new(buffer)?;
+    state.clear();                                // everything NAN = "not provided"
+    state.q()[..6].copy_from_slice(&self.q);
+    *state.in_contact() = 0.0;
+    state.tail().copy_from_slice(&self.motor_temps);   // aux fields
+    Ok(())
+}
+```
+
+Slot offsets come from the struct definitions (`offset_of!`), so there is no
+`unsafe` and no copy. `CoreState::read_from` / `write_to` remain for code that
+wants an owned value.
+
+### Configuration plane
+
+| `ArmDriver` method | Driver hook | Result |
+| :-- | :-- | :-- |
+| `set_payload` | `set_payload_native` | `Applied::Native` or `Applied::Host` |
+| `set_tcp_offset` | `set_tcp_offset_native` | same |
+| `set_gravity` | `set_gravity_native` | same |
+| `set_calibration(&CalibrationData)`, `clear_calibration` | — | host model only |
+| `set_ik_max_joint_step` | — | host model only |
+
+A change is validated, offered to the controller through the hook, then
+applied to the host model, so the two cannot drift apart; a controller fault
+leaves the host model untouched. `CalibrationData` is a `KinematicChain` in
+flat, `MAX_DOF`-padded form (95 × f64).
+
+### Differences from the DexZero spec
+
+- **Errors** are an `ArmError` enum rather than `&'static str`.
+- **Aux schema** is an inline `AuxSchema` instead of `Vec<String>` / `Vec<u32>`.
 - **`dynamics`** already includes the payload, and **`inverse_kinematics`**
-  returns the solution on the seed's 2π branch.
-- **No `unsafe`**: `CoreState` / `CoreCommand` are `#[repr(C)]` all-`f64`, so a
-  consumer may overlay them on its buffer; dexhal itself offers the copying
-  `read_from` / `write_to`.
-- **Calibration and gravity** are not in the spec's control plane. Calibration
-  is typed by `DOF`, so a driver installs it on its own `Arm`; a kernel-facing
-  entry point would need a `MAX_DOF`-padded chain format.
+  returns the solution on the seed's branch or `None`.
+- **Additions**: `tool_jacobian`, `jacobian_pseudo_inverse`,
+  `inverse_dynamics`, `set_gravity`, `set_calibration`, `clear_calibration`,
+  `calibration_residual`, acceleration limits and the `native_payload` /
+  `native_tcp_offset` manifest flags.
+
+`ArmMath` is the DOF-erased form of `Arm` behind `arm()`. Its methods never
+share a name with `Arm`'s own: queries with a typed twin end in `_padded`,
+configuration methods are `apply_*`.
+
+## Tests
+
+```
+cargo test -p dexhal
+```
+
+The tests use a made-up 6R arm (`src/math/testing.rs`) that implements
+`ArmModel` the way a driver does. Real arms are tested in their own
+repositories against their real solvers.
+
+Open work is tracked in [`workitems.md`](workitems.md).

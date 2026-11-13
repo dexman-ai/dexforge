@@ -21,8 +21,9 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::arm::Pose;
-use crate::math::ssik_core::{add3, cross3, dot3};
+use crate::math::kinematics::{compose, frob_diff, Transform, IDENTITY};
+use crate::math::model::Pose;
+use crate::math::ssik_core::{cross3, dot3, mat3_mul, mat3_transpose, mat3_vec, rotation_matrix};
 
 /// Iteration ceiling of [`KinematicChain::refine_ik`].
 pub const CHAIN_IK_MAX_ITERS: usize = 12;
@@ -50,126 +51,73 @@ pub enum ModelError {
     NotRigid,
     /// Payload mass is negative.
     InvalidPayload,
+    /// A value that must be strictly positive is not.
+    NonPositive,
     /// A calibrated chain disagrees with the nominal model by more than the
     /// accepted deviation; usually a base/flange frame convention mismatch.
     ExcessiveDeviation,
 }
 
-/// Compact rigid transform used internally (27 + 9 multiplies to compose).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Rigid {
-    pub(crate) r: [[f64; 3]; 3],
-    pub(crate) p: [f64; 3],
+/// Validate a homogeneous pose and convert it to a [`Transform`].
+pub fn transform_from_pose(m: &Pose) -> Result<Transform, ModelError> {
+    if !m.iter().all(|v| v.is_finite()) {
+        return Err(ModelError::NonFinite);
+    }
+    if m[(3, 0)] != 0.0 || m[(3, 1)] != 0.0 || m[(3, 2)] != 0.0 || m[(3, 3)] != 1.0 {
+        return Err(ModelError::NotRigid);
+    }
+    let out = transform_of(m);
+    let gram = mat3_mul(&mat3_transpose(&out.r), &out.r);
+    for i in 0..3 {
+        for j in 0..3 {
+            let want = if i == j { 1.0 } else { 0.0 };
+            if (gram[i][j] - want).abs() > RIGID_ATOL {
+                return Err(ModelError::NotRigid);
+            }
+        }
+    }
+    if dot3(&out.r[0], &cross3(&out.r[1], &out.r[2])) < 0.0 {
+        return Err(ModelError::NotRigid);
+    }
+    Ok(out)
 }
 
-impl Rigid {
-    pub(crate) const IDENTITY: Rigid = Rigid {
-        r: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        p: [0.0; 3],
-    };
-
-    pub(crate) fn from_pose(m: &Pose) -> Result<Rigid, ModelError> {
-        let mut out = Rigid::IDENTITY;
-        for i in 0..3 {
-            for j in 0..3 {
-                out.r[i][j] = m[(i, j)];
-            }
-            out.p[i] = m[(i, 3)];
+/// Upper 3×4 block of a homogeneous pose, without validation.
+pub(crate) fn transform_of(m: &Pose) -> Transform {
+    let mut out = IDENTITY;
+    for i in 0..3 {
+        for j in 0..3 {
+            out.r[i][j] = m[(i, j)];
         }
-        if !m.iter().all(|v| v.is_finite()) {
-            return Err(ModelError::NonFinite);
-        }
-        if m[(3, 0)] != 0.0 || m[(3, 1)] != 0.0 || m[(3, 2)] != 0.0 || m[(3, 3)] != 1.0 {
-            return Err(ModelError::NotRigid);
-        }
-        for i in 0..3 {
-            for j in 0..3 {
-                let mut s = 0.0;
-                for k in 0..3 {
-                    s += out.r[k][i] * out.r[k][j];
-                }
-                let want = if i == j { 1.0 } else { 0.0 };
-                if (s - want).abs() > RIGID_ATOL {
-                    return Err(ModelError::NotRigid);
-                }
-            }
-        }
-        if dot3(&out.r[0], &cross3(&out.r[1], &out.r[2])) < 0.0 {
-            return Err(ModelError::NotRigid);
-        }
-        Ok(out)
+        out.t[i] = m[(i, 3)];
     }
+    out
+}
 
-    pub(crate) fn to_pose(self) -> Pose {
-        let mut m = Pose::identity();
-        for i in 0..3 {
-            for j in 0..3 {
-                m[(i, j)] = self.r[i][j];
-            }
-            m[(i, 3)] = self.p[i];
+/// Homogeneous 4×4 form of a [`Transform`].
+pub fn transform_to_pose(t: &Transform) -> Pose {
+    let mut m = Pose::identity();
+    for i in 0..3 {
+        for j in 0..3 {
+            m[(i, j)] = t.r[i][j];
         }
-        m
+        m[(i, 3)] = t.t[i];
     }
+    m
+}
 
-    #[inline]
-    pub(crate) fn rotate(&self, v: &[f64; 3]) -> [f64; 3] {
-        [
-            dot3(&self.r[0], v),
-            dot3(&self.r[1], v),
-            dot3(&self.r[2], v),
-        ]
-    }
-
-    pub(crate) fn mul(&self, b: &Rigid) -> Rigid {
-        let mut out = Rigid::IDENTITY;
-        for i in 0..3 {
-            for j in 0..3 {
-                out.r[i][j] =
-                    self.r[i][0] * b.r[0][j] + self.r[i][1] * b.r[1][j] + self.r[i][2] * b.r[2][j];
-            }
-        }
-        out.p = add3(&self.rotate(&b.p), &self.p);
-        out
-    }
-
-    /// Rotation by `angle` about the unit `axis` (Rodrigues), zero translation.
-    pub(crate) fn rotation(axis: &[f64; 3], angle: f64) -> Rigid {
-        let (s, c) = (libm::sin(angle), libm::cos(angle));
-        let t = 1.0 - c;
-        let [x, y, z] = *axis;
-        Rigid {
-            r: [
-                [c + t * x * x, t * x * y - s * z, t * x * z + s * y],
-                [t * x * y + s * z, c + t * y * y, t * y * z - s * x],
-                [t * x * z - s * y, t * y * z + s * x, c + t * z * z],
-            ],
-            p: [0.0; 3],
-        }
-    }
-
-    /// Frobenius norm of the difference of the two homogeneous matrices.
-    pub(crate) fn frob_diff(&self, o: &Rigid) -> f64 {
-        let mut s = 0.0;
-        for i in 0..3 {
-            for j in 0..3 {
-                let d = self.r[i][j] - o.r[i][j];
-                s += d * d;
-            }
-            let d = self.p[i] - o.p[i];
-            s += d * d;
-        }
-        libm::sqrt(s)
+/// Rotation by `angle` about the unit `axis`, zero translation.
+#[inline]
+pub(crate) fn rotation_about(axis: &[f64; 3], angle: f64) -> Transform {
+    Transform {
+        r: rotation_matrix(axis, angle),
+        t: [0.0; 3],
     }
 }
 
 /// Rotation vector of `a · bᵀ` (the base-frame rotation taking `b` to `a`).
 pub(crate) fn rotation_error(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [f64; 3] {
-    let mut e = [[0.0f64; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            e[i][j] = a[i][0] * b[j][0] + a[i][1] * b[j][1] + a[i][2] * b[j][2];
-        }
-    }
+    let e = mat3_mul(a, &mat3_transpose(b));
     let w = [
         0.5 * (e[2][1] - e[1][2]),
         0.5 * (e[0][2] - e[2][0]),
@@ -185,12 +133,12 @@ pub(crate) fn rotation_error(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [f64; 3] {
 }
 
 /// Pose error twist `[Δp; Δθ]` taking `current` to `target`, in the base frame.
-pub(crate) fn pose_error(target: &Rigid, current: &Rigid) -> [f64; 6] {
+pub(crate) fn pose_error(target: &Transform, current: &Transform) -> [f64; 6] {
     let w = rotation_error(&target.r, &current.r);
     [
-        target.p[0] - current.p[0],
-        target.p[1] - current.p[1],
-        target.p[2] - current.p[2],
+        target.t[0] - current.t[0],
+        target.t[1] - current.t[1],
+        target.t[2] - current.t[2],
         w[0],
         w[1],
         w[2],
@@ -327,20 +275,20 @@ pub struct ChainJoint {
 /// Per-robot serial chain of `DOF` revolute joints. See the [module docs](self).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KinematicChain<const DOF: usize> {
-    pub(crate) origin: [Rigid; DOF],
+    pub(crate) origin: [Transform; DOF],
     pub(crate) axis: [[f64; 3]; DOF],
     pub(crate) offset: [f64; DOF],
-    pub(crate) flange: Rigid,
+    pub(crate) flange: Transform,
 }
 
 impl<const DOF: usize> KinematicChain<DOF> {
     /// Build a chain from explicit joints and the last-joint → flange transform.
     pub fn new(joints: &[ChainJoint; DOF], flange: &Pose) -> Result<Self, ModelError> {
         let mut chain = KinematicChain {
-            origin: [Rigid::IDENTITY; DOF],
+            origin: [IDENTITY; DOF],
             axis: [[0.0, 0.0, 1.0]; DOF],
             offset: [0.0; DOF],
-            flange: Rigid::from_pose(flange)?,
+            flange: transform_from_pose(flange)?,
         };
         for i in 0..DOF {
             let j = &joints[i];
@@ -351,7 +299,7 @@ impl<const DOF: usize> KinematicChain<DOF> {
             if n < AXIS_MIN_NORM {
                 return Err(ModelError::DegenerateAxis);
             }
-            chain.origin[i] = Rigid::from_pose(&j.origin)?;
+            chain.origin[i] = transform_from_pose(&j.origin)?;
             chain.axis[i] = [j.axis[0] / n, j.axis[1] / n, j.axis[2] / n];
             chain.offset[i] = j.offset;
         }
@@ -365,15 +313,15 @@ impl<const DOF: usize> KinematicChain<DOF> {
     /// [`with_base`](Self::with_base) and [`with_flange`](Self::with_flange).
     pub fn from_dh(convention: DhConvention, rows: &[DhRow; DOF]) -> Result<Self, ModelError> {
         let mut chain = KinematicChain {
-            origin: [Rigid::IDENTITY; DOF],
+            origin: [IDENTITY; DOF],
             axis: [[0.0, 0.0, 1.0]; DOF],
             offset: [0.0; DOF],
-            flange: Rigid::IDENTITY,
+            flange: IDENTITY,
         };
         // Rx(alpha) with translation (a, 0, d).
         let link = |a: f64, alpha: f64, d: f64| {
-            let mut t = Rigid::rotation(&[1.0, 0.0, 0.0], alpha);
-            t.p = [a, 0.0, d];
+            let mut t = rotation_about(&[1.0, 0.0, 0.0], alpha);
+            t.t = [a, 0.0, d];
             t
         };
         for i in 0..DOF {
@@ -399,7 +347,7 @@ impl<const DOF: usize> KinematicChain<DOF> {
                     let d_prev = if i == 0 { 0.0 } else { rows[i - 1].d };
                     chain.origin[i] = link(row.a, row.alpha, d_prev);
                     if i + 1 == DOF {
-                        chain.flange.p = [0.0, 0.0, row.d];
+                        chain.flange.t = [0.0, 0.0, row.d];
                     }
                 }
             }
@@ -409,25 +357,25 @@ impl<const DOF: usize> KinematicChain<DOF> {
 
     /// Re-express the chain in a different base frame: `base · chain`.
     pub fn with_base(mut self, base: &Pose) -> Result<Self, ModelError> {
-        let base = Rigid::from_pose(base)?;
+        let base = transform_from_pose(base)?;
         if DOF == 0 {
-            self.flange = base.mul(&self.flange);
+            self.flange = compose(&base, &self.flange);
         } else {
-            self.origin[0] = base.mul(&self.origin[0]);
+            self.origin[0] = compose(&base, &self.origin[0]);
         }
         Ok(self)
     }
 
     /// Append a fixed transform after the flange: `chain · flange`.
     pub fn with_flange(mut self, flange: &Pose) -> Result<Self, ModelError> {
-        self.flange = self.flange.mul(&Rigid::from_pose(flange)?);
+        self.flange = compose(&self.flange, &transform_from_pose(flange)?);
         Ok(self)
     }
 
     /// Joint `i` as stored.
     pub fn joint(&self, i: usize) -> ChainJoint {
         ChainJoint {
-            origin: self.origin[i].to_pose(),
+            origin: transform_to_pose(&self.origin[i]),
             axis: self.axis[i],
             offset: self.offset[i],
         }
@@ -435,26 +383,32 @@ impl<const DOF: usize> KinematicChain<DOF> {
 
     /// Last-joint → flange transform.
     pub fn flange(&self) -> Pose {
-        self.flange.to_pose()
+        transform_to_pose(&self.flange)
     }
 
-    pub(crate) fn fk_jacobian_rigid(&self, q: &[f64; DOF]) -> (Rigid, [[f64; DOF]; 6]) {
-        let mut t = Rigid::IDENTITY;
+    /// Joint `i`'s moving rotation at joint value `q`.
+    #[inline]
+    pub(crate) fn joint_rotation(&self, i: usize, q: f64) -> Transform {
+        rotation_about(&self.axis[i], q + self.offset[i])
+    }
+
+    pub(crate) fn fk_jacobian_rigid(&self, q: &[f64; DOF]) -> (Transform, [[f64; DOF]; 6]) {
+        let mut t = IDENTITY;
         let mut axes = [[0.0f64; 3]; DOF];
         let mut points = [[0.0f64; 3]; DOF];
         for i in 0..DOF {
-            t = t.mul(&self.origin[i]);
-            axes[i] = t.rotate(&self.axis[i]);
-            points[i] = t.p;
-            t = t.mul(&Rigid::rotation(&self.axis[i], q[i] + self.offset[i]));
+            t = compose(&t, &self.origin[i]);
+            axes[i] = mat3_vec(&t.r, &self.axis[i]);
+            points[i] = t.t;
+            t = compose(&t, &self.joint_rotation(i, q[i]));
         }
-        t = t.mul(&self.flange);
+        t = compose(&t, &self.flange);
         let mut jac = [[0.0f64; DOF]; 6];
         for i in 0..DOF {
             let arm = [
-                t.p[0] - points[i][0],
-                t.p[1] - points[i][1],
-                t.p[2] - points[i][2],
+                t.t[0] - points[i][0],
+                t.t[1] - points[i][1],
+                t.t[2] - points[i][2],
             ];
             let lin = cross3(&axes[i], &arm);
             for r in 0..3 {
@@ -467,13 +421,11 @@ impl<const DOF: usize> KinematicChain<DOF> {
 
     /// Forward kinematics base → flange.
     pub fn fk(&self, q: &[f64; DOF]) -> Pose {
-        let mut t = Rigid::IDENTITY;
+        let mut t = IDENTITY;
         for i in 0..DOF {
-            t = t
-                .mul(&self.origin[i])
-                .mul(&Rigid::rotation(&self.axis[i], q[i] + self.offset[i]));
+            t = compose(&compose(&t, &self.origin[i]), &self.joint_rotation(i, q[i]));
         }
-        t.mul(&self.flange).to_pose()
+        transform_to_pose(&compose(&t, &self.flange))
     }
 
     /// Geometric Jacobian `[Jv; Jw]` (6 × DOF) of the flange origin, base frame.
@@ -484,7 +436,7 @@ impl<const DOF: usize> KinematicChain<DOF> {
     /// FK and Jacobian from a single pass over the chain.
     pub fn fk_jacobian(&self, q: &[f64; DOF]) -> (Pose, [[f64; DOF]; 6]) {
         let (t, j) = self.fk_jacobian_rigid(q);
-        (t.to_pose(), j)
+        (transform_to_pose(&t), j)
     }
 
     /// Polish `q` so that `fk(q)` matches `target`, starting from a nearby
@@ -494,8 +446,12 @@ impl<const DOF: usize> KinematicChain<DOF> {
     /// the final Frobenius residual `‖fk(q) − target‖`; callers accept the
     /// result against their `fk_atol`. `q` is left untouched if the target is
     /// not a rigid transform (residual `f64::INFINITY`).
+    ///
+    /// Unlike the finite-difference refiners in [`crate::math::kinematics`]
+    /// (`lm_refine`, `dls_ik`), which only need an FK closure, this uses the
+    /// chain's analytic Jacobian: one chain evaluation per iteration.
     pub fn refine_ik(&self, target: &Pose, q: &mut [f64; DOF]) -> f64 {
-        let target = match Rigid::from_pose(target) {
+        let target = match transform_from_pose(target) {
             Ok(t) => t,
             Err(_) => return f64::INFINITY,
         };
@@ -504,7 +460,7 @@ impl<const DOF: usize> KinematicChain<DOF> {
         let mut best_res = f64::INFINITY;
         for iter in 0..=CHAIN_IK_MAX_ITERS {
             let (tip, jac) = self.fk_jacobian_rigid(&cur);
-            let res = tip.frob_diff(&target);
+            let res = frob_diff(&tip, &target);
             if !res.is_finite() {
                 break;
             }
@@ -561,65 +517,20 @@ impl<const DOF: usize> KinematicChain<DOF> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::math::testing::{calibrated_chain, nominal_chain, sample_q, SIX_R_DH};
     use core::f64::consts::{FRAC_PI_2, PI};
-
-    /// Nominal UR5 DH table (standard convention), as published by Universal Robots.
-    pub(crate) const UR5_DH: [DhRow; 6] = [
-        DhRow::new(0.0, FRAC_PI_2, 0.089159, 0.0),
-        DhRow::new(-0.425, 0.0, 0.0, 0.0),
-        DhRow::new(-0.39225, 0.0, 0.0, 0.0),
-        DhRow::new(0.0, FRAC_PI_2, 0.10915, 0.0),
-        DhRow::new(0.0, -FRAC_PI_2, 0.09465, 0.0),
-        DhRow::new(0.0, 0.0, 0.0823, 0.0),
-    ];
-
-    /// Deltas of the magnitude found in a UR `calibration.conf`.
-    pub(crate) const UR5_DELTA: [DhRow; 6] = [
-        DhRow::new(1.2e-4, -3.0e-4, 2.1e-4, 4.0e-4),
-        DhRow::new(-2.5e-4, 5.0e-4, 0.0, -6.0e-4),
-        DhRow::new(3.1e-4, -2.0e-4, 0.0, 3.0e-4),
-        DhRow::new(-0.7e-4, 4.0e-4, -1.5e-4, -2.0e-4),
-        DhRow::new(0.4e-4, -1.0e-4, 0.9e-4, 5.0e-4),
-        DhRow::new(0.0, 0.0, -1.1e-4, -3.0e-4),
-    ];
-
-    pub(crate) fn ur5_nominal() -> KinematicChain<6> {
-        KinematicChain::from_dh(DhConvention::Standard, &UR5_DH).unwrap()
-    }
-
-    pub(crate) fn ur5_calibrated() -> KinematicChain<6> {
-        KinematicChain::from_dh(
-            DhConvention::Standard,
-            &apply_dh_deltas(&UR5_DH, &UR5_DELTA),
-        )
-        .unwrap()
-    }
-
-    /// Deterministic pseudo-random joint vector in `[-amp, amp]`.
-    pub(crate) fn sample_q<const DOF: usize>(seed: u64, amp: f64) -> [f64; DOF] {
-        let mut s = seed
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(0xD1B5_4A32_D192_ED03);
-        let mut q = [0.0; DOF];
-        for v in q.iter_mut() {
-            s = s
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *v = (((s >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0) * amp;
-        }
-        q
-    }
 
     fn frob(a: &Pose, b: &Pose) -> f64 {
         (a - b).norm()
     }
 
     #[test]
-    fn standard_dh_matches_ur5_home_pose() {
-        let t = ur5_nominal().fk(&[0.0; 6]);
-        let want = [-0.81725, -0.19145, -0.005491];
+    fn standard_dh_matches_the_home_pose() {
+        let t = nominal_chain().fk(&[0.0; 6]);
+        // (a2 + a3, −(d4 + d6), d1 − d5) for a shoulder / three-parallel / wrist arm.
+        let want = [-0.75, -0.19, 0.02];
         for i in 0..3 {
             assert!((t[(i, 3)] - want[i]).abs() < 1e-12, "{t}");
         }
@@ -634,32 +545,35 @@ pub(crate) mod tests {
         ];
         let q = [0.4, -0.7, 1.1];
         let chain = KinematicChain::from_dh(DhConvention::Modified, &rows).unwrap();
-        let mut want = Rigid::IDENTITY;
+        let mut want = IDENTITY;
         for i in 0..3 {
-            let mut tx = Rigid::IDENTITY;
-            tx.p = [rows[i].a, 0.0, 0.0];
-            let mut tz = Rigid::IDENTITY;
-            tz.p = [0.0, 0.0, rows[i].d];
-            want = want
-                .mul(&Rigid::rotation(&[1.0, 0.0, 0.0], rows[i].alpha))
-                .mul(&tx)
-                .mul(&Rigid::rotation(&[0.0, 0.0, 1.0], q[i] + rows[i].theta))
-                .mul(&tz);
+            let mut tx = IDENTITY;
+            tx.t = [rows[i].a, 0.0, 0.0];
+            let mut tz = IDENTITY;
+            tz.t = [0.0, 0.0, rows[i].d];
+            for step in [
+                rotation_about(&[1.0, 0.0, 0.0], rows[i].alpha),
+                tx,
+                rotation_about(&[0.0, 0.0, 1.0], q[i] + rows[i].theta),
+                tz,
+            ] {
+                want = compose(&want, &step);
+            }
         }
-        assert!(frob(&chain.fk(&q), &want.to_pose()) < 1e-12);
+        assert!(frob(&chain.fk(&q), &transform_to_pose(&want)) < 1e-12);
     }
 
     #[test]
     fn jacobian_matches_finite_difference() {
-        let chain = ur5_calibrated();
+        let chain = calibrated_chain();
         let q = sample_q::<6>(3, 2.0);
         let (pose, jac) = chain.fk_jacobian(&q);
-        let base = Rigid::from_pose(&pose).unwrap();
+        let base = transform_from_pose(&pose).unwrap();
         let h = 1e-6;
         for c in 0..6 {
             let mut qp = q;
             qp[c] += h;
-            let moved = Rigid::from_pose(&chain.fk(&qp)).unwrap();
+            let moved = transform_from_pose(&chain.fk(&qp)).unwrap();
             let twist = pose_error(&moved, &base);
             for r in 0..6 {
                 assert!((twist[r] / h - jac[r][c]).abs() < 1e-5, "row {r} col {c}");
@@ -669,8 +583,8 @@ pub(crate) mod tests {
 
     #[test]
     fn refine_ik_recovers_calibrated_solution_from_nominal() {
-        let nominal = ur5_nominal();
-        let calibrated = ur5_calibrated();
+        let nominal = nominal_chain();
+        let calibrated = calibrated_chain();
         for seed in 0..20 {
             let q_true = sample_q::<6>(seed, 2.5);
             let target = calibrated.fk(&q_true);
@@ -688,12 +602,50 @@ pub(crate) mod tests {
 
     #[test]
     fn refine_ik_reports_unreachable_target() {
-        let chain = ur5_nominal();
+        let chain = nominal_chain();
         let mut target = chain.fk(&[0.3; 6]);
         target[(0, 3)] += 5.0;
         let mut q = [0.3; 6];
         assert!(chain.refine_ik(&target, &mut q) > 1.0);
         assert!(q.iter().all(|v| v.is_finite()));
+    }
+
+    /// Vendor calibration files express near-parallel axes with DH rows whose
+    /// `d` terms are hundreds of metres and cancel (UR `calibration.conf`:
+    /// joints 2–4). With the axes exactly parallel the shift is a pure change
+    /// of gauge, so the chain must reproduce the nominal kinematics.
+    #[test]
+    fn large_cancelling_dh_offsets_keep_precision() {
+        let mut delta = [DhRow::ZERO; 6];
+        delta[1].d = 439.218_734;
+        delta[2].d = -445.602_911;
+        delta[3].d = 445.602_911 - 439.218_734;
+        let shifted =
+            KinematicChain::from_dh(DhConvention::Standard, &apply_dh_deltas(&SIX_R_DH, &delta))
+                .unwrap();
+        let nominal = nominal_chain();
+        assert!(transform_to_pose(&shifted.origin[2])[(2, 3)].abs() > 400.0);
+        for seed in 0..50 {
+            let q = sample_q::<6>(seed, 3.0);
+            let (pose, jac) = shifted.fk_jacobian(&q);
+            let (want_pose, want_jac) = nominal.fk_jacobian(&q);
+            assert!(frob(&pose, &want_pose) < 5e-12, "seed {seed}");
+            assert!(transform_from_pose(&pose).is_ok());
+            for r in 0..6 {
+                for c in 0..6 {
+                    assert!((jac[r][c] - want_jac[r][c]).abs() < 5e-12, "seed {seed}");
+                }
+            }
+            // The polish converges as on the nominal chain.
+            let mut guess = q;
+            for (i, v) in guess.iter_mut().enumerate() {
+                *v += 2e-3 * (i as f64 - 2.5);
+            }
+            assert!(
+                shifted.refine_ik(&want_pose, &mut guess) < 1e-9,
+                "seed {seed}"
+            );
+        }
     }
 
     #[test]
@@ -719,7 +671,10 @@ pub(crate) mod tests {
         );
         let mut mirror = Pose::identity();
         mirror[(2, 2)] = -1.0;
-        assert_eq!(ur5_nominal().with_base(&mirror), Err(ModelError::NotRigid));
+        assert_eq!(
+            nominal_chain().with_base(&mirror),
+            Err(ModelError::NotRigid)
+        );
     }
 
     #[test]
@@ -731,9 +686,9 @@ pub(crate) mod tests {
             ([0.0, 0.0, 1.0], PI - 1e-3),
             ([0.6, 0.0, 0.8], 2.0),
         ] {
-            let mut t = Rigid::rotation(&axis, angle);
-            t.p = [0.1, -0.2, 0.3];
-            let pose = t.to_pose();
+            let mut t = rotation_about(&axis, angle);
+            t.t = [0.1, -0.2, 0.3];
+            let pose = transform_to_pose(&t);
             let back = pose_from_xyz_quat(&pose_to_xyz_quat(&pose)).unwrap();
             assert!(frob(&pose, &back) < 1e-12, "axis {axis:?}");
         }
