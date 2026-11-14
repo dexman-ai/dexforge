@@ -183,11 +183,8 @@ def test_cross_validate_solve(request: pytest.FixtureRequest) -> None:
                     break
 
                 if base not in SOUNDNESS_ONLY_ARMS:
-                    if not any(
-                        _q_close_mod(ref_q, r_q, tol=STRICT_TOL)
-                        or _q_close_mod(ref_q, r_q, tol=DEDUP_TOL)
-                        for ref_q in py_qs
-                    ):
+                    tol = DEDUP_TOL if (case.singular or base == "xarm7") else STRICT_TOL
+                    if not any(_q_close_mod(ref_q, r_q, tol=tol) for ref_q in py_qs):
                         mismatches += 1
                         pose_failed = True
                         break
@@ -195,15 +192,19 @@ def test_cross_validate_solve(request: pytest.FixtureRequest) -> None:
             if pose_failed:
                 continue
 
-            if not case.singular and len(py_qs) == len(rust_qs):
-                for ref_q in py_qs:
-                    if not any(
-                        _q_close_mod(ref_q, r_q, tol=STRICT_TOL)
-                        or _q_close_mod(ref_q, r_q, tol=DEDUP_TOL)
-                        for r_q in rust_qs
-                    ):
-                        mismatches += 1
-                        break
+            if not case.singular:
+                if base != "xarm7" and len(py_qs) != len(rust_qs):
+                    mismatches += 1
+                    continue
+                if len(rust_qs) > len(py_qs):
+                    mismatches += 1
+                    continue
+                if len(py_qs) == len(rust_qs):
+                    tol = DEDUP_TOL if base == "xarm7" else STRICT_TOL
+                    for ref_q in py_qs:
+                        if not any(_q_close_mod(ref_q, r_q, tol=tol) for r_q in rust_qs):
+                            mismatches += 1
+                            break
 
         assert mismatches == 0, (
             f"{arm_name}: {mismatches}/{len(cases)} poses had mismatched solution sets"

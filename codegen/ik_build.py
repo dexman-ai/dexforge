@@ -214,7 +214,7 @@ def write_generated_files(
     rust_files_written: list[str] = []
     for filename, content in files.items():
         if filename == "lib.rs":
-            dest = output_dir / "lib.rs"
+            dest = output_dir / "src" / "lib.rs"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
@@ -264,12 +264,23 @@ def run_py_scripts(
     :returns: ``(script_name, error_output)`` when a script fails, else ``None``.
     """
 
+    import os
+
+    env = os.environ.copy()
+    existing_py_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{_REPO_ROOT}{os.pathsep}{existing_py_path}"
+        if existing_py_path
+        else str(_REPO_ROOT)
+    )
+
     for filename, path in sorted(generator_scripts.items()):
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
 
+        driver_dir = path.parent.parent
         # Ensure the driver directory exists for scripts that write ``../foo.rs``.
-        (path.parent.parent).mkdir(parents=True, exist_ok=True)
+        driver_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[ik_generator]   Running {path.relative_to(output_dir)} …")
         result = subprocess.run(
@@ -277,12 +288,18 @@ def run_py_scripts(
             capture_output=True,
             text=True,
             cwd=str(output_dir),
+            env=env,
         )
         if result.returncode != 0:
             error = (result.stderr + result.stdout).strip()
             print(f"[ik_generator]   ✗ {filename} failed:\n{error}")
             return (filename, error)
         print(f"[ik_generator]   ✓ {filename} succeeded.")
+
+        # Refresh mod.rs so any auxiliary .rs files emitted by generate_code.py
+        # (such as consts.rs or pq.rs) are declared in the driver module.
+        all_rs = [p.name for p in sorted(driver_dir.glob("*.rs"))]
+        _ensure_arm_mod_rs(output_dir, driver_dir.name, driver_dir.name, all_rs)
 
     return None
 

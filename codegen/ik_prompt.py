@@ -212,7 +212,7 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
         if "husty_pfurner" in ssik_artifact or "polynomial" in ssik_artifact:
             # Category 4: Non-SRS 7-DOF (Flexiv, xArm7)
             # Requires the Husty-Pfurner polynomial loop template.
-            return "xarm7", 256, 7
+            return "rizon4", 256, 7
         else:
             # Category 3: Canonical SRS / jointlock 7-DOF (Franka, KUKA, xArm7)
             # Requires the standard Joint-Lock + SP6 template.
@@ -226,8 +226,8 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
             return "piper", 16, 6
         else:
             # Category 1: Pieper-compliant 6-DOF (UR5, Puma, ABB, Fanuc)
-            # Requires the fast SP6 template.
-            return "ur5", 8, 6
+            # Requires the fast SP6 template (16-slot output array).
+            return "ur5", 16, 6
 
     else:
         raise ValueError(
@@ -269,11 +269,24 @@ def generate_context(
     if not base_link or not ee_link:
         raise ValueError("--urdf requires both --base and --ee to be specified.")
     
-    # use an existing artifact, or generate it from the URDF if it doesn't exist yet
-    # first, try ssik.prebuilt.<stem> where stem is derived from the URDF filename (e.g. "ur5_ik" from "ur5.urdf")
-    # if that fails, try the URDF path directly (in case the user provided a path to a generated artifact instead of a URDF)
-    stem_candidate = urdf_path.stem + "_ik"  # e.g. "ur5_ik" from "ur5.urdf"
-    ssik_artifact, artifact_stem = try_load_prebuilt_artifact(stem_candidate)  # try loading by stem first (common case for prebuilt artifacts):
+    # Use a prebuilt artifact only when its BASE_LINK, EE_LINK, and source URDF
+    # match the requested inputs; otherwise compile a fresh artifact from the URDF.
+    stem_candidate = urdf_path.stem + "_ik"
+    ssik_artifact, artifact_stem = try_load_prebuilt_artifact(stem_candidate)
+    if ssik_artifact is not None and artifact_stem is not None:
+        mb = re.search(r'^BASE_LINK\s*=\s*["\']([^"\']+)["\']', ssik_artifact, re.MULTILINE)
+        me = re.search(r'^EE_LINK\s*=\s*["\']([^"\']+)["\']', ssik_artifact, re.MULTILINE)
+        art_base = mb.group(1) if mb else None
+        art_ee = me.group(1) if me else None
+        repo_driver = _resolve_repo_driver_dir(repo_root, urdf_path.stem)
+        repo_urdf = (repo_driver / f"{urdf_path.stem}.urdf") if repo_driver is not None else None
+        same_urdf = (
+            repo_urdf is not None
+            and repo_urdf.is_file()
+            and Path(urdf_path).read_bytes() == repo_urdf.read_bytes()
+        )
+        if art_base != base_link or art_ee != ee_link or not same_urdf:
+            ssik_artifact, artifact_stem = None, None
 
     if ssik_artifact is None or artifact_stem is None:
         ssik_artifact, artifact_stem = generate_artifact_from_urdf(

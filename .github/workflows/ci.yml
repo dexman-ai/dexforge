@@ -67,10 +67,10 @@ jobs:
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          path: repos/${{ matrix.oem }}/target
+          key: ${{ runner.os }}-cargo-build-${{ matrix.oem }}-${{ hashFiles('repos/**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-cargo-build-${{ matrix.oem }}-
 
       - name: Run OEM Rust tests
         run: cargo test --release --manifest-path repos/${{ matrix.oem }}/rust/Cargo.toml
@@ -113,7 +113,7 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install pytest numpy sympy $(grep '^ssik==' SSIK_VERSION.txt)
+          python -m pip install pytest numpy sympy pin $(grep '^ssik==' SSIK_VERSION.txt)
 
       - name: Verify ssik reference data version
         run: |

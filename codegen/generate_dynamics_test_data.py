@@ -69,7 +69,11 @@ if str(_CODEGEN_DIR) not in sys.path:
     sys.path.insert(0, str(_CODEGEN_DIR))
 
 from generate_dynamics import (  # noqa: E402
+    _normalize_axis,
+    build_fk,
+    compute_base_alignment_rotation,
     extract_base_ee_links,
+    extract_chain,
     load_artifact,
     order_urdf_chain,
     parse_urdf_joints,
@@ -133,9 +137,88 @@ def _resolve_chain_endpoints(
         b = base_link or cand_b
         e = ee_link or cand_e
         if b in link_names and e in link_names:
-            return b, e
+            try:
+                order_urdf_chain(parse_urdf_joints(urdf_path), base_link=b, ee_link=e)
+                return b, e
+            except ValueError:
+                continue
 
     return base_link, ee_link
+
+
+def _resolve_urdf_chain(
+    urdf_path: Path,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+    arm: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+):
+    """Resolve and order the selected ``base_link -> ee_link`` URDF joint chain."""
+    b, e = _resolve_chain_endpoints(
+        urdf_path,
+        base_link=base_link,
+        ee_link=ee_link,
+        arm=arm,
+        output_dir=output_dir,
+    )
+    joints = parse_urdf_joints(urdf_path)
+    if b is None and e is None:
+        actuated = [jt for jt in joints if jt.actuated]
+        act_parents = {jt.parent for jt in actuated}
+        act_children = {jt.child for jt in actuated}
+        starts = [jt.parent for jt in actuated if jt.parent not in act_children]
+        ends = [jt.child for jt in actuated if jt.child not in act_parents]
+        if len(starts) == 1 and len(ends) == 1:
+            chain = order_urdf_chain(joints, base_link=starts[0], ee_link=ends[0])
+        else:
+            chain = order_urdf_chain(joints, base_link=None, ee_link=None)
+    else:
+        chain = order_urdf_chain(joints, base_link=b, ee_link=e)
+
+    if not chain:
+        raise ValueError(
+            f"URDF chain is empty for {urdf_path} (base={b!r}, ee={e!r})"
+        )
+    return chain
+
+
+def _resolve_base_alignment_rotation(
+    urdf_path: Path,
+    chain,
+    arm: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+) -> np.ndarray:
+    """Compute ``R_base`` mapping URDF base -> ssik artifact base frame when available."""
+    n_act = sum(1 for jt in chain if jt.actuated)
+    arm_stem = arm or urdf_path.stem
+    artifact_candidates: List[str] = []
+    if output_dir is not None:
+        exact_matches = [
+            output_dir / f"{arm_stem}_ik.py",
+            output_dir / "codegen" / f"{arm_stem}_ik.py",
+        ]
+        for p in exact_matches:
+            if p.is_file():
+                artifact_candidates.append(str(p))
+        for art_path in (
+            *sorted(output_dir.glob("*_ik.py")),
+            *sorted(output_dir.glob("codegen/*_ik.py")),
+        ):
+            if str(art_path) not in artifact_candidates:
+                artifact_candidates.append(str(art_path))
+    artifact_candidates.append(f"{arm_stem}_ik")
+
+    for cand in artifact_candidates:
+        try:
+            mod = load_artifact(cand)
+            t_lefts, axes, t_rights, n = extract_chain(mod)
+            if n != n_act:
+                continue
+            _, _, frames = build_fk(t_lefts, axes, t_rights)
+            return compute_base_alignment_rotation(axes, frames, chain)
+        except Exception:  # noqa: BLE001
+            continue
+    return np.eye(3, dtype=np.float64)
 
 
 def _build_chain_urdf_xml(
@@ -155,41 +238,24 @@ def _build_chain_urdf_xml(
       ``base_link``'s frame).
     * Side branches and any joints past ``ee_link`` (such as actuated gripper
       fingers) are excluded.
-    * Only child links of actuated joints on the chain retain ``<inertial>``
-      blocks, matching ``generate_dynamics.build_bodies``.
+    * Child links at or after the first actuated joint on the chain retain
+      ``<inertial>`` blocks, matching ``generate_dynamics.build_bodies``.
     """
-    b, e = _resolve_chain_endpoints(
+    chain = _resolve_urdf_chain(
         urdf_path,
         base_link=base_link,
         ee_link=ee_link,
         arm=arm,
         output_dir=output_dir,
     )
-    joints = parse_urdf_joints(urdf_path)
-    try:
-        chain = order_urdf_chain(joints, base_link=b, ee_link=e)
-    except ValueError:
-        if b is not None or e is not None:
-            raise
-        # When neither endpoint was specified and the URDF has fixed helper
-        # branches (e.g. world->base_link or ee_link->tool0), fall back to the
-        # unique contiguous actuated chain if one exists.
-        actuated = [jt for jt in joints if jt.actuated]
-        act_parents = {jt.parent for jt in actuated}
-        act_children = {jt.child for jt in actuated}
-        starts = [jt.parent for jt in actuated if jt.parent not in act_children]
-        ends = [jt.child for jt in actuated if jt.child not in act_parents]
-        if len(starts) == 1 and len(ends) == 1:
-            chain = order_urdf_chain(joints, base_link=starts[0], ee_link=ends[0])
-        else:
-            raise
 
-    if not chain:
-        raise ValueError(
-            f"URDF chain is empty for {urdf_path} (base={b!r}, ee={e!r})"
-        )
-
-    actuated_child_links = {jt.child for jt in chain if jt.actuated}
+    moving_child_links = set()
+    seen_actuated = False
+    for jt in chain:
+        if jt.actuated:
+            seen_actuated = True
+        if seen_actuated:
+            moving_child_links.add(jt.child)
     chain_links = {chain[0].parent} | {jt.child for jt in chain}
 
     root = ET.parse(urdf_path).getroot()
@@ -199,7 +265,7 @@ def _build_chain_urdf_xml(
         if lname not in chain_links:
             continue
         link_copy = ET.Element("link", link.attrib)
-        if lname in actuated_child_links:
+        if lname in moving_child_links:
             inertial = link.find("inertial")
             if inertial is not None:
                 link_copy.append(inertial)
@@ -207,7 +273,26 @@ def _build_chain_urdf_xml(
 
     joint_by_name = {j.get("name"): j for j in root.findall("joint")}
     for jt in chain:
-        out_root.append(joint_by_name[jt.name])
+        orig_j = joint_by_name[jt.name]
+        j_copy = ET.fromstring(ET.tostring(orig_j, encoding="unicode"))
+        if jt.actuated:
+            ux, uy, uz = _normalize_axis(jt.axis, jt.name)
+            axis_el = j_copy.find("axis")
+            if axis_el is None:
+                axis_el = ET.SubElement(j_copy, "axis")
+            axis_el.set("xyz", f"{ux} {uy} {uz}")
+            if jt.jtype in ("revolute", "prismatic") and j_copy.find("limit") is None:
+                ET.SubElement(
+                    j_copy,
+                    "limit",
+                    {
+                        "effort": "100.0",
+                        "lower": "-3.141592653589793",
+                        "upper": "3.141592653589793",
+                        "velocity": "10.0",
+                    },
+                )
+        out_root.append(j_copy)
 
     return ET.tostring(out_root, encoding="unicode")
 
@@ -231,6 +316,19 @@ def build_dataset(
     """
     import pinocchio as pin
 
+    chain = _resolve_urdf_chain(
+        urdf_path,
+        base_link=base_link,
+        ee_link=ee_link,
+        arm=arm,
+        output_dir=output_dir,
+    )
+    r_base = _resolve_base_alignment_rotation(
+        urdf_path,
+        chain,
+        arm=arm,
+        output_dir=output_dir,
+    )
     xml_str = _build_chain_urdf_xml(
         urdf_path,
         base_link=base_link,
@@ -239,7 +337,8 @@ def build_dataset(
         output_dir=output_dir,
     )
     model = pin.buildModelFromXML(xml_str)
-    model.gravity.linear = np.asarray(gravity, dtype=np.float64)
+    # Express the kinematics-frame gravity vector in the URDF root frame.
+    model.gravity.linear = r_base.T @ np.asarray(gravity, dtype=np.float64)
     data = model.createData()
     dof = int(model.nv)
 

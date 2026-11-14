@@ -289,3 +289,73 @@ def test_emit_dynamics_parity_rs_checks_finiteness_and_custom_gravity():
     assert 'dynamics_test_data::GRAVITY.iter().all(|g| g.is_finite())' in rs
     assert "[0.0, 0.0, -9.81]" not in rs
 
+
+def test_non_unit_urdf_axis_is_normalized_and_zero_axis_rejected(tmp_path):
+    artifact, urdf = _write_fixtures(tmp_path)
+    scaled_urdf = tmp_path / "scaled_axis.urdf"
+    scaled_urdf.write_text(
+        urdf.read_text(encoding="utf-8").replace('axis xyz="0 0 1"', 'axis xyz="0 0 2"'),
+        encoding="utf-8",
+    )
+    mod = G.load_artifact(str(artifact))
+    t_lefts, axes, t_rights, _ = G.extract_chain(mod)
+    _, q_syms, frames = G.build_fk(t_lefts, axes, t_rights)
+    dyn_unit = G.build_dynamics(axes, frames, t_rights, q_syms, urdf, "base", "l2")
+    dyn_scaled = G.build_dynamics(axes, frames, t_rights, q_syms, scaled_urdf, "base", "l2")
+    assert sp.simplify(dyn_unit.gravity - dyn_scaled.gravity) == sp.zeros(2, 1)
+    assert sp.simplify(dyn_unit.mass_matrix - dyn_scaled.mass_matrix) == sp.zeros(2, 2)
+
+    zero_urdf = tmp_path / "zero_axis.urdf"
+    zero_urdf.write_text(
+        urdf.read_text(encoding="utf-8").replace('axis xyz="0 0 1"', 'axis xyz="0 0 0"'),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="zero"):
+        G.build_dynamics(axes, frames, t_rights, q_syms, zero_urdf, "base", "l2")
+
+
+def test_rotated_base_frame_aligns_horizontal_gravity_with_pinocchio(tmp_path):
+    pytest.importorskip("pinocchio")
+    import generate_dynamics_test_data as GD
+
+    _, urdf = _write_fixtures(tmp_path)
+    # Artifact uses a base frame rotated 180 deg about Z relative to the URDF:
+    # at q=0, link 1 extends along -X in the artifact frame and +X in the URDF frame.
+    artifact = tmp_path / "rot_rr_ik.py"
+    artifact.write_text(
+        "import numpy as np\n"
+        'BASE_LINK = "base"\n'
+        'EE_LINK = "l2"\n'
+        "DOF = 2\n"
+        "def _tx(d):\n"
+        "    m = np.eye(4); m[0, 3] = d; return m\n"
+        "_JOINT_AXES = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 1.0])]\n"
+        f"_JOINT_T_LEFTS = [np.eye(4), _tx({-L1})]\n"
+        f"_JOINT_T_RIGHTS = [np.eye(4), _tx({-L2})]\n",
+        encoding="utf-8",
+    )
+    mod = G.load_artifact(str(artifact))
+    t_lefts, axes, t_rights, _ = G.extract_chain(mod)
+    _, q_syms, frames = G.build_fk(t_lefts, axes, t_rights)
+    dyn = G.build_dynamics(axes, frames, t_rights, q_syms, urdf, "base", "l2")
+    grav_f = sp.lambdify(q_syms + dyn.gravity_syms, dyn.gravity, "numpy")
+
+    horiz_g = (3.5, -4.2, -9.81)
+    dof, _, cases = GD.build_dataset(
+        urdf,
+        samples=8,
+        seed=0,
+        qd_limit=1.0,
+        qdd_limit=2.0,
+        gravity=horiz_g,
+        base_link="base",
+        ee_link="l2",
+        arm="rot_rr",
+        output_dir=tmp_path,
+    )
+    assert dof == 2
+    for q, _qd, _qdd, g_pin, _m, _c, _tau in cases:
+        g_sym = np.asarray(grav_f(*q, *horiz_g), dtype=float).reshape(-1)
+        assert np.allclose(g_sym, g_pin, atol=1e-6)
+
+

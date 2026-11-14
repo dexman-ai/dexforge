@@ -693,15 +693,104 @@ def _wire_generated_dynamics_module(driver_dir: Path) -> None:
     mod_path.write_text(text, encoding="utf-8")
 
 
+def _parse_triple_floats(
+    text: Optional[str], default: Tuple[float, float, float]
+) -> Tuple[float, float, float]:
+    if text is None:
+        return default
+    parts = [float(v) for v in text.split()]
+    if len(parts) != 3:
+        raise ValueError(f"expected 3 values, got {text!r}")
+    return (parts[0], parts[1], parts[2])
+
+
+def _extract_urdf_kinematic_signature(
+    urdf_path: Path, base_link: str, ee_link: str
+) -> List[tuple]:
+    """Extract the normalized kinematic joint chain signature from *urdf_path*."""
+    import math
+
+    root = ET.parse(urdf_path).getroot()
+    by_child: Dict[str, tuple] = {}
+    for j in root.findall("joint"):
+        parent_el = j.find("parent")
+        child_el = j.find("child")
+        if parent_el is None or child_el is None:
+            continue
+        parent = parent_el.get("link", "")
+        child = child_el.get("link", "")
+        jtype = j.get("type", "fixed")
+        axis_el = j.find("axis")
+        ax = _parse_triple_floats(
+            axis_el.get("xyz") if axis_el is not None else None, (0.0, 0.0, 1.0)
+        )
+        if jtype in ("revolute", "continuous", "prismatic"):
+            norm = math.sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2])
+            if norm < 1e-12:
+                raise ValueError(f"joint {j.get('name')!r} has zero-length axis")
+            ax = (
+                round(ax[0] / norm, 9),
+                round(ax[1] / norm, 9),
+                round(ax[2] / norm, 9),
+            )
+        else:
+            ax = (0.0, 0.0, 0.0)
+        origin_el = j.find("origin")
+        xyz = tuple(
+            round(v, 9)
+            for v in _parse_triple_floats(
+                origin_el.get("xyz") if origin_el is not None else None,
+                (0.0, 0.0, 0.0),
+            )
+        )
+        rpy = tuple(
+            round(v, 9)
+            for v in _parse_triple_floats(
+                origin_el.get("rpy") if origin_el is not None else None,
+                (0.0, 0.0, 0.0),
+            )
+        )
+        by_child[child] = (j.get("name", ""), jtype, parent, child, ax, xyz, rpy)
+
+    if ee_link not in by_child:
+        raise ValueError(
+            f"ee_link {ee_link!r} not found as a child link in {urdf_path}"
+        )
+    rev_chain: List[tuple] = []
+    link = ee_link
+    visited = set()
+    while link != base_link and link in by_child:
+        if link in visited:
+            raise ValueError(f"cycle in URDF chain at {link!r}")
+        visited.add(link)
+        entry = by_child[link]
+        rev_chain.append(entry)
+        link = entry[2]
+    if link != base_link:
+        raise ValueError(
+            f"URDF chain from {ee_link!r} did not reach base_link {base_link!r}"
+        )
+    return list(reversed(rev_chain))
+
+
 def _cached_driver_inputs_match(
     driver_src: Path,
     urdf: Path,
     base_link: Optional[str],
     ee_link: Optional[str],
 ) -> bool:
-    """Return ``True`` iff *urdf* and ``(base_link, ee_link)`` match *driver_src*'s cached inputs."""
+    """Validate *urdf* and ``(base_link, ee_link)`` for ``--from-existing``.
+
+    Returns ``True`` when the cached dynamics + Pinocchio dataset in *driver_src*
+    can be reused directly, or ``False`` when only ``<inertial>`` / non-kinematic
+    URDF data changed (so dynamics and Pinocchio ground truth must be
+    regenerated).
+
+    :raises ValueError: If ``(base_link, ee_link)`` or the URDF's joint
+        kinematics differ from the committed driver (since ``--from-existing``
+        reuses the committed IK solver and kinematics artifact).
+    """
     import re
-    from generate_dynamics import extract_base_ee_links
 
     arm = driver_src.name
     cached_urdf = driver_src / f"{arm}.urdf"
@@ -710,12 +799,6 @@ def _cached_driver_inputs_match(
         if len(urdfs) != 1:
             return False
         cached_urdf = urdfs[0]
-
-    try:
-        if Path(urdf).read_bytes() != cached_urdf.read_bytes():
-            return False
-    except OSError:
-        return False
 
     cached_base: Optional[str] = None
     cached_ee: Optional[str] = None
@@ -730,6 +813,8 @@ def _cached_driver_inputs_match(
             cached_ee = me.group(1)
 
     if cached_base is None or cached_ee is None:
+        from generate_dynamics import extract_base_ee_links
+
         for cand in (
             *sorted(driver_src.glob("*_ik.py")),
             *sorted(driver_src.glob("codegen/*_ik.py")),
@@ -745,9 +830,48 @@ def _cached_driver_inputs_match(
             except Exception:  # noqa: BLE001
                 continue
 
-    if cached_base is None or cached_ee is None:
+    if cached_base is not None and cached_ee is not None:
+        if base_link != cached_base or ee_link != cached_ee:
+            raise ValueError(
+                f"--from-existing for {arm!r} requires --base {cached_base!r} "
+                f"and --ee {cached_ee!r} to match the existing IK solver "
+                f"(got --base {base_link!r}, --ee {ee_link!r}). Omit "
+                f"--from-existing to compile a driver for different frames."
+            )
+
+    try:
+        if Path(urdf).read_bytes() == cached_urdf.read_bytes():
+            return True
+    except OSError:
         return False
-    return base_link == cached_base and ee_link == cached_ee
+
+    if base_link and ee_link:
+        try:
+            cached_sig = _extract_urdf_kinematic_signature(
+                cached_urdf, base_link, ee_link
+            )
+        except Exception:  # noqa: BLE001
+            cached_sig = None
+        if cached_sig is not None:
+            try:
+                new_sig = _extract_urdf_kinematic_signature(
+                    Path(urdf), base_link, ee_link
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"--from-existing URDF {urdf} is incompatible with the "
+                    f"existing {arm!r} kinematic chain ({base_link!r} -> "
+                    f"{ee_link!r}): {exc}"
+                ) from exc
+            if new_sig != cached_sig:
+                raise ValueError(
+                    f"--from-existing cannot change joint kinematics for {arm!r} "
+                    f"(the existing IK solver and FK/Jacobian artifact are baked "
+                    f"for the committed geometry; only <inertial> changes are "
+                    f"supported with --from-existing)."
+                )
+
+    return False
 
 
 def ensure_dynamics_parity(
@@ -933,7 +1057,7 @@ def _build(args: argparse.Namespace) -> int:
                     stale_path = seeded_driver / stale
                     if stale_path.is_file():
                         stale_path.unlink()
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
             print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
             return 1
         print(f"[dexforge]   \u2713 seeded '{arm}' driver under {base}.")
@@ -950,7 +1074,7 @@ def _build(args: argparse.Namespace) -> int:
             ee_link=args.ee,
             repo_root=repo_root,
             output_dir=base,
-            oem_name=urdf.stem,
+            oem_name=args.name or urdf.stem,
             max_retries=max_retries,
             llm_key=args.llm_key,
             llm_url=args.llm_url,

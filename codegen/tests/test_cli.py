@@ -443,6 +443,58 @@ class UrdfBuildTests(unittest.TestCase):
             parity.assert_called_once()
             self.assertTrue(parity.call_args.kwargs.get("force"))
 
+    def test_from_existing_rejects_frame_or_kinematic_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src_urdf = _REPO_ROOT / "repos" / "dexforge-ur" / "rust" / "src" / "drivers" / "ur5" / "ur5.urdf"
+            if not src_urdf.is_file():
+                self.skipTest("ur5.urdf not available")
+            out = Path(tmp) / "seeded_bad_ee"
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+                code = cli.main(
+                    [
+                        "build",
+                        "--urdf",
+                        str(src_urdf),
+                        "--base",
+                        "base_link",
+                        "--ee",
+                        "tool0",
+                        "-o",
+                        str(out),
+                        "--from-existing",
+                        "--no-verify",
+                    ]
+                )
+            self.assertEqual(code, 1)
+            self.assertIn("--from-existing", err.getvalue())
+
+            kin_modified = Path(tmp) / "ur5.urdf"
+            kin_modified.write_text(
+                src_urdf.read_text(encoding="utf-8").replace(
+                    'xyz="0.0 0.0 0.089159"', 'xyz="0.0 0.0 0.250000"'
+                ),
+                encoding="utf-8",
+            )
+            out2 = Path(tmp) / "seeded_bad_kin"
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err2:
+                code2 = cli.main(
+                    [
+                        "build",
+                        "--urdf",
+                        str(kin_modified),
+                        "--base",
+                        "base_link",
+                        "--ee",
+                        "ee_link",
+                        "-o",
+                        str(out2),
+                        "--from-existing",
+                        "--no-verify",
+                    ]
+                )
+            self.assertEqual(code2, 1)
+            self.assertIn("kinematics", err2.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

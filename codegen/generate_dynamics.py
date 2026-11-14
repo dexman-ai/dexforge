@@ -369,6 +369,18 @@ def parse_urdf_joints(path: Path) -> List[UrdfJoint]:
     return joints
 
 
+def _normalize_axis(
+    axis: Tuple[float, float, float], joint_name: str = "?"
+) -> Tuple[float, float, float]:
+    """Normalize a 3D joint axis to unit length, rejecting zero vectors."""
+    ax = np.asarray(axis, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(ax))
+    if not np.isfinite(norm) or norm < 1e-12:
+        raise ValueError(f"joint {joint_name!r} has zero or non-finite axis {axis!r}")
+    unit = ax / norm
+    return (float(unit[0]), float(unit[1]), float(unit[2]))
+
+
 def order_urdf_chain(
     joints: List[UrdfJoint],
     base_link: Optional[str] = None,
@@ -376,9 +388,10 @@ def order_urdf_chain(
 ) -> List[UrdfJoint]:
     """Order URDF joints into the serial base->ee chain.
 
-    The URDF may contain extra side branches; for the common base->ee case we
-    simply walk the first child edge at each link and verify it lands on
-    ``ee_link``.
+    Every link in a URDF tree has at most one parent joint (``by_child``),
+    whereas a link may have multiple child joints (helper frames, camera
+    mounts, etc.). Walking backward from ``ee_link`` via ``by_child`` therefore
+    uniquely recovers the ``base_link -> ee_link`` path even in branched URDFs.
     """
     by_parent: Dict[str, List[UrdfJoint]] = {}
     by_child: Dict[str, UrdfJoint] = {}
@@ -400,34 +413,24 @@ def order_urdf_chain(
         base_link = roots[0]
         ee_link = leaves[0]
 
-    if base_link is not None and ee_link is not None:
-        chain: List[UrdfJoint] = []
-        link = base_link
-        visited = set()
-        while link != ee_link:
-            if link in visited:
-                raise ValueError(f"URDF chain contains a cycle at link {link!r}")
-            visited.add(link)
-            outgoing = by_parent.get(link)
-            if not outgoing:
-                raise ValueError(f"URDF chain stopped before reaching ee_link at {link!r}")
-            jt = outgoing[0]
-            chain.append(jt)
-            link = jt.child
-        return chain
-
-    if base_link is None:
-        assert ee_link is not None
+    if ee_link is not None:
+        if ee_link not in by_child:
+            raise ValueError(f"URDF chain stopped before reaching ee_link at {ee_link!r}")
         reverse_chain: List[UrdfJoint] = []
         link = ee_link
         visited = set()
-        while link in by_child:
+        while link != base_link and link in by_child:
             if link in visited:
                 raise ValueError(f"URDF chain contains a cycle at link {link!r}")
             visited.add(link)
             jt = by_child[link]
             reverse_chain.append(jt)
             link = jt.parent
+        if base_link is not None and link != base_link:
+            raise ValueError(
+                f"URDF chain stopped before reaching ee_link at {ee_link!r} "
+                f"from base_link {base_link!r}"
+            )
         return list(reversed(reverse_chain))
 
     link = base_link
@@ -445,6 +448,8 @@ def order_urdf_chain(
         jt = outgoing[0]
         chain.append(jt)
         link = jt.child
+    if not chain:
+        raise ValueError(f"URDF chain has no outgoing joints from base_link {base_link!r}")
     return chain
 
 
@@ -491,6 +496,98 @@ def _urdf_origin_transform(jt: UrdfJoint) -> sp.Matrix:
     return t
 
 
+def compute_base_alignment_rotation(
+    axes: List[sp.Matrix],
+    frames: List[sp.Matrix],
+    urdf_chain: List[UrdfJoint],
+) -> np.ndarray:
+    """Compute the constant rotation ``R_base`` mapping URDF base -> ssik base frame.
+
+    Some prebuilt ssik artifacts (notably ``ur5_ik``) use a base frame rotated
+    relative to the raw URDF ``base_link`` (e.g. ROS ``base_link_inertia`` is
+    rotated 180° about Z). Pre-multiplying the URDF chain by ``R_base`` aligns
+    the dynamics gravity vector with the ``fk`` / ``jacobian`` frame.
+    """
+    actuated = [jt for jt in urdf_chain if jt.actuated]
+    if len(actuated) != len(axes):
+        raise ValueError(
+            f"URDF actuated joints ({len(actuated)}) != artifact DOF ({len(axes)})"
+        )
+
+    zero_subs = {s: 0 for f in frames for s in f.free_symbols}
+    z_ssik: List[np.ndarray] = []
+    p_ssik: List[np.ndarray] = []
+    for ax, fr in zip(axes, frames):
+        fr0 = np.array(fr.subs(zero_subs).tolist(), dtype=np.float64)
+        ax0 = np.array(ax.tolist(), dtype=np.float64).reshape(3)
+        norm_s = float(np.linalg.norm(ax0))
+        if norm_s < 1e-12:
+            raise ValueError("ssik artifact contains zero-length joint axis")
+        z_ssik.append(fr0[:3, :3] @ (ax0 / norm_s))
+        p_ssik.append(fr0[:3, 3])
+
+    t_cum = np.eye(4, dtype=np.float64)
+    z_urdf: List[np.ndarray] = []
+    p_urdf: List[np.ndarray] = []
+    for jt in urdf_chain:
+        t_cum = t_cum @ np.array(_urdf_origin_transform(jt).tolist(), dtype=np.float64)
+        if not jt.actuated:
+            continue
+        ax_u = np.asarray(_normalize_axis(jt.axis, jt.name), dtype=np.float64)
+        z_urdf.append(t_cum[:3, :3] @ ax_u)
+        p_urdf.append(t_cum[:3, 3].copy())
+
+    u_vecs = list(z_urdf)
+    s_vecs = list(z_ssik)
+    for i in range(len(z_urdf)):
+        for j in range(i + 1, len(z_urdf)):
+            cu = np.cross(z_urdf[i], z_urdf[j])
+            cs = np.cross(z_ssik[i], z_ssik[j])
+            nu = float(np.linalg.norm(cu))
+            ns = float(np.linalg.norm(cs))
+            if nu > 1e-6 and ns > 1e-6:
+                u_vecs.append(cu / nu)
+                s_vecs.append(cs / ns)
+
+    if len(u_vecs) == len(z_urdf) and z_urdf:
+        for i in range(1, len(p_urdf)):
+            du = p_urdf[i] - p_urdf[0]
+            du = du - np.dot(du, z_urdf[0]) * z_urdf[0]
+            ds = p_ssik[i] - p_ssik[0]
+            ds = ds - np.dot(ds, z_ssik[0]) * z_ssik[0]
+            nu = float(np.linalg.norm(du))
+            ns = float(np.linalg.norm(ds))
+            if nu > 1e-6 and ns > 1e-6:
+                du = du / nu
+                ds = ds / ns
+                u_vecs.append(du)
+                s_vecs.append(ds)
+                u_vecs.append(np.cross(z_urdf[0], du))
+                s_vecs.append(np.cross(z_ssik[0], ds))
+                break
+
+    if not u_vecs:
+        return np.eye(3, dtype=np.float64)
+
+    u_mat = np.column_stack(u_vecs)
+    s_mat = np.column_stack(s_vecs)
+    u_svd, _, vt_svd = np.linalg.svd(s_mat @ u_mat.T)
+    det = float(np.linalg.det(u_svd @ vt_svd))
+    r_base = u_svd @ np.diag([1.0, 1.0, 1.0 if det >= 0.0 else -1.0]) @ vt_svd
+
+    # Snap near-integer signed-permutation matrices (e.g. I_3 or Rz(pi)) to exact
+    # integers so small float noise in baked ssik constants does not pollute CSE.
+    rounded = np.round(r_base)
+    if (
+        np.max(np.abs(r_base - rounded)) < 1e-3
+        and np.allclose(rounded @ rounded.T, np.eye(3))
+        and abs(np.linalg.det(rounded) - 1.0) < 1e-6
+    ):
+        r_base = rounded.astype(np.float64)
+
+    return r_base
+
+
 def build_bodies(
     axes: List[sp.Matrix],
     frames: List[sp.Matrix],
@@ -498,20 +595,20 @@ def build_bodies(
     q_syms: List[sp.Symbol],
     urdf_chain: List[UrdfJoint],
 ) -> Tuple[List[RigidBody], List[sp.Matrix], List[sp.Matrix]]:
-    """Place URDF inertials with **URDF** joint kinematics (not ssik frames).
+    """Place URDF inertials with **URDF** joint kinematics aligned to the ssik base frame.
 
     The ssik artifact and a raw URDF can disagree on intermediate link-frame
-    axes even when end-effector FK matches up to a fixed base offset. Pinocchio
-    loads the URDF directly, so COM poses and joint axes used for the energy
-    method must follow the URDF product ``T = ∏ Origin_i · Rot(axis_i, q_i)``.
+    axes or a constant base-frame rotation (e.g. ``ur5.urdf`` vs ``ur5_ik``).
+    We pre-multiply the URDF chain by the constant base-frame alignment rotation
+    ``R_base`` so ``gravity(q, g)`` uses the same base frame as ``fk(q)`` and
+    ``jacobian(q)``, while intermediate link frames follow the URDF product
+    ``T = R_base · ∏ Origin_i · Rot(axis_i, q_i)``.
 
     :returns: ``(bodies, urdf_axes, urdf_frames)`` where ``urdf_frames[i]`` is
         the base→joint-i frame *after* ``Origin_i`` and *before* the joint
-        rotation, and ``urdf_axes[i]`` is the joint axis in that local frame.
-        The ssik ``axes`` / ``frames`` / ``t_rights`` arguments are only used
-        to validate DOF count.
+        rotation, and ``urdf_axes[i]`` is the unit joint axis in that local frame.
     """
-    del frames, t_rights
+    del t_rights
     actuated = [jt for jt in urdf_chain if jt.actuated]
     if len(actuated) != len(axes):
         raise ValueError(
@@ -521,25 +618,29 @@ def build_bodies(
             "in the artifact chain."
         )
 
+    r_base = compute_base_alignment_rotation(axes, frames, urdf_chain)
+
     bodies: List[RigidBody] = []
     urdf_axes: List[sp.Matrix] = []
     urdf_frames: List[sp.Matrix] = []
     t_cum = sp.eye(4)
+    t_cum[:3, :3] = _snap_matrix(sp.Matrix(r_base.tolist()))
     qi = 0
     for jt in urdf_chain:
         t_cum = t_cum * _urdf_origin_transform(jt)
-        if not jt.actuated:
-            continue
-        if qi >= len(q_syms):
-            raise ValueError("URDF actuated joints exceed artifact DOF while walking the chain")
-        q = q_syms[qi]
-        axis_local = sp.Matrix([_snap(v) for v in jt.axis])
-        urdf_frames.append(t_cum)
-        urdf_axes.append(axis_local)
-        t_cum = t_cum * _axis_angle_rot(axis_local, q)
+        if jt.actuated:
+            if qi >= len(q_syms):
+                raise ValueError("URDF actuated joints exceed artifact DOF while walking the chain")
+            q = q_syms[qi]
+            unit_axis = _normalize_axis(jt.axis, jt.name)
+            axis_local = sp.Matrix([_snap(v) for v in unit_axis])
+            urdf_frames.append(t_cum)
+            urdf_axes.append(axis_local)
+            t_cum = t_cum * _axis_angle_rot(axis_local, q)
+            qi += 1
 
         inertial = jt.child_inertial
-        if inertial is not None and inertial.mass > 0.0:
+        if qi > 0 and inertial is not None and inertial.mass > 0.0:
             r_link = t_cum[:3, :3]
             p_link = t_cum[:3, 3]
             com_local = sp.Matrix([_snap(v) for v in inertial.com_xyz])
@@ -561,10 +662,9 @@ def build_bodies(
                     p_com=p_com,
                     r_inertia=r_inertia,
                     inertia_local=inertia_local,
-                    n_preceding=qi + 1,
+                    n_preceding=qi,
                 )
             )
-        qi += 1
 
     if qi != len(q_syms):
         raise ValueError(
