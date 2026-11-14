@@ -87,5 +87,34 @@ class WriteGeneratedFilesTests(unittest.TestCase):
             self.assertIn("pub mod demo;", drivers_mod)
 
 
+    def test_shared_rizon_helper_is_copied_and_declared(self) -> None:
+        # A driver modelled on the Rizon example imports crate::drivers::rizon_common.
+        for uses_helper in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                solver = (
+                    "use crate::drivers::rizon_common::{self, Model};\n"
+                    if uses_helper
+                    else "// solver\n"
+                )
+                ik_build.write_generated_files(
+                    output_dir=tmp_path,
+                    repo_root=_REPO_ROOT,
+                    arm_name="demo",
+                    oem_name="OEM",
+                    files={"ik_solver.rs": solver},
+                    ssik_artifact="# demo artifact\n",
+                    context="demo context\n",
+                    source_urdf=None,
+                )
+                helper = tmp_path / "src" / "drivers" / "rizon_common.rs"
+                drivers_mod = (tmp_path / "src" / "drivers" / "mod.rs").read_text(
+                    encoding="utf-8"
+                )
+                self.assertEqual(helper.is_file(), uses_helper)
+                self.assertEqual("pub mod rizon_common;" in drivers_mod, uses_helper)
+                self.assertIn("pub mod demo;", drivers_mod)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -151,8 +151,15 @@ panic = "abort"
 """
 
 
-def _lib_rs(crate_name: str, arm: str) -> str:
-    """Render the stand-alone crate's ``src/lib.rs``."""
+def _lib_rs(crate_name: str, arm: str, with_dynamics: bool = True) -> str:
+    """Render the stand-alone crate's ``src/lib.rs``.
+
+    The ``generated_dynamics`` re-export is emitted only when the driver has that
+    module; otherwise the crate would fail with an unresolved import.
+    """
+    dynamics_reexport = (
+        f"pub use drivers::{arm}::generated_dynamics;\n" if with_dynamics else ""
+    )
     return f"""\
 //! Stand-alone `{arm}` rigid-body driver (kinematics + dynamics),
 //! compiled by `dexforge build`.
@@ -175,8 +182,7 @@ pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};
 // `dexforge build`. Re-exported so consumers reach the full
 // kinematics + dynamics suite at the crate root.
 pub use drivers::{arm}::generated_kinematics;
-pub use drivers::{arm}::generated_dynamics;
-"""
+{dynamics_reexport}"""
 
 
 def _drivers_mod_rs(arm: str, shared_modules: Sequence[str]) -> str:
@@ -346,7 +352,14 @@ def plan_export(
 
     generated: List[tuple] = [
         (out_dir / "Cargo.toml", _cargo_toml(crate_name, arm)),
-        (out_dir / "src" / "lib.rs", _lib_rs(crate_name, arm)),
+        (
+            out_dir / "src" / "lib.rs",
+            _lib_rs(
+                crate_name,
+                arm,
+                with_dynamics=(driver_src / "generated_dynamics.rs").is_file(),
+            ),
+        ),
         (out_dir / "src" / "drivers" / "mod.rs", _drivers_mod_rs(arm, shared_modules)),
     ]
 
@@ -662,8 +675,24 @@ def generate_ik(
 generate_driver_from_urdf = generate_ik
 
 
+def _reexport_generated_dynamics(driver_dir: Path) -> None:
+    """Add the crate-root ``generated_dynamics`` re-export once the module exists.
+
+    ``plan_export`` omits it for an arm without dynamics; when the dynamics step
+    later writes ``generated_dynamics.rs``, the crate root must expose it again.
+    """
+    lib_path = driver_dir.parent.parent / "lib.rs"
+    if not (driver_dir / "generated_dynamics.rs").is_file() or not lib_path.is_file():
+        return
+    line = f"pub use drivers::{driver_dir.name}::generated_dynamics;"
+    text = lib_path.read_text(encoding="utf-8")
+    if line not in text:
+        lib_path.write_text(text.rstrip("\n") + "\n" + line + "\n", encoding="utf-8")
+
+
 def _wire_generated_dynamics_module(driver_dir: Path) -> None:
     """Ensure the per-arm ``mod.rs`` compiles kinematics + dynamics kernels."""
+    _reexport_generated_dynamics(driver_dir)
     mod_path = driver_dir / "mod.rs"
     required = (
         "pub mod arm;",

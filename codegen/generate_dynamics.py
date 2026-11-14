@@ -577,9 +577,11 @@ def compute_base_alignment_rotation(
 
     # Snap near-integer signed-permutation matrices (e.g. I_3 or Rz(pi)) to exact
     # integers so small float noise in baked ssik constants does not pollute CSE.
+    # The threshold only absorbs float noise (~1e-12); a real base tilt, however
+    # small, is kept so the gravity direction is not silently altered.
     rounded = np.round(r_base)
     if (
-        np.max(np.abs(r_base - rounded)) < 1e-3
+        np.max(np.abs(r_base - rounded)) < 1e-9
         and np.allclose(rounded @ rounded.T, np.eye(3))
         and abs(np.linalg.det(rounded) - 1.0) < 1e-6
     ):

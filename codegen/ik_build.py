@@ -23,6 +23,10 @@ if str(_CODEGEN_DIR) not in sys.path:
     sys.path.insert(0, str(_CODEGEN_DIR))
 
 from repo_paths import math_src as _math_src  # noqa: E402
+from repo_paths import (  # noqa: E402
+    SHARED_DRIVER_MODULES as _SHARED_DRIVER_MODULES,
+    resolve_shared_driver_module as _resolve_shared_driver_module,
+)
 
 
 def _driver_dir(output_root: Path, oem_name: str, arm_name: str) -> Path:
@@ -105,13 +109,40 @@ pub use drivers::{arm_name}::generated_kinematics;
 pub use drivers::{arm_name}::generated_dynamics;
 """
 
+def _copy_shared_driver_modules(repo_root: Path, output_root: Path, driver_dir: Path) -> None:
+    """Copy shared ``crate::drivers::<module>`` helpers the generated driver uses.
+
+    A driver modelled on the Rizon example imports ``crate::drivers::rizon_common``;
+    without this copy the generated crate fails with an unresolved import.
+    """
+    sources = "\n".join(
+        rs.read_text(encoding="utf-8") for rs in sorted(driver_dir.glob("*.rs"))
+    )
+    for module in _SHARED_DRIVER_MODULES:
+        if f"drivers::{module}" not in sources:
+            continue
+        src = _resolve_shared_driver_module(repo_root, module)
+        if src is None:
+            raise FileNotFoundError(f"missing shared driver module: {module}.rs")
+        dst = output_root / "src" / "drivers" / f"{module}.rs"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(_vendor_math_source(src.read_text(encoding="utf-8")), encoding="utf-8")
+        print(f"[ik_generator]   Copied shared module {dst.relative_to(output_root)}")
+
+
 def _ensure_arm_mod_rs(output_root: Path, oem_name: str, arm_name: str, rust_files: list[str]) -> None:
     """Create the arm module files in the generated crate if missing."""
     drivers_mod = output_root / "src" / "drivers" / "mod.rs"
     drivers_mod.parent.mkdir(parents=True, exist_ok=True)
+    # Declare any shared helper modules present in the crate (e.g. rizon_common).
+    shared = [
+        m for m in _SHARED_DRIVER_MODULES
+        if (output_root / "src" / "drivers" / f"{m}.rs").is_file()
+    ]
     drivers_mod.write_text(
         "//! Driver module index (compiled by dexforge build).\n\n"
-        f"pub mod {arm_name};\n",
+        + "".join(f"pub mod {m};\n" for m in shared)
+        + f"pub mod {arm_name};\n",
         encoding="utf-8",
     )
     print(f"[ik_generator]   Created {drivers_mod.relative_to(output_root)}")
@@ -243,6 +274,9 @@ def write_generated_files(
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
             print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)}")
+
+    # Pull in shared helper modules the generated driver references.
+    _copy_shared_driver_modules(repo_root, output_dir, driver_dir)
 
     # Ensure mod.rs exists for the new driver
     _ensure_arm_mod_rs(output_dir, oem_name, arm_name, rust_files_written)

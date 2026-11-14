@@ -359,3 +359,36 @@ def test_rotated_base_frame_aligns_horizontal_gravity_with_pinocchio(tmp_path):
         assert np.allclose(g_sym, g_pin, atol=1e-6)
 
 
+def _base_alignment_for(angle: float):
+    """R_base for a 3-joint chain whose ssik frame is the URDF frame rotated about Z."""
+    c, s = np.cos(angle), np.sin(angle)
+    r_true = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    axes_urdf = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0])]
+    positions = [np.zeros(3), np.array([0.0, 0.0, 0.3]), np.array([0.2, 0.1, 0.6])]
+    axes = [sp.Matrix(r_true @ a) for a in axes_urdf]
+    frames = [
+        sp.Matrix(np.block([[np.eye(3), (r_true @ p)[:, None]], [np.zeros((1, 3)), np.ones((1, 1))]]))
+        for p in positions
+    ]
+    chain, prev = [], np.zeros(3)
+    for i, (a, p) in enumerate(zip(axes_urdf, positions)):
+        chain.append(
+            G.UrdfJoint(
+                name=f"j{i}", jtype="revolute", parent=f"l{i}", child=f"l{i + 1}",
+                axis=tuple(a), origin_xyz=tuple(p - prev), origin_rpy=(0.0, 0.0, 0.0),
+                child_inertial=None,
+            )
+        )
+        prev = p
+    return G.compute_base_alignment_rotation(axes, frames, chain), r_true
+
+
+def test_base_alignment_snaps_float_noise_but_keeps_small_real_tilt():
+    # Float noise and an exact 180 deg rotation snap to an exact integer matrix.
+    for angle in (1e-12, np.pi):
+        r_base, _ = _base_alignment_for(angle)
+        assert np.array_equal(r_base, np.round(r_base))
+    # A real 1e-4 rad base tilt must survive, or gravity direction is silently altered.
+    r_base, r_true = _base_alignment_for(1e-4)
+    assert not np.array_equal(r_base, np.round(r_base))
+    assert np.allclose(r_base, r_true, atol=1e-12)

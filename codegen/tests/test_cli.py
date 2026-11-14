@@ -111,6 +111,36 @@ class PlanExportTests(unittest.TestCase):
         self.assertIn("pub use drivers::ur5::generated_dynamics;", lib)
         self.assertIn("#![no_std]", lib)
 
+    def test_lib_rs_reexports_dynamics_only_when_module_exists(self) -> None:
+        # An arm without generated_dynamics.rs must still export a crate that compiles.
+        self.assertNotIn(
+            "generated_dynamics", cli._lib_rs("demo_ik_driver", "demo", with_dynamics=False)
+        )
+        for arm in ("ur5", "rizon4"):
+            has_dynamics = (cli._driver_dir(_REPO_ROOT, arm) / "generated_dynamics.rs").is_file()
+            with tempfile.TemporaryDirectory() as tmp:
+                export = cli.plan_export(arm, Path(tmp), _REPO_ROOT)
+            lib = next(c for d, c in export.generated if d.name == "lib.rs")
+            self.assertEqual(
+                f"pub use drivers::{arm}::generated_dynamics;" in lib, has_dynamics, arm
+            )
+
+    def test_wiring_restores_dynamics_reexport_once(self) -> None:
+        # When the dynamics step later writes generated_dynamics.rs, lib.rs re-exports it once.
+        with tempfile.TemporaryDirectory() as tmp:
+            crate = Path(tmp)
+            driver = crate / "src" / "drivers" / "demo"
+            driver.mkdir(parents=True)
+            (crate / "src" / "lib.rs").write_text(
+                cli._lib_rs("demo_ik_driver", "demo", with_dynamics=False), encoding="utf-8"
+            )
+            (driver / "mod.rs").write_text("pub mod ik_solver;\n", encoding="utf-8")
+            (driver / "generated_dynamics.rs").write_text("// dyn\n", encoding="utf-8")
+            cli._wire_generated_dynamics_module(driver)
+            cli._wire_generated_dynamics_module(driver)
+            lib = (crate / "src" / "lib.rs").read_text(encoding="utf-8")
+            self.assertEqual(lib.count("pub use drivers::demo::generated_dynamics;"), 1)
+
     def test_cargo_toml_has_only_minimal_deps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             export = cli.plan_export("ur5", Path(tmp), _REPO_ROOT)
