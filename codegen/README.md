@@ -171,6 +171,48 @@ The coding agent executes the deterministic generators in order and runs the tes
 
 ---
 
+## Generator Technical Details
+
+### Symbolic Kinematics & Dynamics (`generate_dynamics.py`)
+
+`codegen/generate_dynamics.py` is an offline symbolic compiler:
+- **Kinematics from the `ssik` artifact:** It sources the product-of-exponentials chain (`_JOINT_T_LEFTS`, `_JOINT_AXES`, `_JOINT_T_RIGHTS`) directly from `<arm>_ik.py`, derives closed-form forward kinematics (`fk(q: &[f64; N]) -> [[f64; 4]; 4]`) and the geometric Jacobian (`jacobian(q: &[f64; N]) -> [[f64; N]; 6]`, rows `[Jv; Jw]`), and emits branch-free `sympy.cse()` expressions using `libm::*` transcendentals and `core::f64::consts::PI`.
+- **Manipulator dynamics from the URDF:** When `--urdf <file>` carries `<inertial>` blocks for the actuated links, the compiler aligns the URDF base frame to the `ssik` base frame (`R_base`) and derives the Lagrangian rigid-body dynamics:
+
+| Function | Returns | Meaning |
+| :--- | :--- | :--- |
+| `gravity(q, g_world)` | `[f64; N]` | Holding torque $\tau = \partial U / \partial q$ for $U = -\sum m_i (g \cdot p_{\text{com},i})$ |
+| `mass_matrix(q)` | `[[f64; N]; N]` | Symmetric joint-space inertia $M = \sum (m_i J_{v,i}^T J_{v,i} + J_{w,i}^T R_i I_i R_i^T J_{w,i})$ |
+| `coriolis(q, qd)` | `[f64; N]` | Velocity-product torque $C(q, \dot{q})\dot{q}$ from the Christoffel symbols of the first kind |
+| `inverse_dynamics(q, qd, qdd, g_world)` | `[f64; N]` | Feed-forward torque $\tau = M(q)\ddot{q} + C(q, \dot{q})\dot{q} + g(q)$ |
+
+Writing to `generated_dynamics.rs` also emits the sibling `generated_kinematics.rs` (`pub use super::generated_dynamics::{fk, jacobian, DOF};`) so the CSE expressions are compiled once.
+
+### Pinocchio Dynamics Ground Truth (`generate_dynamics_test_data.py`)
+
+`codegen/generate_dynamics_test_data.py` is a one-time generator that builds a restricted Pinocchio model for the exact `base_link -> ee_link` serial chain (stripping world pre-transforms and gripper finger branches), samples 1,000 random `(q, qd, qdd)` states within joint limits, and evaluates:
+- `computeGeneralizedGravity` $\rightarrow$ `g(q)`
+- `crba` (symmetrized) $\rightarrow$ `M(q)`
+- `computeCoriolisMatrix(q, qd) @ qd` $\rightarrow$ `C(q, qd) qd`
+- `rnea(q, qd, qdd)` $\rightarrow$ `tau`
+
+It writes `dynamics_test_data.bin`, `dynamics_test_data.rs`, and `dynamics_parity.rs` into the driver directory. Day-to-day `cargo test` runs in pure Rust without requiring Pinocchio.
+
+### Deterministic Spatial Bypass for General 6R (`Raghavan-Roth`)
+
+In Python `ssik`, general 6R solvers (`ikgeo.general_6r`) fall back to a randomized Möbius reparameterization and generalized eigenvalue solve when the equilibrated leading matrix is ill-conditioned (`cond > 1e10`). Because real-time `#![no_std]` drivers forbid RNG and unbounded solvers, translated Rust drivers (e.g. `piper`) replace the Möbius fallback with a **deterministic spatial bypass**: when the unperturbed companion-matrix pass is ill-conditioned or yields no closing in-limit root, the target pose is nudged by 10 µm along fixed tool-frame axes (`PERTURBATIONS`), solved algebraically, and snapped back onto the exact unperturbed target via bounded Levenberg-Marquardt refinement (`lm_refine6`).
+
+### `ssik` Version Locking
+
+All generated IK artifacts and `test_data.bin` files are locked to the `ssik` version in [`SSIK_VERSION.txt`](../SSIK_VERSION.txt):
+```sh
+pip install $(grep ssik SSIK_VERSION.txt)
+python codegen/ik_test_data.py --check
+```
+See [`upgrade_ssik_version.md`](upgrade_ssik_version.md) when upgrading `SSIK_VERSION.txt`.
+
+---
+
 ## Contents of `codegen/`
 
 | File | Role in the New Design |

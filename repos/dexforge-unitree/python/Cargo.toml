@@ -13,3 +13,7 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 dexforge-unitree-core = { path = "../rust" }
 nalgebra = { version = "0.33", default-features = false, features = ["libm"] }
+
+# Standalone workspace root: keeps cargo from attaching this crate to the parent repo workspace.
+[workspace]
+
