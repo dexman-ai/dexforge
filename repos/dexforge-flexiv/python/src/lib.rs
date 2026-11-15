@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 
 use dexforge_flexiv_core::rizon10::ik_solver::{fk as rizon10_fk_core, solve as rizon10_solve_core, DOF as RIZON10_DOF, MAX_SOLUTIONS as RIZON10_MAX_SOLUTIONS};
 use dexforge_flexiv_core::rizon4::ik_solver::{fk as rizon4_fk_core, solve as rizon4_solve_core, DOF as RIZON4_DOF, MAX_SOLUTIONS as RIZON4_MAX_SOLUTIONS};
-use dexforge_flexiv_core::TolerancePolicy;
+use dexforge_flexiv_core::rizon4::ik_solver::TolerancePolicy;
 
 fn extract_matrix_4x4(obj: &Bound<'_, PyAny>) -> PyResult<SMatrix<f64, 4, 4>> {
 	let rows: Vec<Vec<f64>> = if let Ok(lst) = obj.call_method0("tolist") {
