@@ -1,0 +1,15 @@
+[package]
+name = "dexforge-mock-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Mock arm driver (vendor \"mock\") for integration testing dexhal clients"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+name = "dexforge_mock_core"
+path = "src/lib.rs"
+
+[dependencies]
+dexhal = { path = "../.." }

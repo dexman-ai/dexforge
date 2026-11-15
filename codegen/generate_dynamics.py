@@ -38,17 +38,19 @@ Usage::
     # From a ssik prebuilt artifact name (looks up ssik.prebuilt.<name>):
     python codegen/generate_dynamics.py --artifact ur5_ik
 
-    # From a local artifact .py file, writing to a driver module:
+    # From a local artifact .py file, writing into a driver module; this also
+    # writes the sibling ``generated_kinematics.rs`` (``pub use`` of fk/jacobian):
     python codegen/generate_dynamics.py --artifact /path/to/my_arm_ik.py \
-        --output src/drivers/my_arm/dynamics.rs
+        --output repos/dexforge-<oem>/rust/src/drivers/my_arm/generated_dynamics.rs
 
     # Also emit inverse-dynamics (gravity / mass-matrix / Coriolis) by sourcing
     # the link masses + inertias from a URDF whose actuated-joint order matches
     # the artifact (the URDF supplies the *physical* properties the kinematics
     # artifact does not carry):
-    python codegen/generate_dynamics.py --artifact ur5_ik \
-        --urdf src/drivers/ur5/ur5_inertial.urdf \
-        --output src/drivers/ur5/dynamics.rs
+    python codegen/generate_dynamics.py \
+        --artifact repos/dexforge-ur/rust/src/drivers/ur5/codegen/ur5_ik.py \
+        --urdf repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf \
+        --output repos/dexforge-ur/rust/src/drivers/ur5/generated_dynamics.rs
 
 Dynamics (runtime gravity, mass matrix, Coriolis, inverse dynamics)
 -----------------------------------------------------------
@@ -73,8 +75,6 @@ joints contribute to the linear Jacobian only and carry no angular inertia term.
 from __future__ import annotations
 
 import argparse
-import importlib
-import importlib.util
 import sys
 import types
 import xml.etree.ElementTree as ET
@@ -96,39 +96,10 @@ _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
 # numerically faithful to the reference.
 _SNAP_TOL = 1e-12
 
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
 
-# ---------------------------------------------------------------------------
-# ssik artifact loading
-# ---------------------------------------------------------------------------
-
-
-def load_artifact(artifact: str) -> types.ModuleType:
-    """Import a ssik artifact by prebuilt name or by path to a ``*_ik.py`` file.
-
-    :param artifact: Either a bare module name (e.g. ``"ur5_ik"``) resolved
-        against ``ssik.prebuilt``, or a filesystem path to an artifact module.
-    :returns: The imported module exposing ``_JOINT_AXES``, ``_JOINT_T_LEFTS``
-        and ``_JOINT_T_RIGHTS`` (and usually ``DOF``).
-    :raises ImportError: If neither resolution strategy succeeds.
-    """
-    candidate = Path(artifact)
-    if candidate.exists():
-        spec = importlib.util.spec_from_file_location(candidate.stem, candidate)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load artifact module from {candidate}")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    name = artifact[:-3] if artifact.endswith(".py") else artifact
-    try:
-        return importlib.import_module(f"ssik.prebuilt.{name}")
-    except ModuleNotFoundError as exc:
-        raise ImportError(
-            f"Cannot find {artifact!r} as a file or as ssik.prebuilt.{name}. "
-            "Install ssik (`pip install ssik`) or pass a path to the artifact file."
-        ) from exc
+from ssik_artifact import load_artifact  # noqa: E402  (re-exported for callers)
 
 
 def _snap(value: float) -> sp.Expr:
@@ -932,7 +903,7 @@ def _emit_fn_matrix(
     arg_unpacks: List[str],
     printer: NoStdRustPrinter,
 ) -> None:
-    repls, reduced = sp.cse(list(matrix), optimizations="basic")
+    repls, reduced = sp.cse(list(matrix), optimizations=[])
     reduced_mat = sp.Matrix(rows, cols, reduced)
     out.append(signature)
     out.extend(arg_unpacks)
@@ -952,7 +923,7 @@ def _emit_fn_vector(
     arg_unpacks: List[str],
     printer: NoStdRustPrinter,
 ) -> None:
-    repls, reduced = sp.cse(list(vector), optimizations="basic")
+    repls, reduced = sp.cse(list(vector), optimizations=[])
     reduced_vec = sp.Matrix(reduced)
     out.append(signature)
     out.extend(arg_unpacks)
@@ -1168,9 +1139,26 @@ def generate(
         sys.stdout.write(rust)
     else:
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(rust)
+        output.write_text(rust, encoding="utf-8", newline="\n")
         print(f"[generate_dynamics] wrote {output}", file=sys.stderr)
+        if output.name == "generated_dynamics.rs":
+            kin = output.with_name("generated_kinematics.rs")
+            kin.write_text(generate_kinematics_rs(arm), encoding="utf-8", newline="\n")
+            print(f"[generate_dynamics] wrote {kin}", file=sys.stderr)
     return 0
+
+
+def generate_kinematics_rs(arm: str) -> str:
+    """The ``generated_kinematics.rs`` shim: FK / Jacobian views of ``generated_dynamics``."""
+    return (
+        f"//! Flange FK and Jacobian of the {arm} arm.\n"
+        "//!\n"
+        f"//! Auto-generated by `codegen/{Path(__file__).name}` next to `generated_dynamics.rs`;\n"
+        "//! do not edit by hand. Both are emitted from the same symbolic chain, so the\n"
+        "//! kinematics consumed by `arm.rs` and by the dynamics never drift apart.\n"
+        "\n"
+        "pub use super::generated_dynamics::{fk, jacobian, DOF};\n"
+    )
 
 
 # ---------------------------------------------------------------------------

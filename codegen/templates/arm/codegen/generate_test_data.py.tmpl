@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Generate the ssik IK reference dataset for the {{arm_title}} driver.
+
+Provenance for ``../test_data.bin`` and ``../test_data.rs``:
+
+1. Sample in-limit joint vectors and take ``T = fk(q)`` from the sibling ssik
+   artifact ``{{arm}}_ik.py`` (reachable SE(3) targets by construction).
+2. Run the reference ``solve(T, respect_limits=False)`` and keep poses with
+   more than one solution until {{n_cases}} cases are collected.
+3. Write the cases with ``codegen.ik_test_data.write_ik_test_data``.
+
+Scaffolded by ``codegen/scaffold.py`` for the {{family_title}} family. If the
+reference driver ({{reference_driver_dir}}/codegen/generate_test_data.py)
+polishes solutions (shared Gauss-Newton refinement) or splits strict /
+singular cases, mirror that here and in ``ik_solver.rs``.
+
+Usage (from the repository root, with the locked ``ssik`` installed)::
+
+    python {{script_path}}
+
+The RNG seed is fixed so regeneration is deterministic.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import math
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+_CODEGEN_DIR = Path(__file__).resolve().parent
+_DRIVER_DIR = _CODEGEN_DIR.parent
+
+
+def _find_repo_root() -> Path:
+    """The dexforge checkout: an ancestor holding codegen/ik_test_data.py, or $DEXFORGE_ROOT."""
+    for p in _DRIVER_DIR.parents:
+        if (p / "codegen" / "ik_test_data.py").is_file():
+            return p
+    env = os.environ.get("DEXFORGE_ROOT")
+    if env and (Path(env) / "codegen" / "ik_test_data.py").is_file():
+        return Path(env)
+    raise SystemExit("cannot locate the dexforge repository; set DEXFORGE_ROOT")
+
+
+_REPO_ROOT = _find_repo_root()
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from codegen.ik_test_data import IKCase, write_ik_test_data  # noqa: E402
+
+ARM = "{{arm}}"
+DOF = {{dof}}
+N_CASES = {{n_cases}}
+MAX_ATTEMPTS = 40 * N_CASES
+SEED = 12345
+HAS_SINGULAR_TUPLE = False
+ALLOW_REFINEMENT = False
+REFINEMENT_MAX_ITERS = 15
+
+
+def _load_artifact():
+    path = _CODEGEN_DIR / f"{ARM}_ik.py"
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    sys.dont_write_bytecode = True
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _sampling_limits(ik):
+    out = []
+    for lim in ik._JOINT_LIMITS:
+        lo, hi = (-math.pi, math.pi) if lim is None else (float(lim[0]), float(lim[1]))
+        out.append((max(lo, -2.0 * math.pi), min(hi, 2.0 * math.pi)))
+    return out
+
+
+def main() -> None:
+    ik = _load_artifact()
+    rng = np.random.default_rng(SEED)
+    lims = _sampling_limits(ik)
+
+    cases = []
+    attempts = 0
+    while len(cases) < N_CASES and attempts < MAX_ATTEMPTS:
+        attempts += 1
+        q = np.array([rng.uniform(lo, hi) for lo, hi in lims])
+        T = ik.fk(q)
+        sols = ik.solve(T, respect_limits=False)
+        if len(sols) > 1:
+            qs = [list(map(float, s.q)) for s in sols]
+            cases.append(IKCase(q_fk=q.tolist(), tf=T.reshape(-1).tolist(), solutions=qs))
+
+    counts: dict = {}
+    for c in cases:
+        counts[len(c.solutions)] = counts.get(len(c.solutions), 0) + 1
+    print(f"attempts {attempts} cases {len(cases)}")
+    print("solution-count distribution:", dict(sorted(counts.items())))
+
+    bin_path, rs_path = write_ik_test_data(
+        driver_dir=_DRIVER_DIR,
+        arm=ARM,
+        dof=DOF,
+        cases=cases,
+        has_singular_tuple=HAS_SINGULAR_TUPLE,
+        allow_refinement=ALLOW_REFINEMENT,
+        refinement_max_iters=REFINEMENT_MAX_ITERS,
+    )
+    print(f"wrote {bin_path} ({bin_path.stat().st_size} bytes) and {rs_path}")
+
+
+if __name__ == "__main__":
+    main()

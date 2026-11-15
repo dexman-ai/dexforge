@@ -1,5 +1,5 @@
 [workspace]
-members = ["repos/dexhal"]
+members = ["repos/dexhal", "repos/dexhal/mock/rust"]
 resolver = "2"
 
 [profile.release]

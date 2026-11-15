@@ -31,19 +31,44 @@ import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 _CODEGEN_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _CODEGEN_DIR.parent
-if str(_CODEGEN_DIR) not in sys.path:
-    sys.path.insert(0, str(_CODEGEN_DIR))
-
-from repo_paths import list_known_arms, resolve_arm_driver_dir  # noqa: E402
 
 MAGIC = b"DXIK"
 FORMAT_VERSION = 1
+
+
+def iter_oem_driver_roots(repo_root: Path) -> Iterable[Path]:
+    """Yield ``repos/dexforge-*/rust/src/drivers`` directories for every OEM package."""
+    repos = repo_root / "repos"
+    if repos.is_dir():
+        for drivers in sorted(repos.glob("dexforge-*/rust/src/drivers")):
+            if drivers.is_dir():
+                yield drivers
+
+
+def resolve_arm_driver_dir(repo_root: Path, arm: str) -> Optional[Path]:
+    """Resolve the on-disk driver directory for *arm*, or ``None``."""
+    arm = str(arm)
+    for drivers_root in iter_oem_driver_roots(repo_root):
+        candidate = drivers_root / arm
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def list_known_arms(repo_root: Path) -> List[str]:
+    """Return arm directory names discovered under OEM driver trees."""
+    arms: List[str] = []
+    for drivers_root in iter_oem_driver_roots(repo_root):
+        for child in sorted(drivers_root.iterdir()):
+            if child.is_dir() and not child.name.startswith("."):
+                arms.append(child.name)
+    return sorted(set(arms))
 
 
 @dataclass(frozen=True)

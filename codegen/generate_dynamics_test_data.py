@@ -761,18 +761,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         required=True,
         help="URDF carrying <inertial> blocks (same one the generated Rust used).",
     )
-    out_group = parser.add_mutually_exclusive_group(required=True)
-    out_group.add_argument(
+    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=None,
+        required=True,
         help="Driver directory that receives dynamics_test_data.rs + .bin.",
-    )
-    out_group.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help=argparse.SUPPRESS,  # backwards-compat alias; use --output-dir
     )
     parser.add_argument("--arm", default=None, help="Arm name for docs (default: URDF stem).")
     parser.add_argument(
@@ -818,15 +811,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[generate_dynamics_test_data] ERROR: URDF not found: {args.urdf}", file=sys.stderr)
         return 1
 
-    out_dir = args.output_dir
-    # Legacy: if someone still passes --output pointing at a .rs file, use its parent.
-    if args.output is not None:
-        out_dir = args.output.parent if args.output.suffix == ".rs" else args.output
-
     try:
         write_ground_truth(
             urdf=args.urdf,
-            output_dir=out_dir,
+            output_dir=args.output_dir,
             arm=args.arm,
             samples=args.samples,
             seed=args.seed,

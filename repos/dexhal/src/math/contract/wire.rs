@@ -152,24 +152,41 @@ impl Writer<'_> {
 
 /// Typed prefix of the driver → kernel state buffer. Fields the hardware does
 /// not provide stay `NAN`; the kernel then falls back to the host model.
+///
+/// Cartesian quantities (`tcp_pose`, `tcp_twist`, `wrench`) are at the TCP
+/// origin expressed in base axes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreState {
     pub q: [f64; MAX_DOF],
     pub qd: [f64; MAX_DOF],
-    /// `[x, y, z, qx, qy, qz, qw]`, only if the hardware computes its own TCP.
+    /// `[x, y, z, qx, qy, qz, qw]` in base frame, only if the hardware
+    /// computes its own TCP.
     pub tcp_pose: [f64; 7],
+    /// `[vx, vy, vz, wx, wy, wz]` at the TCP origin, base axes.
     pub tcp_twist: [f64; 6],
     pub torques: [f64; MAX_DOF],
+    /// `[Fx, Fy, Fz, Tx, Ty, Tz]` at the TCP origin, base axes.
     pub wrench: [f64; 6],
     /// 1.0 = contact, 0.0 = free, NAN = unknown.
     pub in_contact: f64,
-    /// Digital input bitmask carried as a float.
+    /// Digital input bitmask carried as a float (exact up to 53 bits).
     pub io_digital_in: f64,
     pub io_analog_in: [f64; 4],
     pub gripper_width: f64,
     pub gripper_force: f64,
     pub gripper_has_object: f64,
+    /// Hardware timestamp (s) or monotonic sample counter for dynamic $k$-deep
+    /// latency alignment; `NAN` when the driver does not report one.
+    pub timestamp: f64,
+    /// Hardware operating mode code; `NAN` when not reported.
+    pub robot_mode: f64,
+    /// Driver / controller status or fault code (`0.0` = healthy, `NAN` = not
+    /// reported).
+    pub fault_code: f64,
+    /// `1.0` when a controller script or native protective reflex fired /
+    /// broke contract, `0.0` otherwise, `NAN` if unsupported.
+    pub native_reflex_fired: f64,
 }
 
 impl CoreState {
@@ -190,6 +207,10 @@ impl CoreState {
         gripper_width: f64::NAN,
         gripper_force: f64::NAN,
         gripper_has_object: f64::NAN,
+        timestamp: f64::NAN,
+        robot_mode: f64::NAN,
+        fault_code: f64::NAN,
+        native_reflex_fired: f64::NAN,
     };
 
     /// Copy out of the front of `buffer`.
@@ -211,6 +232,10 @@ impl CoreState {
             gripper_width: r.scalar(),
             gripper_force: r.scalar(),
             gripper_has_object: r.scalar(),
+            timestamp: r.scalar(),
+            robot_mode: r.scalar(),
+            fault_code: r.scalar(),
+            native_reflex_fired: r.scalar(),
         })
     }
 
@@ -232,6 +257,10 @@ impl CoreState {
             self.gripper_width,
             self.gripper_force,
             self.gripper_has_object,
+            self.timestamp,
+            self.robot_mode,
+            self.fault_code,
+            self.native_reflex_fired,
         ]);
         Ok(())
     }
@@ -251,10 +280,19 @@ wire_views! {
     gripper_width: scalar,
     gripper_force: scalar,
     gripper_has_object: scalar,
+    timestamp: scalar,
+    robot_mode: scalar,
+    fault_code: scalar,
+    native_reflex_fired: scalar,
 }
 
 /// Typed prefix of the kernel → driver command buffer. Targets the kernel does
 /// not drive are `NAN`.
+///
+/// Cartesian targets (`target_pose`, `target_twist`, `target_wrench`) are at
+/// the TCP origin in base axes; task-space gains (`task_stiffness_k`,
+/// `task_damping_b`, `task_mass_m`) are diagonal in `task_frame` (or base axes
+/// when `task_frame` is `NAN`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreCommand {
@@ -264,6 +302,9 @@ pub struct CoreCommand {
     pub target_pose: [f64; 7],
     pub target_twist: [f64; 6],
     pub target_wrench: [f64; 6],
+    /// Pose `[x, y, z, qx, qy, qz, qw]` of the compliance task frame in the
+    /// base frame for delegated native compliance; `NAN` when not commanded.
+    pub task_frame: [f64; 7],
     pub task_stiffness_k: [f64; 6],
     pub task_damping_b: [f64; 6],
     pub task_mass_m: [f64; 6],
@@ -291,6 +332,7 @@ impl CoreCommand {
         target_pose: [f64::NAN; 7],
         target_twist: [f64::NAN; 6],
         target_wrench: [f64::NAN; 6],
+        task_frame: [f64::NAN; 7],
         task_stiffness_k: [f64::NAN; 6],
         task_damping_b: [f64::NAN; 6],
         task_mass_m: [f64::NAN; 6],
@@ -318,6 +360,7 @@ impl CoreCommand {
             target_pose: r.array(),
             target_twist: r.array(),
             target_wrench: r.array(),
+            task_frame: r.array(),
             task_stiffness_k: r.array(),
             task_damping_b: r.array(),
             task_mass_m: r.array(),
@@ -345,6 +388,7 @@ impl CoreCommand {
         w.array(&self.target_pose);
         w.array(&self.target_twist);
         w.array(&self.target_wrench);
+        w.array(&self.task_frame);
         w.array(&self.task_stiffness_k);
         w.array(&self.task_damping_b);
         w.array(&self.task_mass_m);
@@ -371,6 +415,7 @@ wire_views! {
     target_pose: [7],
     target_twist: [6],
     target_wrench: [6],
+    task_frame: [7],
     task_stiffness_k: [6],
     task_damping_b: [6],
     task_mass_m: [6],
@@ -389,14 +434,14 @@ wire_views! {
 mod tests {
     use super::*;
 
-    fn ramp() -> [f64; 96] {
+    fn ramp() -> [f64; 104] {
         core::array::from_fn(|i| i as f64)
     }
 
     #[test]
     fn copying_helpers_round_trip() {
-        assert_eq!(CoreState::LEN, 52);
-        assert_eq!(CoreCommand::LEN, 89);
+        assert_eq!(CoreState::LEN, 56);
+        assert_eq!(CoreCommand::LEN, 96);
 
         let buf = ramp();
         let state = CoreState::read_from(&buf).unwrap();
@@ -405,10 +450,15 @@ mod tests {
             (0.0, 16.0, 43.0)
         );
         assert_eq!(
-            (state.io_analog_in, state.gripper_has_object),
-            ([45.0, 46.0, 47.0, 48.0], 51.0)
+            (
+                state.io_analog_in,
+                state.gripper_has_object,
+                state.timestamp,
+                state.native_reflex_fired
+            ),
+            ([45.0, 46.0, 47.0, 48.0], 51.0, 52.0, 55.0)
         );
-        let mut out = [-1.0f64; 96];
+        let mut out = [-1.0f64; 104];
         state.write_to(&mut out).unwrap();
         assert_eq!(out[..CoreState::LEN], buf[..CoreState::LEN]);
         assert_eq!(out[CoreState::LEN], -1.0);
@@ -417,21 +467,22 @@ mod tests {
         assert_eq!(
             (
                 cmd.target_pose[0],
+                cmd.task_frame[0],
                 cmd.reflex_threshold[0],
                 cmd.gripper_max_force
             ),
-            (24.0, 77.0, 88.0)
+            (24.0, 43.0, 84.0, 95.0)
         );
-        let mut out = [-1.0f64; 96];
+        let mut out = [-1.0f64; 104];
         cmd.write_to(&mut out).unwrap();
         assert_eq!(out[..CoreCommand::LEN], buf[..CoreCommand::LEN]);
 
         assert_eq!(
-            CoreState::read_from(&buf[..51]),
+            CoreState::read_from(&buf[..55]),
             Err(ArmError::BufferTooSmall)
         );
         assert_eq!(
-            CoreCommand::IDLE.write_to(&mut out[..88]),
+            CoreCommand::IDLE.write_to(&mut out[..95]),
             Err(ArmError::BufferTooSmall)
         );
     }
@@ -453,8 +504,12 @@ mod tests {
         assert_eq!(view.gripper_width(), state.gripper_width);
         assert_eq!(view.gripper_force(), state.gripper_force);
         assert_eq!(view.gripper_has_object(), state.gripper_has_object);
-        assert_eq!(view.tail().len(), 96 - CoreState::LEN);
-        assert_eq!(view.tail()[0], 52.0);
+        assert_eq!(view.timestamp(), state.timestamp);
+        assert_eq!(view.robot_mode(), state.robot_mode);
+        assert_eq!(view.fault_code(), state.fault_code);
+        assert_eq!(view.native_reflex_fired(), state.native_reflex_fired);
+        assert_eq!(view.tail().len(), 104 - CoreState::LEN);
+        assert_eq!(view.tail()[0], 56.0);
 
         let cmd = CoreCommand::read_from(&buf).unwrap();
         let view = CoreCommandView::new(&buf).unwrap();
@@ -464,6 +519,7 @@ mod tests {
         assert_eq!(view.target_pose(), &cmd.target_pose);
         assert_eq!(view.target_twist(), &cmd.target_twist);
         assert_eq!(view.target_wrench(), &cmd.target_wrench);
+        assert_eq!(view.task_frame(), &cmd.task_frame);
         assert_eq!(view.task_stiffness_k(), &cmd.task_stiffness_k);
         assert_eq!(view.task_damping_b(), &cmd.task_damping_b);
         assert_eq!(view.task_mass_m(), &cmd.task_mass_m);
@@ -476,7 +532,7 @@ mod tests {
         assert_eq!(view.gripper_target_width(), cmd.gripper_target_width);
         assert_eq!(view.gripper_target_speed(), cmd.gripper_target_speed);
         assert_eq!(view.gripper_max_force(), cmd.gripper_max_force);
-        assert_eq!(view.tail().len(), 96 - CoreCommand::LEN);
+        assert_eq!(view.tail().len(), 104 - CoreCommand::LEN);
     }
 
     #[test]
@@ -486,29 +542,40 @@ mod tests {
         view.clear();
         view.q()[..6].copy_from_slice(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
         *view.in_contact() = 1.0;
+        *view.timestamp() = 0.042;
+        *view.native_reflex_fired() = 0.0;
         view.io_analog_in()[3] = 4.5;
         view.tail().copy_from_slice(&[7.0, 8.0, 9.0]);
         assert_eq!(view.as_view().in_contact(), 1.0);
+        assert_eq!(view.as_view().timestamp(), 0.042);
 
         let state = CoreState::read_from(&buf).unwrap();
         assert_eq!(state.q[..6], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
         assert!(state.q[6].is_nan() && state.tcp_pose[0].is_nan());
-        assert_eq!((state.in_contact, state.io_analog_in[3]), (1.0, 4.5));
+        assert_eq!(
+            (state.in_contact, state.io_analog_in[3], state.timestamp),
+            (1.0, 4.5, 0.042)
+        );
         assert_eq!(buf[CoreState::LEN..], [7.0, 8.0, 9.0]);
 
         let mut cmd = [0.0f64; CoreCommand::LEN];
         let mut view = CoreCommandViewMut::new(&mut cmd).unwrap();
         view.clear();
         view.target_q()[0] = 1.5;
+        *view.task_frame() = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         *view.gripper_max_force() = 20.0;
         let decoded = CoreCommand::read_from(&cmd).unwrap();
         assert_eq!(
-            (decoded.target_q[0], decoded.gripper_max_force),
-            (1.5, 20.0)
+            (
+                decoded.target_q[0],
+                decoded.task_frame[6],
+                decoded.gripper_max_force
+            ),
+            (1.5, 1.0, 20.0)
         );
         assert!(decoded.target_pose[0].is_nan());
 
-        assert!(CoreStateView::new(&buf[..51]).is_err());
-        assert!(CoreCommandViewMut::new(&mut cmd[..88]).is_err());
+        assert!(CoreStateView::new(&buf[..55]).is_err());
+        assert!(CoreCommandViewMut::new(&mut cmd[..95]).is_err());
     }
 }

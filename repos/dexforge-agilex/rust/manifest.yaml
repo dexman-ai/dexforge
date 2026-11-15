@@ -1,0 +1,40 @@
+# Manifest of the Piper (`Piper`, vendor "agilex").
+#
+# Loaded by `PiperDriver::new()` through
+# `ArmManifest::from_text::<Piper, 6, 16>`; see
+# repos/dexhal/examples/manifest.yaml for every key. Scaffolded by
+# codegen/scaffold.py: `limits.velocity` / `limits.effort` come from the URDF
+# <limit> tags. Every `TODO` must be replaced from the OEM data sheet / protocol
+# specification (the manifest does not parse until they are).
+
+driver: piper               # must equal Piper::NAME
+version: "0.2"
+control_freq_hz: 500          # rate at which the controller expects commands
+control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose]
+realtime: true
+
+latency:
+  state_staleness_cycles: 1
+  command_dispatch_cycles: 1
+
+limits:
+  velocity: [5.0, 5.0, 5.0, 5.0, 5.0, 3.0]   # rad/s  (URDF <limit velocity>)
+  acceleration: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0]   # rad/s^2
+  effort: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]   # N*m  (URDF <limit effort>)
+
+has_static_inertials: true
+
+sensing:
+  torque: true
+  wrench: false
+  gripper: true
+
+native:
+  cartesian_impedance: false
+  cartesian_admittance: false
+  joint_impedance: true
+  joint_admittance: false
+  contact_detection: false
+  reflexes: false
+  payload: false
+  tcp_offset: false

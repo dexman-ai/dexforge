@@ -1,4 +1,4 @@
-"""Numerical validation of symbolic dynamics in ``dexforge_build``.
+"""Numerical validation of the symbolic dynamics in ``codegen/generate_dynamics.py``.
 
 Builds a synthetic planar RR (2-DOF, revolute-about-z) artifact plus a matching
 URDF carrying ``<inertial>`` blocks, derives the symbolic dynamics and checks it

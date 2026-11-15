@@ -20,7 +20,7 @@ use nalgebra::SMatrix;
 use crate::drivers::rizon_common::{self, Model};
 
 pub use crate::drivers::rizon_common::{DOF, MAX_SOLUTIONS};
-pub use crate::math::tolerances::TolerancePolicy;
+pub use dexhal::math::tolerances::TolerancePolicy;
 
 use super::consts;
 use super::pq;
@@ -130,7 +130,7 @@ mod tests {
     }
 
     fn fk_residual(q: &[f64; 7], tf: &SMatrix<f64, 4, 4>) -> f64 {
-        crate::math::kinematics::mat4_frob_diff(&fk(q), tf)
+        dexhal::math::kinematics::mat4_frob_diff(&fk(q), tf)
     }
 
     #[test]
