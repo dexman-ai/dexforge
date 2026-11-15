@@ -186,7 +186,7 @@ def generate_artifact_from_urdf(
     return source_code, f"{stem}_ik"
 
 
-def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
+def find_best_example(ssik_artifact: str) -> Tuple[str, int, int]:
     """Dynamically determine the kinematic family and maximum IK solution count.
 
     Inspects the target Python artifact's source code for DOF and solver
@@ -210,9 +210,11 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
     # ---- 7-DOF Arms ----
     if "DOF = 7" in ssik_artifact or _has_128:
         if "husty_pfurner" in ssik_artifact or "polynomial" in ssik_artifact:
-            # Category 4: Non-SRS 7-DOF (Flexiv, xArm7)
-            # Requires the Husty-Pfurner polynomial loop template.
-            return "rizon4", 256, 7
+            # Category 4: Non-SRS 7-DOF (xArm7)
+            # Requires the Husty-Pfurner polynomial loop template. xArm7 is
+            # used because it is self-contained; the Rizon drivers depend on
+            # rizon_common.rs and _rizon_codegen.py, which are not vendored.
+            return "xarm7", 128, 7
         else:
             # Category 3: Canonical SRS / jointlock 7-DOF (Franka, KUKA, xArm7)
             # Requires the standard Joint-Lock + SP6 template.
