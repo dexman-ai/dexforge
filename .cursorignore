@@ -1,0 +1,13 @@
+# Reduce agent search surface: OEM repos share identical filenames
+# (ik_solver.rs, arm.rs, generated_kinematics.rs, ...). Focus on UR.
+repos/dexforge-agilex/
+repos/dexforge-flexiv/
+repos/dexforge-franka/
+repos/dexforge-ufactory/
+
+# Build / cache noise
+**/target/
+**/.venv/
+**/__pycache__/
+**/*.so
+**/*.pyd

@@ -22,6 +22,8 @@ from typing import NamedTuple, Optional, Tuple
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
 
 
 class IKGenerationEntrypoint(NamedTuple):
@@ -184,7 +186,7 @@ def generate_artifact_from_urdf(
     return source_code, f"{stem}_ik"
 
 
-def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
+def find_best_example(ssik_artifact: str) -> Tuple[str, int, int]:
     """Dynamically determine the kinematic family and maximum IK solution count.
 
     Inspects the target Python artifact's source code for DOF and solver
@@ -208,9 +210,11 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
     # ---- 7-DOF Arms ----
     if "DOF = 7" in ssik_artifact or _has_128:
         if "husty_pfurner" in ssik_artifact or "polynomial" in ssik_artifact:
-            # Category 4: Non-SRS 7-DOF (Flexiv, xArm7)
-            # Requires the Husty-Pfurner polynomial loop template.
-            return "xarm7", 256, 7
+            # Category 4: Non-SRS 7-DOF (xArm7)
+            # Requires the Husty-Pfurner polynomial loop template. xArm7 is
+            # used because it is self-contained; the Rizon drivers depend on
+            # rizon_common.rs and _rizon_codegen.py, which are not vendored.
+            return "xarm7", 128, 7
         else:
             # Category 3: Canonical SRS / jointlock 7-DOF (Franka, KUKA, xArm7)
             # Requires the standard Joint-Lock + SP6 template.
@@ -224,8 +228,8 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
             return "piper", 16, 6
         else:
             # Category 1: Pieper-compliant 6-DOF (UR5, Puma, ABB, Fanuc)
-            # Requires the fast SP6 template.
-            return "ur5", 8, 6
+            # Requires the fast SP6 template (16-slot output array).
+            return "ur5", 16, 6
 
     else:
         raise ValueError(
@@ -236,13 +240,13 @@ def find_best_example(ssik_artifact: str) -> Tuple[str, int]:
 
 
 def _resolve_repo_driver_dir(repo_root: Path, arm: str) -> Optional[Path]:
-    """Resolve a driver directory in the repo for an arm name.
-    """
-    drivers_root = repo_root / "src" / "drivers"
-    for candidate in sorted(drivers_root.glob(f"*/drivers/{arm}")):
-        if candidate.is_dir():
-            return candidate
-    return None
+    """Resolve a driver directory in the repo for an arm name."""
+    try:
+        from repo_paths import resolve_arm_driver_dir
+    except ImportError:  # pragma: no cover - package import path
+        from codegen.repo_paths import resolve_arm_driver_dir  # type: ignore
+
+    return resolve_arm_driver_dir(repo_root, str(arm))
 
 
 def generate_context(
@@ -267,11 +271,24 @@ def generate_context(
     if not base_link or not ee_link:
         raise ValueError("--urdf requires both --base and --ee to be specified.")
     
-    # use an existing artifact, or generate it from the URDF if it doesn't exist yet
-    # first, try ssik.prebuilt.<stem> where stem is derived from the URDF filename (e.g. "ur5_ik" from "ur5.urdf")
-    # if that fails, try the URDF path directly (in case the user provided a path to a generated artifact instead of a URDF)
-    stem_candidate = urdf_path.stem + "_ik"  # e.g. "ur5_ik" from "ur5.urdf"
-    ssik_artifact, artifact_stem = try_load_prebuilt_artifact(stem_candidate)  # try loading by stem first (common case for prebuilt artifacts):
+    # Use a prebuilt artifact only when its BASE_LINK, EE_LINK, and source URDF
+    # match the requested inputs; otherwise compile a fresh artifact from the URDF.
+    stem_candidate = urdf_path.stem + "_ik"
+    ssik_artifact, artifact_stem = try_load_prebuilt_artifact(stem_candidate)
+    if ssik_artifact is not None and artifact_stem is not None:
+        mb = re.search(r'^BASE_LINK\s*=\s*["\']([^"\']+)["\']', ssik_artifact, re.MULTILINE)
+        me = re.search(r'^EE_LINK\s*=\s*["\']([^"\']+)["\']', ssik_artifact, re.MULTILINE)
+        art_base = mb.group(1) if mb else None
+        art_ee = me.group(1) if me else None
+        repo_driver = _resolve_repo_driver_dir(repo_root, urdf_path.stem)
+        repo_urdf = (repo_driver / f"{urdf_path.stem}.urdf") if repo_driver is not None else None
+        same_urdf = (
+            repo_urdf is not None
+            and repo_urdf.is_file()
+            and Path(urdf_path).read_bytes() == repo_urdf.read_bytes()
+        )
+        if art_base != base_link or art_ee != ee_link or not same_urdf:
+            ssik_artifact, artifact_stem = None, None
 
     if ssik_artifact is None or artifact_stem is None:
         ssik_artifact, artifact_stem = generate_artifact_from_urdf(
@@ -283,23 +300,12 @@ def generate_context(
 
     print("[ik_generator] Step 1: Detecting kinematic family …")
     best_guess_example_arm, max_solutions, dof = find_best_example(ssik_artifact)
-    example_arm = example_arm or _resolve_repo_driver_dir(repo_root,best_guess_example_arm)
-    
-    # Fall back gracefully when the chosen example arm has no Rust driver yet.
     if example_arm is None:
-        fallback = "franka_panda"
-        if _resolve_repo_driver_dir(repo_root, fallback) is not None:
-            print(
-                f"[ik_generator]   WARNING: No Rust driver for '{example_arm}'; "
-                f"falling back to '{fallback}' as structural template."
-            )
-            example_arm = fallback
-        else:
-            print(
-                f"[ik_generator]   WARNING: No Rust driver found for '{example_arm}' "
-                "or fallback 'franka_panda'. The one-shot example will be empty.",
-                file=sys.stderr,
-            )
+        example_arm = best_guess_example_arm
+    if _resolve_repo_driver_dir(repo_root, example_arm) is None:
+        raise FileNotFoundError(
+            f"missing example driver directory for arm {example_arm!r}"
+        )
     print(
         f"[ik_generator]   → example arm: '{example_arm}', "
         f"MAX_SOLUTIONS = {max_solutions}, DOF = {dof}"
@@ -450,12 +456,14 @@ def assemble_context(
     prompt_template = prompt_path.read_text(encoding="utf-8")
 
     # --- Rust API headers ---
-    ssik_core_sigs = extract_rust_signatures(
-        _REPO_ROOT / "src" / "math" / "ssik_core.rs"
-    )
-    kinematics_sigs = extract_rust_signatures(
-        _REPO_ROOT / "src" / "math" / "kinematics.rs"
-    )
+    try:
+        from repo_paths import math_src
+    except ImportError:  # pragma: no cover
+        from codegen.repo_paths import math_src  # type: ignore
+
+    math_dir = math_src(repo_root)
+    ssik_core_sigs = extract_rust_signatures(math_dir / "ssik_core.rs")
+    kinematics_sigs = extract_rust_signatures(math_dir / "kinematics.rs")
 
     # --- One-shot example (Python source + Rust translation + helper scripts) ---
     example_py = _load_example_py_source(example_arm)

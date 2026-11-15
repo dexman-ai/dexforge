@@ -14,7 +14,16 @@ import ik_prompt  # noqa: E402
 class GenerateContextTests(unittest.TestCase):
     def test_generate_context_ur5_has_non_empty_sections(self) -> None:
         repo_root = Path(__file__).resolve().parents[2]
-        urdf_path = repo_root / "src" / "drivers" / "ur" / "drivers" / "ur5" / "ur5.urdf"
+        urdf_path = (
+            repo_root
+            / "repos"
+            / "dexforge-ur"
+            / "rust"
+            / "src"
+            / "drivers"
+            / "ur5"
+            / "ur5.urdf"
+        )
 
         self.assertTrue(urdf_path.is_file(), f"Missing URDF fixture: {urdf_path}")
 
@@ -22,7 +31,7 @@ class GenerateContextTests(unittest.TestCase):
             entry = ik_prompt.generate_context(
                 urdf_path=urdf_path,
                 base_link="base_link",
-                ee_link="tool0",
+                ee_link="ee_link",
                 output_dir=Path(tmp),
                 repo_root=repo_root,
                 example_arm="ur5",
@@ -74,6 +83,32 @@ pub fn sp1_solve(k: &[f64; 3], p: &[f64; 3], q: &[f64; 3]) -> f64 {
             "pub fn sp1_solve(k: &[f64; 3], p: &[f64; 3], q: &[f64; 3]) -> f64",
             extracted,
         )
+
+class FindBestExampleTests(unittest.TestCase):
+    """One-shot examples must be self-contained and match their array size."""
+
+    _ARTIFACTS = (
+        "DOF = 7\nhusty_pfurner",
+        "DOF = 7\nsp6",
+        "DOF = 6\nraghavan_roth",
+        "DOF = 6\npieper",
+    )
+
+    def test_examples_do_not_use_unvendored_helpers(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        for artifact in self._ARTIFACTS:
+            arm, max_solutions, _dof = ik_prompt.find_best_example(artifact)
+            driver_dir = ik_prompt._resolve_repo_driver_dir(repo_root, arm)
+            if driver_dir is None:
+                self.skipTest(f"{arm} driver not visible in this checkout")
+            rust = (driver_dir / "ik_solver.rs").read_text(encoding="utf-8")
+            scripts = ik_prompt._load_example_scripts(arm, repo_root)
+            self.assertNotIn("rizon_common", rust, arm)
+            self.assertNotIn("_rizon_codegen", scripts, arm)
+            declared = re.search(r"MAX_SOLUTIONS:\s*usize\s*=\s*(\d+)", rust)
+            if declared is not None:
+                self.assertEqual(int(declared.group(1)), max_solutions, arm)
+
 
 if __name__ == "__main__":
     unittest.main()

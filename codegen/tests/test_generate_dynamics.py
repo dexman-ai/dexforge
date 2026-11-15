@@ -28,7 +28,7 @@ import sympy as sp  # noqa: E402  (after importorskip)
 
 _CODEGEN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_CODEGEN))
-import dexforge_build as G  # noqa: E402
+import generate_dynamics as G  # noqa: E402
 
 # Planar RR geometry shared between the generator fixtures and the reference.
 L1, LC1, M1, IZ1 = 0.5, 0.25, 2.0, 0.03
@@ -220,3 +220,175 @@ def test_dynamics_matches_planar_rr_reference(tmp_path):
                 * qd[k]
             )
         assert abs(qd @ (m_dot @ qd) - 2 * qd @ c_sym) < 1e-6
+
+
+def test_pinocchio_chain_xml_strips_world_transform_and_gripper_joints(tmp_path):
+    import generate_dynamics_test_data as GD
+    import xml.etree.ElementTree as ET
+
+    urdf = tmp_path / "with_gripper.urdf"
+    urdf.write_text(
+        f"""<robot name="rr_gripper">
+  <link name="world"/>
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/><child link="base"/>
+    <origin xyz="0 0 1.0" rpy="1.5707963267948966 0 0"/>
+  </joint>
+  <link name="base"/>
+  <link name="l1">
+    <inertial>
+      <origin xyz="{LC1} 0 0" rpy="0 0 0"/>
+      <mass value="{M1}"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="{IZ1}"/>
+    </inertial>
+  </link>
+  <link name="l2">
+    <inertial>
+      <origin xyz="{LC2} 0 0" rpy="0 0 0"/>
+      <mass value="{M2}"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.006" iyz="0" izz="{IZ2}"/>
+    </inertial>
+  </link>
+  <link name="finger">
+    <inertial>
+      <origin xyz="0.02 0 0" rpy="0 0 0"/>
+      <mass value="0.2"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <joint name="j0" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+  </joint>
+  <joint name="j1" type="revolute">
+    <parent link="l1"/><child link="l2"/>
+    <origin xyz="{L1} 0 0" rpy="0 0 0"/><axis xyz="0 0 1"/>
+  </joint>
+  <joint name="finger_joint" type="prismatic">
+    <parent link="l2"/><child link="finger"/>
+    <origin xyz="{L2} 0 0" rpy="0 0 0"/><axis xyz="0 1 0"/>
+  </joint>
+</robot>
+""",
+        encoding="utf-8",
+    )
+
+    xml_str = GD._build_chain_urdf_xml(urdf, base_link="base", ee_link="l2")
+    root = ET.fromstring(xml_str)
+    joint_names = [j.get("name") for j in root.findall("joint")]
+    link_names = [l.get("name") for l in root.findall("link")]
+    assert joint_names == ["j0", "j1"]
+    assert link_names == ["base", "l1", "l2"]
+
+
+def test_emit_dynamics_parity_rs_checks_finiteness_and_custom_gravity():
+    import generate_dynamics_test_data as GD
+
+    rs = GD.emit_dynamics_parity_rs("demo", 6)
+    assert 'assert!(d.is_finite(), "non-finite dynamics comparison");' in rs
+    assert 'dynamics_test_data::GRAVITY.iter().all(|g| g.is_finite())' in rs
+    assert "[0.0, 0.0, -9.81]" not in rs
+
+
+def test_non_unit_urdf_axis_is_normalized_and_zero_axis_rejected(tmp_path):
+    artifact, urdf = _write_fixtures(tmp_path)
+    scaled_urdf = tmp_path / "scaled_axis.urdf"
+    scaled_urdf.write_text(
+        urdf.read_text(encoding="utf-8").replace('axis xyz="0 0 1"', 'axis xyz="0 0 2"'),
+        encoding="utf-8",
+    )
+    mod = G.load_artifact(str(artifact))
+    t_lefts, axes, t_rights, _ = G.extract_chain(mod)
+    _, q_syms, frames = G.build_fk(t_lefts, axes, t_rights)
+    dyn_unit = G.build_dynamics(axes, frames, t_rights, q_syms, urdf, "base", "l2")
+    dyn_scaled = G.build_dynamics(axes, frames, t_rights, q_syms, scaled_urdf, "base", "l2")
+    assert sp.simplify(dyn_unit.gravity - dyn_scaled.gravity) == sp.zeros(2, 1)
+    assert sp.simplify(dyn_unit.mass_matrix - dyn_scaled.mass_matrix) == sp.zeros(2, 2)
+
+    zero_urdf = tmp_path / "zero_axis.urdf"
+    zero_urdf.write_text(
+        urdf.read_text(encoding="utf-8").replace('axis xyz="0 0 1"', 'axis xyz="0 0 0"'),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="zero"):
+        G.build_dynamics(axes, frames, t_rights, q_syms, zero_urdf, "base", "l2")
+
+
+def test_rotated_base_frame_aligns_horizontal_gravity_with_pinocchio(tmp_path):
+    pytest.importorskip("pinocchio")
+    import generate_dynamics_test_data as GD
+
+    _, urdf = _write_fixtures(tmp_path)
+    # Artifact uses a base frame rotated 180 deg about Z relative to the URDF:
+    # at q=0, link 1 extends along -X in the artifact frame and +X in the URDF frame.
+    artifact = tmp_path / "rot_rr_ik.py"
+    artifact.write_text(
+        "import numpy as np\n"
+        'BASE_LINK = "base"\n'
+        'EE_LINK = "l2"\n'
+        "DOF = 2\n"
+        "def _tx(d):\n"
+        "    m = np.eye(4); m[0, 3] = d; return m\n"
+        "_JOINT_AXES = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 0.0, 1.0])]\n"
+        f"_JOINT_T_LEFTS = [np.eye(4), _tx({-L1})]\n"
+        f"_JOINT_T_RIGHTS = [np.eye(4), _tx({-L2})]\n",
+        encoding="utf-8",
+    )
+    mod = G.load_artifact(str(artifact))
+    t_lefts, axes, t_rights, _ = G.extract_chain(mod)
+    _, q_syms, frames = G.build_fk(t_lefts, axes, t_rights)
+    dyn = G.build_dynamics(axes, frames, t_rights, q_syms, urdf, "base", "l2")
+    grav_f = sp.lambdify(q_syms + dyn.gravity_syms, dyn.gravity, "numpy")
+
+    horiz_g = (3.5, -4.2, -9.81)
+    dof, _, cases = GD.build_dataset(
+        urdf,
+        samples=8,
+        seed=0,
+        qd_limit=1.0,
+        qdd_limit=2.0,
+        gravity=horiz_g,
+        base_link="base",
+        ee_link="l2",
+        arm="rot_rr",
+        output_dir=tmp_path,
+    )
+    assert dof == 2
+    for q, _qd, _qdd, g_pin, _m, _c, _tau in cases:
+        g_sym = np.asarray(grav_f(*q, *horiz_g), dtype=float).reshape(-1)
+        assert np.allclose(g_sym, g_pin, atol=1e-6)
+
+
+def _base_alignment_for(angle: float):
+    """R_base for a 3-joint chain whose ssik frame is the URDF frame rotated about Z."""
+    c, s = np.cos(angle), np.sin(angle)
+    r_true = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    axes_urdf = [np.array([0.0, 0.0, 1.0]), np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0])]
+    positions = [np.zeros(3), np.array([0.0, 0.0, 0.3]), np.array([0.2, 0.1, 0.6])]
+    axes = [sp.Matrix(r_true @ a) for a in axes_urdf]
+    frames = [
+        sp.Matrix(np.block([[np.eye(3), (r_true @ p)[:, None]], [np.zeros((1, 3)), np.ones((1, 1))]]))
+        for p in positions
+    ]
+    chain, prev = [], np.zeros(3)
+    for i, (a, p) in enumerate(zip(axes_urdf, positions)):
+        chain.append(
+            G.UrdfJoint(
+                name=f"j{i}", jtype="revolute", parent=f"l{i}", child=f"l{i + 1}",
+                axis=tuple(a), origin_xyz=tuple(p - prev), origin_rpy=(0.0, 0.0, 0.0),
+                child_inertial=None,
+            )
+        )
+        prev = p
+    return G.compute_base_alignment_rotation(axes, frames, chain), r_true
+
+
+def test_base_alignment_snaps_float_noise_but_keeps_small_real_tilt():
+    # Float noise and an exact 180 deg rotation snap to an exact integer matrix.
+    for angle in (1e-12, np.pi):
+        r_base, _ = _base_alignment_for(angle)
+        assert np.array_equal(r_base, np.round(r_base))
+    # A real 1e-4 rad base tilt must survive, or gravity direction is silently altered.
+    r_base, r_true = _base_alignment_for(1e-4)
+    assert not np.array_equal(r_base, np.round(r_base))
+    assert np.allclose(r_base, r_true, atol=1e-12)

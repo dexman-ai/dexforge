@@ -35,4 +35,19 @@ impl ArmModel<6, 16> for Ur5 {
             refinement_max_iters,
         )
     }
+
+    #[inline]
+    fn flange_gravity(q: &[f64; 6], gravity: &[f64; 3]) -> [f64; 6] {
+        crate::drivers::ur5::generated_dynamics::gravity(q, gravity)
+    }
+
+    #[inline]
+    fn flange_mass_matrix(q: &[f64; 6]) -> [[f64; 6]; 6] {
+        crate::drivers::ur5::generated_dynamics::mass_matrix(q)
+    }
+
+    #[inline]
+    fn flange_coriolis(q: &[f64; 6], qd: &[f64; 6]) -> [f64; 6] {
+        crate::drivers::ur5::generated_dynamics::coriolis(q, qd)
+    }
 }

@@ -13,26 +13,53 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
+import re
 
 # Repository root — all relative paths are anchored here.
 _CODEGEN_DIR = Path(__file__).resolve().parent   # codegen/
 _REPO_ROOT = _CODEGEN_DIR.parent                 # repository root
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
+
+from repo_paths import math_src as _math_src  # noqa: E402
+from repo_paths import (  # noqa: E402
+    SHARED_DRIVER_MODULES as _SHARED_DRIVER_MODULES,
+    resolve_shared_driver_module as _resolve_shared_driver_module,
+)
+
 
 def _driver_dir(output_root: Path, oem_name: str, arm_name: str) -> Path:
-    """Return the driver directory rooted at *root* for *arm_name*."""
-    return output_root / "drivers" / oem_name / arm_name
+    """Return the driver directory inside a generated crate for *arm_name*.
+
+    Layout matches ``dexforge build`` / ``plan_export``::
+
+        <crate>/src/drivers/<arm>/
+
+    *oem_name* is retained for provenance naming but no longer nests the path.
+    """
+    del oem_name  # crate layout is flat under src/drivers/<arm>
+    return output_root / "src" / "drivers" / arm_name
+
+
+def _vendor_math_source(text: str) -> str:
+    """Rewrite dexhal-crate paths so vendored math compiles in a stand-alone crate.
+
+    Doctests and comments in ``repos/dexhal`` correctly say ``dexhal::math::…``.
+    After copy into a ``dexforge build`` output crate there is no ``dexhal``
+    dependency, so those paths become ``crate::math::…``.
+    """
+    return text.replace("dexhal::math::", "crate::math::")
 
 
 def _copy_math_kernels(repo_root: Path, output_root: Path) -> None:
     """Copy the shared math kernels into the generated crate tree."""
-    src = repo_root / "src" / "math"
-    dst = output_root / "math"
-    if not src.is_dir():
-        raise FileNotFoundError(f"missing math kernels: {src}")
+    src = _math_src(repo_root)
+    dst = output_root / "src" / "math"
     dst.mkdir(parents=True, exist_ok=True)
     for rs in sorted(src.glob("*.rs")):
-        shutil.copyfile(rs, dst / rs.name)
+        text = rs.read_text(encoding="utf-8")
+        (dst / rs.name).write_text(_vendor_math_source(text), encoding="utf-8")
 
 
 def _cargo_toml(cargo_suffix: str, arm_name: str) -> str:
@@ -44,6 +71,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Rigid Body Kinematics and Dynamics driver for {cargo_suffix} arms, compiled by dexforge."
 license = "BSD-3-Clause"
+
+# Keep the generated crate out of any parent Cargo workspace.
+[workspace]
+
+[lib]
+# Vendored dexhal sources keep ``dexhal::…`` doctests; those do not apply in a
+# stand-alone driver crate. Unit tests under ``#[cfg(test)]`` are the gate.
+doctest = false
 
 [dependencies]
 libm = "0.2"
@@ -71,27 +106,59 @@ pub mod math;
 
 pub use drivers::{arm_name}::ik_solver::{{fk, solve, TolerancePolicy}};
 pub use drivers::{arm_name}::generated_kinematics;
+pub use drivers::{arm_name}::generated_dynamics;
 """
 
-def _ensure_arm_mod_rs(output_root: Path, oem_name:str, arm_name: str, rust_files: list[str]) -> None:
+def _copy_shared_driver_modules(repo_root: Path, output_root: Path, driver_dir: Path) -> None:
+    """Copy shared ``crate::drivers::<module>`` helpers the generated driver uses.
+
+    A driver modelled on the Rizon example imports ``crate::drivers::rizon_common``;
+    without this copy the generated crate fails with an unresolved import.
+    """
+    sources = "\n".join(
+        rs.read_text(encoding="utf-8") for rs in sorted(driver_dir.glob("*.rs"))
+    )
+    for module in _SHARED_DRIVER_MODULES:
+        if f"drivers::{module}" not in sources:
+            continue
+        src = _resolve_shared_driver_module(repo_root, module)
+        if src is None:
+            raise FileNotFoundError(f"missing shared driver module: {module}.rs")
+        dst = output_root / "src" / "drivers" / f"{module}.rs"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(_vendor_math_source(src.read_text(encoding="utf-8")), encoding="utf-8")
+        print(f"[ik_generator]   Copied shared module {dst.relative_to(output_root)}")
+
+
+def _ensure_arm_mod_rs(output_root: Path, oem_name: str, arm_name: str, rust_files: list[str]) -> None:
     """Create the arm module files in the generated crate if missing."""
-    mod_path = _driver_dir(output_root, oem_name, "") / "mod.rs"
-    mod_path.parent.mkdir(parents=True, exist_ok=True)
-    mod_path.write_text(f"pub mod {arm_name};\n\n", encoding="utf-8")
-    print(f"[ik_generator]   Created {mod_path.relative_to(output_root)}")
+    drivers_mod = output_root / "src" / "drivers" / "mod.rs"
+    drivers_mod.parent.mkdir(parents=True, exist_ok=True)
+    # Declare any shared helper modules present in the crate (e.g. rizon_common).
+    shared = [
+        m for m in _SHARED_DRIVER_MODULES
+        if (output_root / "src" / "drivers" / f"{m}.rs").is_file()
+    ]
+    drivers_mod.write_text(
+        "//! Driver module index (compiled by dexforge build).\n\n"
+        + "".join(f"pub mod {m};\n" for m in shared)
+        + f"pub mod {arm_name};\n",
+        encoding="utf-8",
+    )
+    print(f"[ik_generator]   Created {drivers_mod.relative_to(output_root)}")
 
     mod_path = _driver_dir(output_root, oem_name, arm_name) / "mod.rs"
     mod_path.parent.mkdir(parents=True, exist_ok=True)
 
-    lines: list[str] = [f"//! {arm_name} IK driver.\n"]
-    lines.append("")
-    lines.append("pub mod ik_solver;")
+    lines: list[str] = [f"//! {arm_name} IK driver.\n", "", "pub mod ik_solver;"]
     for fname in sorted(rust_files):
         stem = Path(fname).stem
         if stem in ("ik_solver", "mod", "test_data"):
             continue
-        if stem == "arm":
-            lines.append("pub mod arm;")
+        # Dynamics / kinematics kernels and the ArmModel marker must be public
+        # so crate-root re-exports and flange_* overrides can reach them.
+        if stem in ("arm", "generated_dynamics", "generated_kinematics"):
+            lines.append(f"pub mod {stem};")
         else:
             lines.append(f"mod {stem};")
     mod_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -178,7 +245,7 @@ def write_generated_files(
     rust_files_written: list[str] = []
     for filename, content in files.items():
         if filename == "lib.rs":
-            dest = output_dir / "lib.rs"
+            dest = output_dir / "src" / "lib.rs"
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
             written[filename] = dest
@@ -208,13 +275,18 @@ def write_generated_files(
             written[filename] = dest
             print(f"[ik_generator]   Wrote {dest.relative_to(output_dir)}")
 
+    # Pull in shared helper modules the generated driver references.
+    _copy_shared_driver_modules(repo_root, output_dir, driver_dir)
+
     # Ensure mod.rs exists for the new driver
     _ensure_arm_mod_rs(output_dir, oem_name, arm_name, rust_files_written)
 
     return written
 
 
-def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list[tuple[str, str]]:
+def run_py_scripts(
+    generator_scripts: dict[str, Path], output_dir: Path
+) -> Optional[Tuple[str, str]]:
     """Run all ``generate_*.py`` files that were written to ``codegen/``.
 
     Each script is executed with the current Python interpreter from the
@@ -223,13 +295,26 @@ def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list
 
     :param generator_scripts: The ``{filename: path}`` dict returned by
         :func:`write_generated_files`.
-    :returns:  ``(script_name, error_output)`` tuple when a script fails.
-        None means all scripts succeeded.
+    :returns: ``(script_name, error_output)`` when a script fails, else ``None``.
     """
+
+    import os
+
+    env = os.environ.copy()
+    existing_py_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        f"{_REPO_ROOT}{os.pathsep}{existing_py_path}"
+        if existing_py_path
+        else str(_REPO_ROOT)
+    )
 
     for filename, path in sorted(generator_scripts.items()):
         if not filename.startswith("generate_") or not filename.endswith(".py"):
             continue
+
+        driver_dir = path.parent.parent
+        # Ensure the driver directory exists for scripts that write ``../foo.rs``.
+        driver_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[ik_generator]   Running {path.relative_to(output_dir)} …")
         result = subprocess.run(
@@ -237,13 +322,18 @@ def run_py_scripts(generator_scripts: dict[str, Path], output_dir: Path) -> list
             capture_output=True,
             text=True,
             cwd=str(output_dir),
+            env=env,
         )
         if result.returncode != 0:
             error = (result.stderr + result.stdout).strip()
             print(f"[ik_generator]   ✗ {filename} failed:\n{error}")
-            return [(filename, error)]
-        else:
-            print(f"[ik_generator]   ✓ {filename} succeeded.")
+            return (filename, error)
+        print(f"[ik_generator]   ✓ {filename} succeeded.")
+
+        # Refresh mod.rs so any auxiliary .rs files emitted by generate_code.py
+        # (such as consts.rs or pq.rs) are declared in the driver module.
+        all_rs = [p.name for p in sorted(driver_dir.glob("*.rs"))]
+        _ensure_arm_mod_rs(output_dir, driver_dir.name, driver_dir.name, all_rs)
 
     return None
 
@@ -264,12 +354,15 @@ def build_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
 
 
 def test_rust_crate(cwd: Path = _REPO_ROOT) -> Tuple[bool, str]:
-    """Run ``cargo test`` from *cwd*.
+    """Run library unit tests from *cwd* (``cargo test --lib``).
+
+    Doctests are disabled on stand-alone crates (see ``doctest = false``); the
+    IK/dynamics gate is the ``#[cfg(test)]`` suite.
 
     :returns: ``(success, output)`` where *output* is combined stdout+stderr.
     """
     result = subprocess.run(
-        ["cargo", "test"],
+        ["cargo", "test", "--lib"],
         capture_output=True,
         text=True,
         cwd=str(cwd),

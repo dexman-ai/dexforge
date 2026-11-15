@@ -48,6 +48,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+_CODEGEN_DIR = Path(__file__).resolve().parent
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
+
 # Optional heavy deps — only required when compiling symbolic dynamics.
 try:
     import numpy as np
@@ -64,16 +68,14 @@ except ImportError:
 # LLM calls = _MAX_RETRIES + 1.
 _MAX_RETRIES = 3
 
-# Shared, arm-agnostic numeric kernels copied verbatim into every driver crate
-# (src/math/<name>.rs). The driver sources reference these as ``crate::math::*``,
-# so preserving the module layout lets the copied files compile unchanged.
-_MATH_MODULES = ("kinematics", "postprocess", "ssik_core", "tolerances")
-
-# Driver sources may reference shared solver modules that live alongside the
-# per-arm driver directories (exposed as ``crate::drivers::<module>``). These
-# are detected per-arm by scanning the driver sources, so URDF-derived drivers
-# pull in whatever they actually use.
-_SHARED_DRIVER_MODULES = ("rizon_common",)
+from repo_paths import (  # noqa: E402  (codegen/ is on sys.path for the CLI)
+    MATH_MODULES as _MATH_MODULES,
+    SHARED_DRIVER_MODULES as _SHARED_DRIVER_MODULES,
+    find_repo_root as _find_repo_root_impl,
+    math_src as _math_src,
+    resolve_arm_driver_dir as _resolve_arm_driver_dir,
+    resolve_shared_driver_module as _resolve_shared_driver_module,
+)
 
 
 class Export(NamedTuple):
@@ -100,22 +102,8 @@ def default_crate_name(arm: str) -> str:
 
 
 def find_repo_root(start: Optional[Path] = None) -> Path:
-    """Locate the dexforge repository root (the source of driver/math files).
-
-    Walks upward from *start* (the directory containing this module by default)
-    until it finds a directory holding ``src/Cargo.toml`` and ``src/math``.
-
-    :raises FileNotFoundError: If no repository root is found.
-    """
-    here = start or Path(__file__).resolve().parent
-    for candidate in (here, *here.parents):
-        if (candidate / "src" / "Cargo.toml").is_file() and (candidate / "src" / "math").is_dir():
-            return candidate
-    raise FileNotFoundError(
-        "could not locate the dexforge source tree (no parent directory contains "
-        "both 'src/Cargo.toml' and 'src/math/'). Run 'dexforge build' from a dexforge "
-        "checkout, or pass --repo-root."
-    )
+    """Locate the dexforge repository root (the source of driver/math files)."""
+    return _find_repo_root_impl(start)
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -137,6 +125,15 @@ edition = "2021"
 description = "Stand-alone analytical IK driver for the {arm} arm, compiled by dexforge."
 license = "BSD-3-Clause"
 
+# Empty workspace table keeps this crate independent even when written under a
+# parent Cargo workspace (e.g. the dexforge monorepo checkout).
+[workspace]
+
+[lib]
+# Vendored dexhal sources keep ``dexhal::…`` doctests; those do not apply here.
+# Driver correctness is gated by ``#[cfg(test)]`` unit tests.
+doctest = false
+
 # Self-contained: depends only on libm + nalgebra (no_std), never on the
 # dexforge repository or the dexforge Python package.
 [dependencies]
@@ -154,8 +151,15 @@ panic = "abort"
 """
 
 
-def _lib_rs(crate_name: str, arm: str) -> str:
-    """Render the stand-alone crate's ``src/lib.rs``."""
+def _lib_rs(crate_name: str, arm: str, with_dynamics: bool = True) -> str:
+    """Render the stand-alone crate's ``src/lib.rs``.
+
+    The ``generated_dynamics`` re-export is emitted only when the driver has that
+    module; otherwise the crate would fail with an unresolved import.
+    """
+    dynamics_reexport = (
+        f"pub use drivers::{arm}::generated_dynamics;\n" if with_dynamics else ""
+    )
     return f"""\
 //! Stand-alone `{arm}` rigid-body driver (kinematics + dynamics),
 //! compiled by `dexforge build`.
@@ -178,7 +182,7 @@ pub use drivers::{arm}::ik_solver::{{fk, solve, TolerancePolicy}};
 // `dexforge build`. Re-exported so consumers reach the full
 // kinematics + dynamics suite at the crate root.
 pub use drivers::{arm}::generated_kinematics;
-"""
+{dynamics_reexport}"""
 
 
 def _drivers_mod_rs(arm: str, shared_modules: Sequence[str]) -> str:
@@ -203,7 +207,8 @@ def generate_armmodel_impl(arm_name: str, dof: int, max_solutions: int) -> str:
 
     The generated module owns the zero-sized marker type and the concrete
     ``ArmModel`` implementation for the arm's ``fk`` / ``jacobian`` /
-    ``solve`` entry points.
+    ``solve`` entry points, plus the flange dynamics hooks that call
+    ``generated_dynamics`` (emitted by ``generate_dynamics_for_arm``).
     """
     marker_name = _arm_marker_name(arm_name)
     return f"""\
@@ -244,6 +249,21 @@ impl ArmModel<{dof}, {max_solutions}> for {marker_name} {{
             refinement_max_iters,
         )
     }}
+
+    #[inline]
+    fn flange_gravity(q: &[f64; {dof}], gravity: &[f64; 3]) -> [f64; {dof}] {{
+        crate::drivers::{arm_name}::generated_dynamics::gravity(q, gravity)
+    }}
+
+    #[inline]
+    fn flange_mass_matrix(q: &[f64; {dof}]) -> [[f64; {dof}]; {dof}] {{
+        crate::drivers::{arm_name}::generated_dynamics::mass_matrix(q)
+    }}
+
+    #[inline]
+    fn flange_coriolis(q: &[f64; {dof}], qd: &[f64; {dof}]) -> [f64; {dof}] {{
+        crate::drivers::{arm_name}::generated_dynamics::coriolis(q, qd)
+    }}
 }}
 """
 
@@ -262,8 +282,17 @@ def _shared_modules_used(driver_src: Path) -> List[str]:
 
 
 def _driver_dir(repo_root: Path, arm: str) -> Path:
-    """Return the canonical source path for an arm's driver directory."""
-    return repo_root / "src" / "drivers" / arm
+    """Return the canonical source path for an arm's driver directory.
+
+    :raises FileNotFoundError: If no driver directory exists for *arm*.
+    """
+    found = _resolve_arm_driver_dir(repo_root, arm)
+    if found is not None:
+        return found
+    raise FileNotFoundError(
+        f"missing driver directory for arm {arm!r}. Compile this arm from a "
+        f"URDF first (dexforge build --urdf <file> ...)."
+    )
 
 
 def plan_export(
@@ -286,43 +315,51 @@ def plan_export(
     """
     crate_name = crate_name or default_crate_name(arm)
     out_dir = out_dir.resolve()
-    src = repo_root / "src"
 
     copies: List[tuple] = []
 
-    # Shared math kernels: src/math/{mod,<modules>}.rs
-    math_src = src / "math"
-    if not math_src.is_dir():
-        raise FileNotFoundError(f"missing math kernels: {math_src}")
-    copies.append((math_src / "mod.rs", out_dir / "src" / "math" / "mod.rs"))
+    # Shared math kernels (dexhal in the monorepo, or legacy src/math).
+    try:
+        math_dir = _math_src(repo_root)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(str(exc)) from exc
+    copies.append((math_dir / "mod.rs", out_dir / "src" / "math" / "mod.rs"))
     for name in _MATH_MODULES:
-        copies.append((math_src / f"{name}.rs", out_dir / "src" / "math" / f"{name}.rs"))
+        src_rs = math_dir / f"{name}.rs"
+        if not src_rs.is_file():
+            raise FileNotFoundError(f"missing math kernel: {src_rs}")
+        copies.append((src_rs, out_dir / "src" / "math" / f"{name}.rs"))
 
     # Per-arm driver sources: every .rs file in the driver directory.
     driver_src = _driver_dir(repo_root, arm)
-    if not driver_src.is_dir():
-        raise FileNotFoundError(
-            f"missing driver directory: {driver_src}. Compile this arm from a "
-            f"URDF first (dexforge build --urdf <file> ...)."
-        )
     for rs in sorted(driver_src.glob("*.rs")):
         copies.append((rs, out_dir / "src" / "drivers" / arm / rs.name))
 
     # Shared solver modules the driver actually references.
     shared_modules = _shared_modules_used(driver_src)
     for module in shared_modules:
-        rc = repo_root / "src" / "drivers" / f"{module}.rs"
-        if not rc.is_file():
-            raise FileNotFoundError(f"missing shared driver module: {rc}")
+        rc = _resolve_shared_driver_module(repo_root, module)
+        if rc is None or not rc.is_file():
+            raise FileNotFoundError(f"missing shared driver module: {module}.rs")
         copies.append((rc, out_dir / "src" / "drivers" / f"{module}.rs"))
 
     # Optional provenance: copy the source URDF (the OEM's hardware spec) if any.
     for urdf in sorted(driver_src.glob("*.urdf")):
         copies.append((urdf, out_dir / urdf.name))
+    # Also copy the binary IK / Pinocchio datasets when present so parity tests travel.
+    for blob in sorted(driver_src.glob("*test_data.bin")):
+        copies.append((blob, out_dir / "src" / "drivers" / arm / blob.name))
 
     generated: List[tuple] = [
         (out_dir / "Cargo.toml", _cargo_toml(crate_name, arm)),
-        (out_dir / "src" / "lib.rs", _lib_rs(crate_name, arm)),
+        (
+            out_dir / "src" / "lib.rs",
+            _lib_rs(
+                crate_name,
+                arm,
+                with_dynamics=(driver_src / "generated_dynamics.rs").is_file(),
+            ),
+        ),
         (out_dir / "src" / "drivers" / "mod.rs", _drivers_mod_rs(arm, shared_modules)),
     ]
 
@@ -342,7 +379,14 @@ def write_export(export: Export) -> List[Path]:
         if not src.is_file():
             raise FileNotFoundError(f"missing source file: {src}")
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, dst)
+        # Vendored math kernels must not keep ``dexhal::math::`` doctest paths.
+        if "math" in dst.parts and dst.suffix == ".rs":
+            text = src.read_text(encoding="utf-8").replace(
+                "dexhal::math::", "crate::math::"
+            )
+            dst.write_text(text, encoding="utf-8")
+        else:
+            shutil.copyfile(src, dst)
     for dst, content in export.generated:
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text(content, encoding="utf-8")
@@ -350,17 +394,33 @@ def write_export(export: Export) -> List[Path]:
 
 
 def verify_crate(out_dir: Path) -> tuple:
-    """Build the generated crate to prove it is standalone.
+    """Build and unit-test the generated crate (includes dynamics_parity when present).
 
     :returns: ``(success, combined_output)``.
     """
-    result = subprocess.run(
+    build = subprocess.run(
         ["cargo", "build", "--release"],
         capture_output=True,
         text=True,
         cwd=str(out_dir),
     )
-    return result.returncode == 0, (result.stderr + result.stdout).strip()
+    if build.returncode != 0:
+        return False, (build.stderr + build.stdout).strip()
+
+    # ``--lib`` skips doctests (disabled on stand-alone crates anyway) and runs
+    # IK reference tests plus Pinocchio dynamics_parity when wired into mod.rs.
+    tests = subprocess.run(
+        ["cargo", "test", "--lib"],
+        capture_output=True,
+        text=True,
+        cwd=str(out_dir),
+    )
+    combined = (
+        (build.stderr + build.stdout).strip()
+        + "\n"
+        + (tests.stderr + tests.stdout).strip()
+    ).strip()
+    return tests.returncode == 0, combined
 
 
 # ===========================================================================
@@ -413,7 +473,7 @@ def generate_ik(
     ee_link: str,
     repo_root: Path,
     output_dir: Path,
-    oem_name: str,
+    oem_name: Optional[str] = None,
     max_retries: int = _MAX_RETRIES,
     llm_key: Optional[str] = None,
     llm_url: Optional[str] = None,
@@ -430,7 +490,7 @@ def generate_ik(
     :param base_link: Base link name in the URDF (required).
     :param ee_link: End-effector link name in the URDF (required).
     :param output_dir: Working directory for the Python artifact and context dump.
-    :param oem_name: OEM name for crate naming and provenance (e.g. "Flexiv").
+    :param oem_name: OEM name for crate naming and provenance (default: URDF stem).
     :param repo_root: dexforge source tree root (provides kernels and driver paths).
     :param max_retries: Number of LLM retry attempts after the initial attempt.
     :param llm_key: LLM API key (overrides DEXFORGE_LLM_KEY env var).
@@ -457,6 +517,8 @@ def generate_ik(
         from codegen.ik_prompt import generate_context  # type: ignore[no-redef]
 
     arm_name = urdf.stem if urdf is not None else ""
+    oem_name = oem_name or arm_name
+    error: Optional[str] = "LLM generation did not produce a buildable crate"
 
     # --- Step 0/1/2: artifact + family + context entrypoint ---
     try:
@@ -469,7 +531,6 @@ def generate_ik(
         )
         ssik_artifact = entry.ssik_artifact
         arm_name = entry.arm_name
-        example_arm = entry.example_arm
         max_solutions = entry.max_solutions
         dof = entry.dof
         context = entry.context
@@ -543,19 +604,61 @@ def generate_ik(
             urdf,
         )
 
+        # --- Step 6b: Symbolic FK/Jacobian/dynamics BEFORE cargo build ---
+        # arm.rs / lib.rs re-export generated_kinematics + generated_dynamics;
+        # those modules come from SymPy, not the LLM. Generate them once and
+        # reuse across LLM retries so we do not pay the SymPy cost repeatedly.
+        driver_dir = output_dir / "src" / "drivers" / arm_name
+        dyn_rs = driver_dir / "generated_dynamics.rs"
+        if attempt == 0 or not dyn_rs.is_file():
+            print(
+                f"[ik_generator] Step 6b: Compiling symbolic kinematics + "
+                f"dynamics for '{arm_name}' …"
+            )
+            ok_dyn, dyn_msg = generate_dynamics_for_arm(
+                arm_name,
+                Path(urdf),
+                output_dir,
+                ssik_artifact=None,
+                base_link=base_link,
+                ee_link=ee_link,
+            )
+            if not ok_dyn:
+                return False, arm_name, dyn_msg
+            print(f"[ik_generator]   ✓ {dyn_msg}")
+        else:
+            _wire_generated_dynamics_module(driver_dir)
+            print(
+                "[ik_generator] Step 6b: Reusing existing generated_dynamics.rs "
+                "(skip SymPy on retry)."
+            )
+
+        # --- Step 6c: Pinocchio golden data + dynamics_parity before cargo test ---
+        print(
+            f"[ik_generator] Step 6c: Ensuring Pinocchio dynamics parity for "
+            f"'{arm_name}' …"
+        )
+        ok_parity, parity_msg = ensure_dynamics_parity(
+            arm_name,
+            Path(urdf),
+            output_dir,
+            force=(attempt == 0),
+            base_link=base_link,
+            ee_link=ee_link,
+        )
+        if not ok_parity:
+            return False, arm_name, parity_msg
+        print(f"[ik_generator]   ✓ {parity_msg}")
+
         # --- Step 7/8/9: scripts + build + test ---
         error = build_and_verify(
             generator_scripts=written,
             output_dir=output_dir,
-            attempt=attempt,
-            max_attempts=max_attempts,
-            raw_response=raw_response,
-            messages=messages,
         )
         if error is None:
-            break
+            return True, arm_name, ""
 
-        # on failure, append the error to the message history and retry; on success, break out of the loop
+        # on failure, append the error to the message history and retry
         messages.append({"role": "assistant", "content": raw_response})
         messages.append({
             "role": "user",
@@ -565,14 +668,295 @@ def generate_ik(
             ),
         })
 
-    return (True, arm_name, entry.ssik_artifact, "") if error is None else (False, arm_name, entry.ssik_artifact, f"Build failure after {max_attempts} attempts: {error}")
+    return False, arm_name, f"Build failure after {max_attempts} attempts: {error}"
+
+
+# Backwards-compatible alias used by older tests / docs.
+generate_driver_from_urdf = generate_ik
+
+
+def _reexport_generated_dynamics(driver_dir: Path) -> None:
+    """Add the crate-root ``generated_dynamics`` re-export once the module exists.
+
+    ``plan_export`` omits it for an arm without dynamics; when the dynamics step
+    later writes ``generated_dynamics.rs``, the crate root must expose it again.
+    """
+    lib_path = driver_dir.parent.parent / "lib.rs"
+    if not (driver_dir / "generated_dynamics.rs").is_file() or not lib_path.is_file():
+        return
+    line = f"pub use drivers::{driver_dir.name}::generated_dynamics;"
+    text = lib_path.read_text(encoding="utf-8")
+    if line not in text:
+        lib_path.write_text(text.rstrip("\n") + "\n" + line + "\n", encoding="utf-8")
+
+
+def _wire_generated_dynamics_module(driver_dir: Path) -> None:
+    """Ensure the per-arm ``mod.rs`` compiles kinematics + dynamics kernels."""
+    _reexport_generated_dynamics(driver_dir)
+    mod_path = driver_dir / "mod.rs"
+    required = (
+        "pub mod arm;",
+        "pub mod generated_dynamics;",
+        "pub mod generated_kinematics;",
+        "pub mod ik_solver;",
+    )
+    if not mod_path.is_file():
+        mod_path.write_text(
+            "//! Auto-generated driver module index.\n\n"
+            + "\n".join(required)
+            + "\n\n#[cfg(test)]\nmod dynamics_parity;\n",
+            encoding="utf-8",
+        )
+        return
+    text = mod_path.read_text(encoding="utf-8")
+    additions = [line for line in required if line.split(";")[0] not in text]
+    if additions:
+        # Insert public kernel modules after ik_solver when present; else append.
+        if "pub mod ik_solver;" in text:
+            insert_at = text.index("pub mod ik_solver;") + len("pub mod ik_solver;")
+            text = text[:insert_at] + "\n" + "\n".join(additions) + text[insert_at:]
+        else:
+            text = text.rstrip() + "\n\n" + "\n".join(additions) + "\n"
+    if "mod dynamics_parity" not in text:
+        text = text.rstrip() + "\n\n#[cfg(test)]\nmod dynamics_parity;\n"
+    mod_path.write_text(text, encoding="utf-8")
+
+
+def _parse_triple_floats(
+    text: Optional[str], default: Tuple[float, float, float]
+) -> Tuple[float, float, float]:
+    if text is None:
+        return default
+    parts = [float(v) for v in text.split()]
+    if len(parts) != 3:
+        raise ValueError(f"expected 3 values, got {text!r}")
+    return (parts[0], parts[1], parts[2])
+
+
+def _extract_urdf_kinematic_signature(
+    urdf_path: Path, base_link: str, ee_link: str
+) -> List[tuple]:
+    """Extract the normalized kinematic joint chain signature from *urdf_path*."""
+    import math
+
+    root = ET.parse(urdf_path).getroot()
+    by_child: Dict[str, tuple] = {}
+    for j in root.findall("joint"):
+        parent_el = j.find("parent")
+        child_el = j.find("child")
+        if parent_el is None or child_el is None:
+            continue
+        parent = parent_el.get("link", "")
+        child = child_el.get("link", "")
+        jtype = j.get("type", "fixed")
+        axis_el = j.find("axis")
+        ax = _parse_triple_floats(
+            axis_el.get("xyz") if axis_el is not None else None, (0.0, 0.0, 1.0)
+        )
+        if jtype in ("revolute", "continuous", "prismatic"):
+            norm = math.sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2])
+            if norm < 1e-12:
+                raise ValueError(f"joint {j.get('name')!r} has zero-length axis")
+            ax = (
+                round(ax[0] / norm, 9),
+                round(ax[1] / norm, 9),
+                round(ax[2] / norm, 9),
+            )
+        else:
+            ax = (0.0, 0.0, 0.0)
+        origin_el = j.find("origin")
+        xyz = tuple(
+            round(v, 9)
+            for v in _parse_triple_floats(
+                origin_el.get("xyz") if origin_el is not None else None,
+                (0.0, 0.0, 0.0),
+            )
+        )
+        rpy = tuple(
+            round(v, 9)
+            for v in _parse_triple_floats(
+                origin_el.get("rpy") if origin_el is not None else None,
+                (0.0, 0.0, 0.0),
+            )
+        )
+        by_child[child] = (j.get("name", ""), jtype, parent, child, ax, xyz, rpy)
+
+    if ee_link not in by_child:
+        raise ValueError(
+            f"ee_link {ee_link!r} not found as a child link in {urdf_path}"
+        )
+    rev_chain: List[tuple] = []
+    link = ee_link
+    visited = set()
+    while link != base_link and link in by_child:
+        if link in visited:
+            raise ValueError(f"cycle in URDF chain at {link!r}")
+        visited.add(link)
+        entry = by_child[link]
+        rev_chain.append(entry)
+        link = entry[2]
+    if link != base_link:
+        raise ValueError(
+            f"URDF chain from {ee_link!r} did not reach base_link {base_link!r}"
+        )
+    return list(reversed(rev_chain))
+
+
+def _cached_driver_inputs_match(
+    driver_src: Path,
+    urdf: Path,
+    base_link: Optional[str],
+    ee_link: Optional[str],
+) -> bool:
+    """Validate *urdf* and ``(base_link, ee_link)`` for ``--from-existing``.
+
+    Returns ``True`` when the cached dynamics + Pinocchio dataset in *driver_src*
+    can be reused directly, or ``False`` when only ``<inertial>`` / non-kinematic
+    URDF data changed (so dynamics and Pinocchio ground truth must be
+    regenerated).
+
+    :raises ValueError: If ``(base_link, ee_link)`` or the URDF's joint
+        kinematics differ from the committed driver (since ``--from-existing``
+        reuses the committed IK solver and kinematics artifact).
+    """
+    import re
+
+    arm = driver_src.name
+    cached_urdf = driver_src / f"{arm}.urdf"
+    if not cached_urdf.is_file():
+        urdfs = sorted(driver_src.glob("*.urdf"))
+        if len(urdfs) != 1:
+            return False
+        cached_urdf = urdfs[0]
+
+    cached_base: Optional[str] = None
+    cached_ee: Optional[str] = None
+    ik_rs = driver_src / "ik_solver.rs"
+    if ik_rs.is_file():
+        text = ik_rs.read_text(encoding="utf-8")
+        mb = re.search(r'BASE_LINK\s*:\s*&str\s*=\s*"([^"]+)"', text)
+        me = re.search(r'EE_LINK\s*:\s*&str\s*=\s*"([^"]+)"', text)
+        if mb:
+            cached_base = mb.group(1)
+        if me:
+            cached_ee = me.group(1)
+
+    if cached_base is None or cached_ee is None:
+        from generate_dynamics import extract_base_ee_links
+
+        for cand in (
+            *sorted(driver_src.glob("*_ik.py")),
+            *sorted(driver_src.glob("codegen/*_ik.py")),
+            f"{arm}_ik",
+        ):
+            try:
+                mod = load_artifact(str(cand))
+                art_b, art_e = extract_base_ee_links(mod)
+                cached_base = cached_base or art_b
+                cached_ee = cached_ee or art_e
+                if cached_base and cached_ee:
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+
+    if cached_base is not None and cached_ee is not None:
+        if base_link != cached_base or ee_link != cached_ee:
+            raise ValueError(
+                f"--from-existing for {arm!r} requires --base {cached_base!r} "
+                f"and --ee {cached_ee!r} to match the existing IK solver "
+                f"(got --base {base_link!r}, --ee {ee_link!r}). Omit "
+                f"--from-existing to compile a driver for different frames."
+            )
+
+    try:
+        if Path(urdf).read_bytes() == cached_urdf.read_bytes():
+            return True
+    except OSError:
+        return False
+
+    if base_link and ee_link:
+        try:
+            cached_sig = _extract_urdf_kinematic_signature(
+                cached_urdf, base_link, ee_link
+            )
+        except Exception:  # noqa: BLE001
+            cached_sig = None
+        if cached_sig is not None:
+            try:
+                new_sig = _extract_urdf_kinematic_signature(
+                    Path(urdf), base_link, ee_link
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"--from-existing URDF {urdf} is incompatible with the "
+                    f"existing {arm!r} kinematic chain ({base_link!r} -> "
+                    f"{ee_link!r}): {exc}"
+                ) from exc
+            if new_sig != cached_sig:
+                raise ValueError(
+                    f"--from-existing cannot change joint kinematics for {arm!r} "
+                    f"(the existing IK solver and FK/Jacobian artifact are baked "
+                    f"for the committed geometry; only <inertial> changes are "
+                    f"supported with --from-existing)."
+                )
+
+    return False
+
+
+def ensure_dynamics_parity(
+    arm: str,
+    urdf: Path,
+    crate_root: Path,
+    samples: int = 1_000,
+    seed: int = 0,
+    force: bool = False,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
+) -> tuple:
+    """Emit Pinocchio golden data + ``dynamics_parity`` tests into the crate.
+
+    Skips regeneration when ``dynamics_test_data.bin`` already exists unless
+    *force* is set (LLM retries reuse the golden file).
+
+    :returns: ``(success, message)``.
+    """
+    from generate_dynamics_test_data import write_ground_truth
+
+    driver_dir = crate_root / "src" / "drivers" / arm
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    bin_path = driver_dir / "dynamics_test_data.bin"
+    parity_rs = driver_dir / "dynamics_parity.rs"
+
+    if bin_path.is_file() and parity_rs.is_file() and not force:
+        _wire_generated_dynamics_module(driver_dir)
+        return True, f"reusing existing Pinocchio golden data under {driver_dir}"
+
+    try:
+        write_ground_truth(
+            urdf=Path(urdf),
+            output_dir=driver_dir,
+            arm=arm,
+            samples=samples,
+            seed=seed,
+            base_link=base_link,
+            ee_link=ee_link,
+        )
+    except ImportError as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Pinocchio ground-truth generation failed: {exc}"
+
+    _wire_generated_dynamics_module(driver_dir)
+    return True, f"wrote Pinocchio golden data + dynamics_parity under {driver_dir}"
 
 
 def generate_dynamics_for_arm(
     arm: str,
-    ssik_artifact: Path,
     urdf: Path,
     crate_root: Path,
+    ssik_artifact: Optional[Path] = None,
+    base_link: Optional[str] = None,
+    ee_link: Optional[str] = None,
 ) -> tuple:
     """Compile the arm's full rigid-body kinematics + dynamics in the crate root.
 
@@ -588,10 +972,54 @@ def generate_dynamics_for_arm(
     :param urdf: Source URDF (supplies link masses/inertias for dynamics); the
         dynamics functions are emitted only when it carries ``<inertial>`` data.
     :param crate_root: Generated crate root directory.
+    :param ssik_artifact: Optional path/name of the ssik ``*_ik`` artifact. When
+        omitted, the first ``*_ik.py`` under the driver directory is used.
     :returns: ``(success, combined_output)``.
     """
     from generate_dynamics import generate
-    return generate(ssik_artifact, urdf, arm, crate_root)
+
+    driver_dir = crate_root / "src" / "drivers" / arm
+    driver_dir.mkdir(parents=True, exist_ok=True)
+
+    artifact: Optional[Path | str] = ssik_artifact
+    if artifact is None:
+        matches = sorted(driver_dir.glob("*_ik.py"))
+        if not matches:
+            matches = sorted(driver_dir.glob("codegen/*_ik.py"))
+        if not matches:
+            matches = sorted(crate_root.rglob("*_ik.py"))
+        if matches:
+            artifact = matches[0]
+        else:
+            # Fall back to the ssik prebuilt name derived from the arm
+            # (e.g. ur5 → ur5_ik). Requires `pip install ssik`.
+            artifact = f"{arm}_ik"
+
+    out_rs = driver_dir / "generated_dynamics.rs"
+    code = generate(
+        str(artifact),
+        Path(urdf),
+        arm,
+        out_rs,
+        base_link=base_link,
+        ee_link=ee_link,
+    )
+    if code != 0:
+        return False, f"generate_dynamics failed for {arm} (exit {code})"
+
+    # Kinematics-only consumers import generated_kinematics; re-export DOF, fk
+    # and jacobian from generated_dynamics so the CSE expressions are compiled once.
+    kin_rs = driver_dir / "generated_kinematics.rs"
+    kin_rs.write_text(
+        f"//! Auto-generated symbolic kinematics re-exports for `{arm}`.\n"
+        "//! `fk` and `jacobian` live in [`super::generated_dynamics`]; "
+        "re-exporting avoids compiling duplicate copies.\n\n"
+        "pub use super::generated_dynamics::{DOF, fk, jacobian};\n",
+        encoding="utf-8",
+    )
+
+    _wire_generated_dynamics_module(driver_dir)
+    return True, f"wrote {out_rs} and {kin_rs}"
 
 def _build(args: argparse.Namespace) -> int:
     """Handle ``dexforge build --urdf``: translate a URDF, then verify the crate."""
@@ -618,30 +1046,112 @@ def _build(args: argparse.Namespace) -> int:
     if args.list:
         print("[dexforge] compile plan (1 crate):")
         print(f"  {urdf.stem} -> {base}")
-        print("      generated in-place in the requested output directory")
+        if getattr(args, "from_existing", False):
+            print("      seed from existing in-repo driver (--from-existing)")
+        else:
+            print("      LLM translation + symbolic dynamics")
         return 0
 
-    print(f"[dexforge] translating {urdf.name} into an IK driver via the LLM …")
-    ok, arm, output = generate_ik(
-        urdf, args.base, args.ee, repo_root, base, args.llm_key, args.llm_url, args.llm_model, args.llm_max_retries
+    arm = urdf.stem
+    reuse_cached_dynamics = True
+    if getattr(args, "from_existing", False):
+        # Package the already-translated in-repo driver as a stand-alone crate.
+        # Used to prove the packaging / dynamics half of the pipeline (and to
+        # compare against the committed driver) without calling an LLM.
+        print(
+            f"[dexforge] seeding '{arm}' stand-alone crate from in-repo driver "
+            f"(--from-existing) …"
+        )
+        try:
+            driver_src = _driver_dir(repo_root, arm)
+            reuse_cached_dynamics = _cached_driver_inputs_match(
+                driver_src, Path(urdf), args.base, args.ee
+            )
+            export = plan_export(
+                arm,
+                base,
+                repo_root,
+                crate_name=args.name,
+            )
+            write_export(export)
+            if not reuse_cached_dynamics:
+                shutil.copyfile(urdf, base / urdf.name)
+                seeded_driver = base / "src" / "drivers" / arm
+                for stale in (
+                    "generated_dynamics.rs",
+                    "dynamics_test_data.bin",
+                    "dynamics_test_data.rs",
+                    "dynamics_parity.rs",
+                ):
+                    stale_path = seeded_driver / stale
+                    if stale_path.is_file():
+                        stale_path.unlink()
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"[dexforge] ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"[dexforge]   \u2713 seeded '{arm}' driver under {base}.")
+    else:
+        print(f"[dexforge] translating {urdf.name} into an IK driver via the LLM …")
+        max_retries = (
+            args.max_retries
+            if getattr(args, "max_retries", None) is not None
+            else _MAX_RETRIES
+        )
+        ok, arm, output = generate_ik(
+            urdf=urdf,
+            base_link=args.base,
+            ee_link=args.ee,
+            repo_root=repo_root,
+            output_dir=base,
+            oem_name=args.name or urdf.stem,
+            max_retries=max_retries,
+            llm_key=args.llm_key,
+            llm_url=args.llm_url,
+            llm_model=args.llm_model,
+        )
+        if not ok:
+            print(
+                f"[dexforge] ERROR: URDF→driver translation failed:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[dexforge]   \u2713 generated '{arm}' driver under {base}.")
+
+    dyn_rs = base / "src" / "drivers" / arm / "generated_dynamics.rs"
+    if reuse_cached_dynamics and dyn_rs.is_file():
+        print(
+            f"[dexforge]   \u2713 kinematics/dynamics already present for '{arm}' "
+            f"(skipping SymPy recompile)."
+        )
+    else:
+        print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
+        ok, output = generate_dynamics_for_arm(
+            arm, Path(urdf), base, base_link=args.base, ee_link=args.ee
+        )
+        if not ok:
+            print(
+                f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under {base}.")
+
+    print(f"[dexforge] ensuring Pinocchio dynamics parity for '{arm}' …")
+    ok, output = ensure_dynamics_parity(
+        arm,
+        Path(urdf),
+        base,
+        force=not reuse_cached_dynamics,
+        base_link=args.base,
+        ee_link=args.ee,
     )
     if not ok:
         print(
-            f"[dexforge] ERROR: URDF→driver translation failed:\n{output}",
+            f"[dexforge] ERROR: Pinocchio dynamics parity setup failed:\n{output}",
             file=sys.stderr,
         )
         return 1
-    print(f"[dexforge]   \u2713 generated '{arm}' driver under {base}.")
-
-    print(f"[dexforge] compiling full kinematics + dynamics for '{arm}' …")
-    ok, output = generate_dynamics_for_arm(arm, urdf, base)
-    if not ok:
-        print(
-            f"[dexforge] ERROR: kinematics/dynamics compilation failed:\n{output}",
-            file=sys.stderr,
-        )
-        return 1
-    print(f"[dexforge]   \u2713 compiled FK, Jacobian and dynamics under {base}.")
+    print(f"[dexforge]   \u2713 {output}")
 
     if args.verify:
         print("[dexforge]   verifying standalone build (cargo build --release) …")
@@ -747,6 +1257,15 @@ def build_parser() -> argparse.ArgumentParser:
         dest="verify",
         action="store_false",
         help="Skip the standalone 'cargo build' verification of each crate.",
+    )
+    build_p.add_argument(
+        "--from-existing",
+        action="store_true",
+        help=(
+            "Skip the LLM and seed the stand-alone crate from the matching "
+            "in-repo driver (resolved from --urdf stem, e.g. ur5.urdf → ur5). "
+            "Still runs the symbolic dynamics compiler and cargo verify."
+        ),
     )
     build_p.set_defaults(func=_build, verify=True)
     return parser

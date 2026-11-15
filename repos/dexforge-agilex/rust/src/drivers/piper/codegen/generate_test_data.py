@@ -43,11 +43,18 @@ Run from the repository root:
 
 from __future__ import annotations
 
-import os
-import subprocess
+from pathlib import Path
+import sys
 
 import numpy as np
 from ssik.prebuilt import piper_ik as P
+
+_DRIVER_DIR = Path(__file__).resolve().parent.parent
+_REPO_ROOT = _DRIVER_DIR.parents[5]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from codegen.ik_test_data import IKCase, write_ik_test_data  # noqa: E402
 
 N_POSES = 500
 SEED = 7
@@ -56,8 +63,6 @@ SEED = 7
 # within this tolerance; it is run through the `piper_solve` example harness so
 # the dataset stays in sync with the real numeric pipeline.
 REPRO_TOL = 1e-6
-REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
-DEST = os.path.join(REPO_ROOT, "src", "drivers", "piper", "test_data.rs")
 
 
 def _rust_solutions(poses):
@@ -104,70 +109,53 @@ def main() -> None:
         ref_false = [s.q for s in P.solve(t, respect_limits=False)]
         if len(ref_false) <= 1:
             continue
-        candidates.append((t, ref_false))
+        candidates.append((q, t, ref_false))
 
-    poses = [t for t, _ in candidates]
+    poses = [t for _, t, _ in candidates]
     rust = _rust_solutions(poses)
 
     cases = []
     singular = 0
-    for (t, ref_false), mine in zip(candidates, rust):
+    for (q, t, ref_false), mine in zip(candidates, rust):
         if _reproduces(ref_false, mine):
-            cases.append((t, ref_false, False))
+            sols = [list(map(float, s)) for s in ref_false]
+            cases.append(
+                IKCase(
+                    q_fk=q.tolist(),
+                    tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
+                    solutions=sols,
+                    singular=False,
+                )
+            )
         else:
             # Singular pose: compare against the complete `allow_refinement=True`
             # set in FK-residual space with a relaxed joint tolerance.
             ref_true = [s.q for s in P.solve(t, respect_limits=False, allow_refinement=True)]
-            cases.append((t, ref_true, True))
+            sols = [list(map(float, s)) for s in ref_true]
+            cases.append(
+                IKCase(
+                    q_fk=q.tolist(),
+                    tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
+                    solutions=sols,
+                    singular=True,
+                )
+            )
             singular += 1
 
-    _write_rust(cases)
+    bin_path, rs_path = write_ik_test_data(
+        driver_dir=_DRIVER_DIR,
+        arm="piper",
+        dof=6,
+        cases=cases,
+        has_singular_tuple=True,
+        allow_refinement=False,
+        refinement_max_iters=15,
+    )
     print(
         f"kept {len(cases)}/{len(candidates)} multi-solution poses "
-        f"(of {N_POSES} sampled) to {DEST}; "
+        f"(of {N_POSES} sampled) to {bin_path} and {rs_path}; "
         f"{len(cases) - singular} strict, {singular} singular"
     )
-
-
-def _fmt(x: float) -> str:
-    return repr(float(x))
-
-
-def _write_rust(cases) -> None:
-    lines = [
-        "//! Auto-generated Piper IK regression data. Regenerate with",
-        "//! `python codegen/generate_test_data.py`.",
-        "//!",
-        "//! Each entry is `(row-major 4x4 pose, &[expected joint solutions],",
-        "//! singular)`, captured by running the reference Piper solver and",
-        "//! retaining every multi-solution pose (all 500 sampled poses):",
-        "//!",
-        "//! * `singular == false` — the Rust pipeline reproduces the unrefined",
-        "//!   `ssik.prebuilt.piper_ik.solve(T, respect_limits=False)` output",
-        "//!   exactly (count + value); the test asserts an exact joint-space",
-        "//!   match.",
-        "//! * `singular == true` — the pose sits at a kinematic singularity",
-        "//!   where bounded Francis-QR and LAPACK resolve near-double roots",
-        "//!   differently. The solutions are the *complete*",
-        "//!   `allow_refinement=True` reference set; the test compares the Rust",
-        "//!   output in Cartesian / FK-residual space with a relaxed joint",
-        "//!   tolerance (see `ik_solver`'s test module).",
-        "",
-        "/// `(pose, solutions, singular)` regression cases.",
-        "pub static CASES: &[(&[f64; 16], &[[f64; 6]], bool)] = &[,",
-    ]
-    lines[-1] = "pub static CASES: &[(&[f64; 16], &[[f64; 6]], bool)] = &["
-    for t, sols, singular in cases:
-        pose = ", ".join(_fmt(v) for v in np.asarray(t, dtype=np.float64).reshape(-1))
-        lines.append(f"    (&[{pose}], &[")
-        for q in sols:
-            joints = ", ".join(_fmt(v) for v in np.asarray(q, dtype=np.float64))
-            lines.append(f"        [{joints}],")
-        lines.append(f"    ], {'true' if singular else 'false'}),")
-    lines.append("];")
-    lines.append("")
-    with open(DEST, "w") as f:
-        f.write("\n".join(lines))
 
 
 if __name__ == "__main__":

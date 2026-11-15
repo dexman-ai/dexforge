@@ -38,7 +38,7 @@ ARMS = {
     "rizon10": "ssik.prebuilt.rizon10_ik",
 }
 
-REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+DRIVERS_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _CACHE_DIR = os.path.join(tempfile.gettempdir(), "rizon_compose_cache")
 
 

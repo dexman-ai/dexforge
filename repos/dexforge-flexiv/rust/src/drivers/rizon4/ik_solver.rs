@@ -38,6 +38,12 @@ pub const SOLVER_NAME: &str = "jointlock.seven_r";
 /// Solver tier — mirrors `SOLVER_TIER` in the Python artifact.
 pub const SOLVER_TIER: u32 = 1;
 
+/// Base link name in the URDF.
+pub const BASE_LINK: &str = "base_link";
+
+/// End-effector link name in the URDF.
+pub const EE_LINK: &str = "flange";
+
 /// Home pose: 4×4 SE(3) of the flange in `base_link` at `q = [0; 7]`.
 /// Mirrors `T_HOME` in the Python artifact.
 pub const T_HOME: [[f64; 4]; 4] = consts::T_HOME;
@@ -165,11 +171,13 @@ mod tests {
         //    bounded Francis-QR route and the reference resolve near-double
         //    roots to slightly different points on the same self-motion
         //    manifold.
+        assert!(!test_data::ssik_version().is_empty());
+        let cases = test_data::cases();
         let mut total_expected = 0usize;
         let mut strict_cases = 0usize;
         let mut singular_cases = 0usize;
         let mut case_idx = 0usize;
-        for (tf_arr, expected, singular) in test_data::CASES {
+        for (tf_arr, expected, singular) in &cases {
             let tf = tf_from_row_major(tf_arr);
             let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
             let got: Vec<[f64; 7]> = sols.iter().flatten().copied().collect();
@@ -228,13 +236,13 @@ mod tests {
             case_idx += 1;
         }
         assert!(total_expected > 0, "no expected solutions in dataset");
-        assert_eq!(case_idx, test_data::CASES.len());
+        assert_eq!(case_idx, cases.len());
         assert!(strict_cases > 0 || singular_cases > 0);
     }
 
     #[test]
     fn respect_limits_subset() {
-        for (tf_arr, _expected, _singular) in test_data::CASES.iter().take(64) {
+        for (tf_arr, _expected, _singular) in test_data::cases().iter().take(64) {
             let tf = tf_from_row_major(tf_arr);
             let raw = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
             let lim = solve(&tf, None, None, true, false, TolerancePolicy::DEFAULT, 15);
@@ -259,7 +267,7 @@ mod tests {
 
     #[test]
     fn max_solutions_cap() {
-        let (tf_arr, _, _) = test_data::CASES[0];
+        let (tf_arr, _, _) = &test_data::cases()[0];
         let tf = tf_from_row_major(tf_arr);
         let all_sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
         let n_all: usize = all_sols.iter().flatten().count();

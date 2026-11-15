@@ -20,3 +20,6 @@ dist/
 **/*.dll
 *.pyd
 **/*.pyd
+.DS_Store
+**/.DS_Store
+

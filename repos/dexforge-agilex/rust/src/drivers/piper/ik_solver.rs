@@ -62,6 +62,12 @@ mod test_data;
 /// Degrees of freedom of the Piper.
 pub const DOF: usize = 6;
 
+/// Base link name in the URDF.
+pub const BASE_LINK: &str = "base_link";
+
+/// End-effector link name in the URDF.
+pub const EE_LINK: &str = "link6";
+
 const TWO_PI: f64 = 2.0 * PI;
 
 /// 2-norm condition number of the equilibrated leading matrix `A_eq` above
@@ -709,11 +715,13 @@ mod tests {
 
     #[test]
     fn matches_ssik_reference_dataset() {
+        assert!(!test_data::ssik_version().is_empty());
+        let cases = test_data::cases();
         let mut total_expected = 0usize;
         let mut strict_cases = 0usize;
         let mut singular_cases = 0usize;
         let mut case_idx = 0usize;
-        for (tf_arr, expected, singular) in test_data::CASES {
+        for (tf_arr, expected, singular) in &cases {
             let tf = tf_from_row_major(tf_arr);
             let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
             let got: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
@@ -775,7 +783,7 @@ mod tests {
             case_idx += 1;
         }
         assert!(total_expected > 0, "no expected solutions in dataset");
-        assert_eq!(case_idx, test_data::CASES.len());
+        assert_eq!(case_idx, cases.len());
         // The full 500-pose sample is retained; a non-trivial share exercises
         // the singular (FK-residual) comparison path.
         assert!(strict_cases > 0 && singular_cases > 0);
@@ -790,7 +798,7 @@ mod tests {
         // path is covered: every root it returns must close the original,
         // unperturbed target pose in Cartesian space.
         let mut covered = 0usize;
-        for (tf_arr, _expected, _singular) in test_data::CASES.iter().take(16) {
+        for (tf_arr, _expected, _singular) in test_data::cases().iter().take(16) {
             let tf = tf_from_row_major(tf_arr);
             let mut out = [[0.0f64; 6]; 16];
             let n = spatial_bypass(&tf, TolerancePolicy::DEFAULT, &mut out);
@@ -820,7 +828,7 @@ mod tests {
 
     #[test]
     fn max_solutions_cap() {
-        let (tf_arr, _, _) = test_data::CASES[0];
+        let (tf_arr, _, _) = &test_data::cases()[0];
         let tf = tf_from_row_major(tf_arr);
         let all_sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
         let n_all: usize = all_sols.iter().flatten().count();
@@ -833,7 +841,7 @@ mod tests {
 
     #[test]
     fn q_seed_sorts_nearest_first() {
-        let (tf_arr, _, _) = test_data::CASES[0];
+        let (tf_arr, _, _) = &test_data::cases()[0];
         let tf = tf_from_row_major(tf_arr);
         let zero = [0.0f64; 6];
         let sols = solve(&tf, None, Some(&zero), false, false, TolerancePolicy::DEFAULT, 15);

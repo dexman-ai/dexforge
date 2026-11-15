@@ -38,6 +38,12 @@ mod test_data;
 /// Degrees of freedom of the UR5.
 pub const DOF: usize = 6;
 
+/// Base link name in the URDF.
+pub const BASE_LINK: &str = "base_link";
+
+/// End-effector link name in the URDF.
+pub const EE_LINK: &str = "ee_link";
+
 // --- algebraic-block degeneracy constants from ur5_ik.py ---
 const TWO_PI: f64 = 2.0 * PI;
 
@@ -567,10 +573,11 @@ mod tests {
 
     #[test]
     fn matches_ssik_reference_dataset() {
+        assert!(!test_data::ssik_version().is_empty());
         let tol = 1e-5;
         let mut total_expected = 0usize;
         let mut case_idx = 0usize;
-        for (tf_arr, expected) in test_data::CASES {
+        for (tf_arr, expected) in &test_data::cases() {
             let tf = tf_from_row_major(tf_arr);
             let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
             let got: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();

@@ -119,7 +119,7 @@ def main():
     out.append("")
 
     here = os.path.dirname(os.path.abspath(__file__))
-    dest = os.path.join(here, "..", "src", "drivers", "xarm7", "consts.rs")
+    dest = os.path.join(here, "..", "consts.rs")
     with open(dest, "w") as fh:
         fh.write("\n".join(out))
     print("wrote", os.path.normpath(dest))

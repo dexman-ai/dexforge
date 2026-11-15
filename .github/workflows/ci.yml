@@ -26,6 +26,7 @@ jobs:
           - dexforge-franka
           - dexforge-ufactory
           - dexforge-flexiv
+          - dexforge-unitree
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +36,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.12"
           cache: "pip"
 
       - name: Create virtual environment
@@ -66,10 +67,18 @@ jobs:
       - name: Cache cargo build
         uses: actions/cache@v4
         with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          path: repos/${{ matrix.oem }}/target
+          key: ${{ runner.os }}-cargo-build-${{ matrix.oem }}-${{ hashFiles('repos/**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-build-target-
+            ${{ runner.os }}-cargo-build-${{ matrix.oem }}-
+
+      - name: Run OEM Rust tests
+        run: cargo test --release --manifest-path repos/${{ matrix.oem }}/rust/Cargo.toml
+
+      - name: Verify ssik reference data version
+        run: |
+          source .venv/bin/activate
+          python codegen/ik_test_data.py --check
 
       - name: Build and install Python bindings
         run: |
@@ -81,3 +90,41 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest repos/${{ matrix.oem }}/python/tests -v
+
+  codegen-and-core:
+    name: Codegen & Core Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Create virtual environment
+        run: python -m venv .venv
+
+      - name: Install Python dependencies
+        run: |
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install pytest numpy sympy pin $(grep '^ssik==' SSIK_VERSION.txt)
+
+      - name: Verify ssik reference data version
+        run: |
+          source .venv/bin/activate
+          python codegen/ik_test_data.py --check
+
+      - name: Run codegen tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest codegen/tests -v
+
+      - name: Run dexhal Rust tests
+        run: cargo test --release --manifest-path repos/dexhal/Cargo.toml
+

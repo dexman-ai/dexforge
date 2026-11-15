@@ -86,8 +86,8 @@ for k,v in arrays.items():
 
 import os
 
-dest = os.path.join(os.path.dirname(__file__), "..", "src", "drivers", "piper", "pq.rs")
-with open(os.path.normpath(dest), "w") as f:
+dest = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "pq.rs"))
+with open(dest, "w") as f:
     f.write("//! Per-arm Raghavan-Roth `(P_sin, P_cos, P_one, Q)` matrix builder for the\n")
     f.write("//! AgileX Piper, translated verbatim from\n")
     f.write("//! `ssik.prebuilt.piper_ik._build_pq_matrices`.\n")
