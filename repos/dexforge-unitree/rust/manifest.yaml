@@ -1,0 +1,40 @@
+# Manifest of the Z1 (`Z1`, vendor "unitree").
+#
+# Loaded by `Z1Driver::new()` through
+# `ArmManifest::from_text::<Z1, 6, 16>`; see
+# repos/dexhal/examples/manifest.yaml for every key. Scaffolded by
+# codegen/scaffold.py: `limits.velocity` / `limits.effort` come from the URDF
+# <limit> tags. Every `TODO` must be replaced from the OEM data sheet / protocol
+# specification (the manifest does not parse until they are).
+
+driver: z1               # must equal Z1::NAME
+version: "0.2"
+control_freq_hz: 500          # rate at which the controller expects commands
+control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose, cartesian_twist]
+realtime: true
+
+latency:
+  state_staleness_cycles: 1
+  command_dispatch_cycles: 1
+
+limits:
+  velocity: [3.1415, 3.1415, 3.1415, 3.1415, 3.1415, 3.1415]   # rad/s  (URDF <limit velocity>)
+  acceleration: [15.0, 15.0, 15.0, 15.0, 15.0, 15.0]   # rad/s^2
+  effort: [30.0, 60.0, 30.0, 30.0, 30.0, 30.0]   # N*m  (URDF <limit effort>)
+
+has_static_inertials: true
+
+sensing:
+  torque: true
+  wrench: false
+  gripper: true
+
+native:
+  cartesian_impedance: false
+  cartesian_admittance: false
+  joint_impedance: true
+  joint_admittance: false
+  contact_detection: false
+  reflexes: false
+  payload: false
+  tcp_offset: false

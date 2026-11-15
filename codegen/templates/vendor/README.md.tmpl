@@ -1,0 +1,12 @@
+# dexforge-{{oem}}
+
+{{oem_title}} arm drivers for [`dexhal`](../dexhal/README.md).
+
+The crate in `rust/` links against `dexhal` and owns only the arm-specific
+generated kinematics, analytical IK, dynamics and hardware I/O. It was
+scaffolded with `codegen/scaffold.py`; see `codegen/README.md` for the
+generation workflow.
+
+```sh
+cargo test --manifest-path repos/dexforge-{{oem}}/Cargo.toml
+```

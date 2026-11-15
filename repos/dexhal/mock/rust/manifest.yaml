@@ -1,0 +1,37 @@
+# Manifest of the mock arm (`MockArm`, vendor "mock").
+#
+# Loaded by `MockDriver::default_arm()` and exported as `dexforge_mock_core::MANIFEST`.
+# The mock executes every command natively in software, so it lists every
+# control mode and reflects the sensing channels below back in its state.
+
+driver: mock-6r               # must equal MockArm::NAME
+version: "0.2"
+control_freq_hz: 500
+control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose, cartesian_twist, cartesian_wrench]
+realtime: false
+
+latency:
+  state_staleness_cycles: 1
+  command_dispatch_cycles: 2
+
+limits:
+  velocity: [3.15, 3.15, 3.15, 3.2, 3.2, 3.2]
+  acceleration: [15.0, 15.0, 15.0, 15.0, 15.0, 15.0]
+  effort: [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]
+  position_min: [-3.0, -6.2, -6.2, -6.2, -6.2, -.inf]
+  position_max: [3.0, 6.2, 6.2, 6.2, 6.2, .inf]
+
+sensing:
+  torque: true
+  wrench: true
+  gripper: true
+
+native:
+  cartesian_impedance: false
+  cartesian_admittance: false
+  joint_impedance: false
+  joint_admittance: false
+  contact_detection: false
+  reflexes: false
+  payload: false
+  tcp_offset: false

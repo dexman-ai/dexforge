@@ -19,18 +19,66 @@
   lazy_load_meshes=True for kinematic-only fixtures.
 -->
 <robot name="Rizon4">
-  <link name="base_link" />
-  <link name="link1" />
-  <link name="link2" />
-  <link name="link3" />
-  <link name="link4" />
-  <link name="link5" />
-  <link name="link6" />
-  <link name="link7" />
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0.0 -0.0008 0.0883" rpy="0 0 0" />
+      <mass value="3.863" />
+      <inertia ixx="0.0188" ixy="0.0" ixz="0.0" iyy="0.019" iyz="0.0002" izz="0.0103" />
+    </inertial>
+  </link>
+  <link name="link1">
+    <inertial>
+      <origin xyz="0.0002 0.004 0.1451" rpy="0 0 0" />
+      <mass value="3.85" />
+      <inertia ixx="0.0308" ixy="0.0" ixz="-0.0001" iyy="0.0307" iyz="0.0012" izz="0.0077" />
+    </inertial>
+  </link>
+  <link name="link2">
+    <inertial>
+      <origin xyz="0.0 0.0356 0.0946" rpy="0 0 0" />
+      <mass value="2.904" />
+      <inertia ixx="0.0255" ixy="0.0" ixz="0.0001" iyy="0.0263" iyz="-0.0001" izz="0.0039" />
+    </inertial>
+  </link>
+  <link name="link3">
+    <inertial>
+      <origin xyz="-0.0123 -0.0021 0.1368" rpy="0 0 0" />
+      <mass value="2.381" />
+      <inertia ixx="0.0144" ixy="0.0001" ixz="-0.0015" iyy="0.0139" iyz="-0.0006" izz="0.0039" />
+    </inertial>
+  </link>
+  <link name="link4">
+    <inertial>
+      <origin xyz="-0.0129 0.0309 0.1047" rpy="0 0 0" />
+      <mass value="2.381" />
+      <inertia ixx="0.0184" ixy="0.0001" ixz="-0.0016" iyy="0.0188" iyz="-0.0012" izz="0.0029" />
+    </inertial>
+  </link>
+  <link name="link5">
+    <inertial>
+      <origin xyz="0.0003 0.0024 0.1365" rpy="0 0 0" />
+      <mass value="2.336" />
+      <inertia ixx="0.0144" ixy="0.0" ixz="0.0" iyy="0.0136" iyz="0.0006" izz="0.0036" />
+    </inertial>
+  </link>
+  <link name="link6">
+    <inertial>
+      <origin xyz="0.0193 0.0595 0.0726" rpy="0 0 0" />
+      <mass value="2.251" />
+      <inertia ixx="0.0085" ixy="0.0004" ixz="0.0012" iyy="0.0089" iyz="0.0018" izz="0.0041" />
+    </inertial>
+  </link>
+  <link name="link7">
+    <inertial>
+      <origin xyz="0.0003 0.0008 0.025" rpy="0 0 0" />
+      <mass value="0.774" />
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.0009" />
+    </inertial>
+  </link>
   <link name="flange" />
 
   <joint name="joint1" type="revolute">
-    <origin xyz="0 0 0.155" rpy="0 0 -3.141592654" />
+    <origin xyz="0 0 0.155" rpy="0 0 -3.141592653589793" />
     <parent link="base_link" />
     <child link="link1" />
     <axis xyz="0 0 1" />
@@ -54,7 +102,7 @@
   </joint>
 
   <joint name="joint4" type="revolute">
-    <origin xyz="-0.02 -0.03 0.19" rpy="0 0 -3.141592654" />
+    <origin xyz="-0.02 -0.03 0.19" rpy="0 0 -3.141592653589793" />
     <parent link="link3" />
     <child link="link4" />
     <axis xyz="0 1 0" />
@@ -62,7 +110,7 @@
   </joint>
 
   <joint name="joint5" type="revolute">
-    <origin xyz="-0.02 0.025 0.195" rpy="0 0 -3.141592654" />
+    <origin xyz="-0.02 0.025 0.195" rpy="0 0 -3.141592653589793" />
     <parent link="link4" />
     <child link="link5" />
     <axis xyz="0 0 1" />
@@ -78,7 +126,7 @@
   </joint>
 
   <joint name="joint7" type="revolute">
-    <origin xyz="-0.015 0.073 0.11" rpy="0 -1.570796327 0" />
+    <origin xyz="-0.015 0.073 0.11" rpy="0 -1.5707963267948966 0" />
     <parent link="link6" />
     <child link="link7" />
     <axis xyz="0 0 1" />
@@ -86,7 +134,7 @@
   </joint>
 
   <joint name="link7_to_flange" type="fixed">
-    <origin xyz="0 0 0.081" rpy="0 0 -3.141592654" />
+    <origin xyz="0 0 0.081" rpy="0 0 -3.141592653589793" />
     <parent link="link7" />
     <child link="flange" />
   </joint>

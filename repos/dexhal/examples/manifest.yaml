@@ -25,10 +25,16 @@ limits:
   velocity: [3.15, 3.15, 3.15, 3.2, 3.2, 3.2]        # rad/s
   acceleration: [15.0, 15.0, 15.0, 15.0, 15.0, 15.0] # rad/s^2
   effort: [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]    # N*m
+  # Optional; one positive finite value per joint. When omitted, the kernel
+  # derives jerk limits from `acceleration` and its jerk ramp time.
+  jerk: [300.0, 300.0, 300.0, 300.0, 300.0, 300.0]   # rad/s^3
   # Optional; default to the model's ArmModel::JOINT_LIMITS. `.inf` marks a
   # continuous joint.
   position_min: [-3.0, -6.2, -6.2, -6.2, -6.2, -.inf] # rad
   position_max: [3.0, 6.2, 6.2, 6.2, 6.2, .inf]
+
+has_static_inertials: true    # optional (ArmModel::HAS_DYNAMICS); false when static URDF
+                              # inertials are unavailable or unsuitable for HostImpedance
 
 sensing:                      # optional section; every key defaults to false
   torque: true                #   joint torques (native or from motor currents)

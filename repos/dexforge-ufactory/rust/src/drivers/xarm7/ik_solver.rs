@@ -47,15 +47,15 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::kinematics::{
+use dexhal::math::kinematics::{
     compose, frob_diff, lm_refine_masked, pose_residual12, se3_inv, Transform, IDENTITY,
 };
-use crate::math::postprocess::{dedup_solutions, q_close};
-use crate::math::ssik_core::{
+use dexhal::math::postprocess::{dedup_solutions, q_close};
+use dexhal::math::ssik_core::{
     add3, dot3, mat3_mul, mat3_transpose, mat3_vec, mat3t_vec, neg3, norm3, rotate,
     rotation_matrix, sp1_solve, sp3_solve, sp4_solve, sp5_solve, sub3, wrap_to_pi,
 };
-pub use crate::math::tolerances::TolerancePolicy;
+pub use dexhal::math::tolerances::TolerancePolicy;
 
 use super::consts;
 

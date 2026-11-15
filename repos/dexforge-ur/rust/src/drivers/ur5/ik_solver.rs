@@ -22,9 +22,9 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::kinematics::{lm_refine6, mat4_frob_diff};
-use crate::math::ssik_core::{sp6_solve, wrap_to_pi};
-pub use crate::math::tolerances::TolerancePolicy;
+use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff};
+use dexhal::math::ssik_core::{sp6_solve, wrap_to_pi};
+pub use dexhal::math::tolerances::TolerancePolicy;
 
 use core::f64::consts::PI;
 

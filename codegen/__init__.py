@@ -1,10 +1,10 @@
-"""dexforge code-generation scripts.
+"""dexforge code-generation tools.
 
-This package collects the offline compiler scripts that turn a URDF into a
-stand-alone Rust driver crate. The end-to-end driver-build CLI lives in
-:mod:`codegen.dexforge_build` (exposed as the ``dexforge build`` command) and
-contains both the LLM-assisted IK generator (``_run_ik_generator_core``) and the
-symbolic kinematics + dynamics compiler (``_run_generate_dynamics_core``). The IK
-generator's support modules (:mod:`codegen.ik_build`, :mod:`codegen.ik_llm`,
-:mod:`codegen.ik_prompt`) remain as separate files.
+Deterministic scripts and templates used by a coding agent to generate dexhal
+OEM driver crates (see ``codegen/README.md`` and ``codegen/new_driver.md``):
+:mod:`codegen.ssik_artifact` (build / inspect ssik artifacts),
+:mod:`codegen.scaffold` (vendor crate + ``arm.rs`` from templates),
+:mod:`codegen.generate_dynamics` (SymPy FK / Jacobian / dynamics),
+:mod:`codegen.generate_dynamics_test_data` (Pinocchio ground truth) and
+:mod:`codegen.ik_test_data` (ssik IK reference datasets).
 """

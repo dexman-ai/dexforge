@@ -1,17 +1,20 @@
-//! The driver contract: what a kernel sees of an arm.
+//! The driver contract: what the DexZero kernel sees of an arm.
 //!
-//! * [`ArmManifest`] — static capabilities, read once at boot.
+//! * [`ArmManifest`] — static capabilities, limits (including optional
+//!   [`jerk_limits`](ArmManifest::jerk_limits) and
+//!   [`has_static_inertials`](ArmManifest::has_static_inertials)), and latency
+//!   cycles, read once at boot.
 //! * [`CoreState`] / [`CoreCommand`] and their zero-copy views — the two
 //!   buffers exchanged every control cycle.
-//! * [`ArmDriver`] — the object-safe control API. A driver implements the
-//!   hardware half (`manifest`, `connect`, `disconnect`, `read_state`,
+//! * [`ArmDriver`] — the object-safe control API (`Send`). A driver implements
+//!   the hardware half (`manifest`, `connect`, `disconnect`, `read_state`,
 //!   `write_command`) and hands out its host-side model.
 //! * [`ArmMath`] — that host-side model with the DOF erased
-//!   ([`MAX_DOF`]-padded arrays), implemented by every
-//!   [`Arm`].
+//!   ([`MAX_DOF`]-padded arrays, `Send`), implemented by every [`Arm`].
 //!
-//! It mirrors DexZero's driver contract so a kernel can hold any arm as
-//! `dyn ArmDriver`.
+//! DexZero defines no copy of this contract; its executor thread holds the
+//! driver as `Box<dyn ArmDriver>` and its planner thread holds an independent
+//! `Box<dyn ArmMath>`.
 
 pub mod manifest;
 pub mod wire;
@@ -210,7 +213,7 @@ impl CalibrationData {
 /// No method shares a name with an inherent method of [`Arm`]: queries whose
 /// typed twin has the same natural name end in `_padded`, and configuration
 /// methods are `apply_*` / `remove_*`.
-pub trait ArmMath {
+pub trait ArmMath: Send {
     /// Number of actuated joints.
     fn dof(&self) -> usize;
 
@@ -409,7 +412,7 @@ fn applied(native: Result<(), ArmError>) -> Result<Applied, ArmError> {
 ///
 /// `read_state`, `write_command` and the math queries are the data plane and
 /// must not allocate or block.
-pub trait ArmDriver {
+pub trait ArmDriver: Send {
     /// Static capabilities, read once at boot.
     fn manifest(&self) -> &ArmManifest;
 

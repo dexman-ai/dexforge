@@ -82,7 +82,7 @@
   </link>
 
   <joint name="xarm7_joint2" type="revolute">
-    <origin xyz="0 0 0" rpy="-1.5707963 0 0" />
+    <origin xyz="0 0 0" rpy="-1.5707963267948966 0 0" />
     <parent link="link_1" />
     <child link="link_2" />
     <axis xyz="0 0 1" />
@@ -112,7 +112,7 @@
   </link>
 
   <joint name="xarm7_joint3" type="revolute">
-    <origin xyz="0 -0.293 0" rpy="1.5707963 0 0" />
+    <origin xyz="0 -0.293 0" rpy="1.5707963267948966 0 0" />
     <parent link="link_2" />
     <child link="link_3" />
     <axis xyz="0 0 1" />
@@ -142,7 +142,7 @@
   </link>
 
   <joint name="xarm7_joint4" type="revolute">
-    <origin xyz="0.0525 0 0" rpy="1.5707963 0 0" />
+    <origin xyz="0.0525 0 0" rpy="1.5707963267948966 0 0" />
     <parent link="link_3" />
     <child link="link_4" />
     <axis xyz="0 0 1" />
@@ -172,7 +172,7 @@
   </link>
 
   <joint name="xarm7_joint5" type="revolute">
-    <origin xyz="0.0775 -0.3425 0" rpy="1.5707963 0 0" />
+    <origin xyz="0.0775 -0.3425 0" rpy="1.5707963267948966 0 0" />
     <parent link="link_4" />
     <child link="link_5" />
     <axis xyz="0 0 1" />
@@ -202,7 +202,7 @@
   </link>
 
   <joint name="xarm7_joint6" type="revolute">
-    <origin xyz="0 0 0" rpy="1.5707963 0 0" />
+    <origin xyz="0 0 0" rpy="1.5707963267948966 0 0" />
     <parent link="link_5" />
     <child link="link_6" />
     <axis xyz="0 0 1" />
@@ -232,7 +232,7 @@
   </link>
 
   <joint name="xarm7_joint7" type="revolute">
-    <origin xyz="0.076 0.097 0" rpy="-1.5707963 0 0" />
+    <origin xyz="0.076 0.097 0" rpy="-1.5707963267948966 0 0" />
     <parent link="link_6" />
     <child link="link7" />
     <axis xyz="0 0 1" />

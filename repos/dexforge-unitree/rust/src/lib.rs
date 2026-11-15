@@ -1,10 +1,16 @@
+//! Unitree arm drivers for dexhal.
+//!
+//! Each arm under [`drivers`] implements `dexhal::math::ArmModel` (generated
+//! kinematics, IK and dynamics) and `dexhal::math::ArmDriver` (hardware I/O).
+
 #![no_std]
 #![forbid(unsafe_code)]
 
-pub mod drivers;
-pub mod math;
+#[cfg(feature = "std")]
+extern crate std;
 
+pub mod drivers;
+
+// Per-arm re-exports (appended by codegen/scaffold.py).
 pub use drivers::z1;
-pub use drivers::z1::generated_dynamics;
-pub use drivers::z1::generated_kinematics;
-pub use drivers::z1::ik_solver::{fk, solve, TolerancePolicy};
+pub use drivers::z1::{Z1, Z1Driver};

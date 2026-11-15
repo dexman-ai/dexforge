@@ -196,20 +196,26 @@ excited every joint (`4·DOF + 6` for pose samples). See the module docs.
 
 ## Driver contract
 
-`math::contract` is the driver contract DexZero consumes:
+`math::contract` is the driver contract the DexZero kernel consumes (`dexzero.md`,
+`compliance.md`):
 
-| DexZero spec | dexhal |
+| Role | dexhal item |
 | :-- | :-- |
-| `MAX_DOF`, `ContractVersion`, `ControlMode` | `MAX_DOF`, `ContractVersion`, `control_mode` |
-| `DriverManifest` | `ArmManifest` |
-| `CoreDriverState`, `CoreDriverCommand` | `CoreState` (52 × f64), `CoreCommand` (89 × f64) |
-| `DynamicsState` | `DynamicsState` |
-| `DexArmDriver` | `ArmDriver` |
+| Version & modes | `MAX_DOF` (8), `ContractVersion`, `CONTRACT_VERSION` (0.2.0), `control_mode` |
+| Static capabilities, read once at boot | `ArmManifest` (from `manifest.yaml`) |
+| Driver → kernel buffer, every cycle | `CoreState` (56 × f64) + aux tail, `CoreStateView` / `CoreStateViewMut` |
+| Kernel → driver buffer, every cycle | `CoreCommand` (96 × f64), `CoreCommandView` / `CoreCommandViewMut` |
+| Host-side model & dynamics | `ArmMath` (`Send`), `DynamicsState`, `CalibrationData` (95 × f64) |
+| Driver trait | `ArmDriver` (`Send`) |
 
 A hardware driver implements `manifest`, `connect`, `disconnect`, `read_state`,
 `write_command` and returns its `Arm` from `arm()` / `arm_mut()`. Everything
 else is provided: FK, Jacobian (base and tool axes), pseudo-inverse, IK,
 dynamics, inverse dynamics, and the configuration plane.
+
+In DexZero, the real-time executor thread owns `Box<dyn ArmDriver>` and the
+planner thread owns an independent `Box<dyn ArmMath>` (`Arm<Model, DOF, MAX>`)
+so trajectory scrubbing and IK never contend with the control loop.
 
 ### Manifest
 
@@ -225,12 +231,21 @@ format is a strict subset of YAML and unknown keys are errors. Name, DOF,
 position limits and model capabilities come from the `ArmModel`. Velocity,
 acceleration and effort limits have no default: the file (or
 `ArmManifest::for_model` with a `JointRatings`) must give a finite, positive
-value per joint.
+value per joint. `limits.jerk` is optional (`NAN` when omitted so the kernel
+applies its acceleration / ramp-time fallback), and `has_static_inertials`
+defaults to `ArmModel::HAS_DYNAMICS` (`false` disables `HostImpedance` when an
+arm obscures URDF inertials or relies on proprietary drive friction models).
 
 ### Buffers
 
-`CoreState` and `CoreCommand` are `#[repr(C)]` all-`f64` structs whose layout
-is the wire layout. The data plane works in place through views:
+`CoreState` (56 × `f64`) and `CoreCommand` (96 × `f64`) are `#[repr(C)]`
+all-`f64` structs whose layout is the wire layout. Cartesian wire fields
+(`tcp_pose`, `tcp_twist`, `wrench`, `target_pose`, `target_twist`,
+`target_wrench`) are at the TCP origin in base axes; `CoreCommand::task_frame`
+carries the compliance task frame for delegated native compliance, and
+`CoreState` carries `timestamp` (or monotonic sample counter for dynamic
+$k$-deep latency alignment), `robot_mode`, `fault_code`, and
+`native_reflex_fired`. The data plane works in place through views:
 
 ```rust
 fn read_state(&mut self, buffer: &mut [f64]) -> Result<(), ArmError> {
@@ -262,17 +277,6 @@ applied to the host model, so the two cannot drift apart; a controller fault
 leaves the host model untouched. `CalibrationData` is a `KinematicChain` in
 flat, `MAX_DOF`-padded form (95 × f64).
 
-### Differences from the DexZero spec
-
-- **Errors** are an `ArmError` enum rather than `&'static str`.
-- **Aux schema** is an inline `AuxSchema` instead of `Vec<String>` / `Vec<u32>`.
-- **`dynamics`** already includes the payload, and **`inverse_kinematics`**
-  returns the solution on the seed's branch or `None`.
-- **Additions**: `tool_jacobian`, `jacobian_pseudo_inverse`,
-  `inverse_dynamics`, `set_gravity`, `set_calibration`, `clear_calibration`,
-  `calibration_residual`, acceleration limits and the `native_payload` /
-  `native_tcp_offset` manifest flags.
-
 `ArmMath` is the DOF-erased form of `Arm` behind `arm()`. Its methods never
 share a name with `Arm`'s own: queries with a typed twin end in `_padded`,
 configuration methods are `apply_*`.
@@ -286,5 +290,12 @@ cargo test -p dexhal
 The tests use a made-up 6R arm (`src/math/testing.rs`) that implements
 `ArmModel` the way a driver does. Real arms are tested in their own
 repositories against their real solvers.
+
+For integration tests of dexhal clients, `mock/rust` (`dexforge-mock-core`,
+vendor `"mock"`) provides a `MockDriver` with no-op `connect`/`disconnect`, a
+command queue whose depth is the manifest latency, and state computed from the
+oldest queued command. The crate ships a client manifest (`MANIFEST`) and a
+simple six-R arm model (`MockArm`, NAME `"mock-6r"`), so `MockDriver::default_arm()`
+works without any extra setup. Test it with `cargo test -p dexforge-mock-core`.
 
 Open work is tracked in [`workitems.md`](workitems.md).

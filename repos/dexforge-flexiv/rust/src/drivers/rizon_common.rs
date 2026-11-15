@@ -73,10 +73,10 @@
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::kinematics::{lm_refine_masked, mat4_frob_diff, mat4_mul, rot_homogeneous};
-use crate::math::postprocess::{dedup_solutions, wrap_distance};
-use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
-pub use crate::math::tolerances::TolerancePolicy;
+use dexhal::math::kinematics::{lm_refine_masked, mat4_frob_diff, mat4_mul, rot_homogeneous};
+use dexhal::math::postprocess::{dedup_solutions, wrap_distance};
+use dexhal::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
+pub use dexhal::math::tolerances::TolerancePolicy;
 
 use core::f64::consts::PI;
 

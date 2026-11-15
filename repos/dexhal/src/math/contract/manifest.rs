@@ -49,7 +49,9 @@
 //! | `realtime` | no | Needs a real-time thread (default `false`) |
 //! | `latency.state_staleness_cycles`, `latency.command_dispatch_cycles` | yes | Delays in control cycles |
 //! | `limits.velocity`, `limits.acceleration`, `limits.effort` | yes | One positive finite value per joint (rad/s, rad/s², N·m) |
+//! | `limits.jerk` | no | One positive finite value per joint (rad/s³); `NAN` when omitted so the kernel applies its ramp-time fallback |
 //! | `limits.position_min`, `limits.position_max` | no | Override [`ArmModel::JOINT_LIMITS`] (rad) |
+//! | `has_static_inertials` | no | Static link mass / inertia model is trustworthy for host impedance (default [`ArmModel::HAS_DYNAMICS`]) |
 //! | `sensing.torque`, `.wrench`, `.gripper` | no | Hardware sensing (default `false`) |
 //! | `native.cartesian_impedance`, `.cartesian_admittance`, `.joint_impedance`, `.joint_admittance`, `.contact_detection`, `.reflexes`, `.payload`, `.tcp_offset` | no | Features the controller executes itself (default `false`) |
 //! | `aux` | no | List of `- name: … / type: f64 / count: …` items following [`CoreState`] in the state buffer |
@@ -191,8 +193,14 @@ pub struct ArmManifest {
     pub velocity_limits: [f64; MAX_DOF],
     /// Acceleration limits (rad/s²).
     pub acceleration_limits: [f64; MAX_DOF],
+    /// Jerk limits (rad/s³); `NAN` when omitted by the manifest.
+    pub jerk_limits: [f64; MAX_DOF],
     /// Torque limits (N·m).
     pub effort_limits: [f64; MAX_DOF],
+    /// Whether static link inertials are available and accurate enough for
+    /// host-side inverse dynamics (`HostImpedance` / torque-residual
+    /// admittance). Defaults to [`ArmModel::HAS_DYNAMICS`].
+    pub has_static_inertials: bool,
     pub model: ModelCapabilities,
 }
 
@@ -247,7 +255,9 @@ impl ArmManifest {
             joint_limits_max: hi,
             velocity_limits: padded(&ratings.velocity),
             acceleration_limits: padded(&ratings.acceleration),
+            jerk_limits: [f64::NAN; MAX_DOF],
             effort_limits: padded(&ratings.effort),
+            has_static_inertials: A::HAS_DYNAMICS,
             model: ModelCapabilities {
                 dof: DOF as u8,
                 max_ik_solutions: MAX as u16,
@@ -469,6 +479,10 @@ impl<const DOF: usize> Parser<DOF> {
                 mark(&mut self.seen, 9)?;
                 m.is_realtime_required = parse_bool(value)?;
             }
+            "has_static_inertials" => {
+                mark(&mut self.seen, 24)?;
+                m.has_static_inertials = parse_bool(value)?;
+            }
             _ => return Err(ManifestErrorKind::UnknownKey),
         }
         Ok(())
@@ -500,6 +514,20 @@ impl<const DOF: usize> Parser<DOF> {
             ("limits", "effort") => {
                 mark(&mut self.seen, 8)?;
                 self.ratings.effort = parse_joint_list(value)?;
+                return Ok(());
+            }
+            ("limits", "jerk") => {
+                mark(&mut self.seen, 23)?;
+                let jerk = parse_joint_list::<DOF>(value)?;
+                for v in &jerk {
+                    if !v.is_finite() {
+                        return Err(ManifestErrorKind::Model(ModelError::NonFinite));
+                    }
+                    if *v <= 0.0 {
+                        return Err(ManifestErrorKind::Model(ModelError::NonPositive));
+                    }
+                }
+                m.jerk_limits = padded(&jerk);
                 return Ok(());
             }
             ("limits", "position_min") => {
@@ -702,7 +730,9 @@ mod tests {
         // Nothing is unbounded by default, and padding is zero.
         assert_eq!(manifest.velocity_limits[..6], [3.0; 6]);
         assert_eq!(manifest.acceleration_limits[5], 15.0);
+        assert!(manifest.jerk_limits.iter().all(|v| v.is_nan()));
         assert_eq!(manifest.effort_limits[3], 28.0);
+        assert!(manifest.has_static_inertials);
         for limits in [
             manifest.joint_limits_min,
             manifest.joint_limits_max,
@@ -760,10 +790,13 @@ mod tests {
         assert!(!m.native_cartesian_impedance && !m.native_reflexes);
         assert_eq!(m.velocity_limits[..6], [3.15, 3.15, 3.15, 3.2, 3.2, 3.2]);
         assert_eq!(m.acceleration_limits[..6], [15.0; 6]);
+        assert_eq!(m.jerk_limits[..6], [300.0; 6]);
+        assert_eq!(m.jerk_limits[6..], [0.0, 0.0]);
         assert_eq!(
             m.effort_limits[..6],
             [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]
         );
+        assert!(m.has_static_inertials);
         // Position limits: overridden by the file, including a continuous joint.
         assert_eq!(m.joint_limits_min[..2], [-3.0, -6.2]);
         assert_eq!(
@@ -813,7 +846,13 @@ limits:
             },
         )
         .unwrap();
-        assert_eq!(m, direct);
+        assert_eq!(m.velocity_limits, direct.velocity_limits);
+        assert_eq!(m.acceleration_limits, direct.acceleration_limits);
+        assert_eq!(m.effort_limits, direct.effort_limits);
+        assert_eq!(m.joint_limits_min, direct.joint_limits_min);
+        assert_eq!(m.joint_limits_max, direct.joint_limits_max);
+        assert!(m.jerk_limits.iter().all(|v| v.is_nan()));
+        assert_eq!(m.has_static_inertials, direct.has_static_inertials);
     }
 
     #[test]
@@ -831,7 +870,12 @@ limits:
         );
         assert_eq!(kind("driver: six-r\ndriver: six-r\n"), (2, DuplicateKey));
         assert_eq!(kind("# comment\n\nspeed: 3\n"), (3, UnknownKey));
-        assert_eq!(kind("limits:\n  jerk: [1]\n"), (2, UnknownKey));
+        assert_eq!(kind("limits:\n  snap: [1]\n"), (2, UnknownKey));
+        assert_eq!(kind("limits:\n  jerk: [1, 2, 3]\n"), (2, WrongLength));
+        assert_eq!(
+            kind("limits:\n  jerk: [1, 1, 1, 1, 1, 0]\n"),
+            (2, Model(ModelError::NonPositive))
+        );
         assert_eq!(kind("limits:\n  velocity: [1, 2, 3]\n"), (2, WrongLength));
         assert_eq!(
             kind("limits:\n  velocity: [1, 2, 3, 4, 5, x]\n"),

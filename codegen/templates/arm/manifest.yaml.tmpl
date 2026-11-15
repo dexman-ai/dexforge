@@ -1,0 +1,41 @@
+# Manifest of the {{arm_title}} (`{{struct_name}}`, vendor "{{oem}}").
+#
+# Loaded by `{{struct_name}}Driver::new()` through
+# `ArmManifest::from_text::<{{struct_name}}, {{dof}}, {{max_solutions}}>`; see
+# repos/dexhal/examples/manifest.yaml for every key. Scaffolded by
+# codegen/scaffold.py: `limits.velocity` / `limits.effort` come from the URDF
+# <limit> tags. Every `TODO` must be replaced from the OEM data sheet / protocol
+# specification (the manifest does not parse until they are).
+
+driver: {{arm}}               # must equal {{struct_name}}::NAME
+version: "{{contract_version}}"
+control_freq_hz: TODO         # rate at which the controller expects commands
+control_modes: [TODO]         # natively executed targets: joint_pos, joint_vel, joint_torque,
+                              #   cartesian_pose, cartesian_twist, cartesian_wrench
+realtime: false
+
+latency:
+  state_staleness_cycles: TODO
+  command_dispatch_cycles: TODO
+
+limits:
+  velocity: [{{velocity}}]   # rad/s{{velocity_note}}
+  acceleration: [{{acceleration}}]   # rad/s^2
+  effort: [{{effort}}]   # N*m{{effort_note}}
+
+has_static_inertials: {{has_dynamics}}
+
+sensing:
+  torque: false
+  wrench: false
+  gripper: false
+
+native:
+  cartesian_impedance: false
+  cartesian_admittance: false
+  joint_impedance: false
+  joint_admittance: false
+  contact_detection: false
+  reflexes: false
+  payload: false
+  tcp_offset: false

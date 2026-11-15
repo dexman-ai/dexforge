@@ -1,0 +1,40 @@
+# Manifest of the Rizon4 (`Rizon4`, vendor "flexiv").
+#
+# Loaded by `Rizon4Driver::new()` through
+# `ArmManifest::from_text::<Rizon4, 7, 256>`; see
+# repos/dexhal/examples/manifest.yaml for every key. Scaffolded by
+# codegen/scaffold.py: `limits.velocity` / `limits.effort` come from the URDF
+# <limit> tags. Every `TODO` must be replaced from the OEM data sheet / protocol
+# specification (the manifest does not parse until they are).
+
+driver: rizon4               # must equal Rizon4::NAME
+version: "0.2"
+control_freq_hz: 1000         # rate at which the controller expects commands
+control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose, cartesian_twist, cartesian_wrench]
+realtime: true
+
+latency:
+  state_staleness_cycles: 1
+  command_dispatch_cycles: 1
+
+limits:
+  velocity: [2.0944, 2.0944, 2.4435, 2.4435, 4.8869, 4.8869, 4.8869]   # rad/s  (URDF <limit velocity>)
+  acceleration: [15.0, 15.0, 20.0, 20.0, 30.0, 30.0, 30.0]   # rad/s^2
+  effort: [123.0, 123.0, 64.0, 64.0, 39.0, 39.0, 39.0]   # N*m  (URDF <limit effort>)
+
+has_static_inertials: true
+
+sensing:
+  torque: true
+  wrench: true
+  gripper: true
+
+native:
+  cartesian_impedance: true
+  cartesian_admittance: false
+  joint_impedance: true
+  joint_admittance: false
+  contact_detection: true
+  reflexes: true
+  payload: true
+  tcp_offset: true

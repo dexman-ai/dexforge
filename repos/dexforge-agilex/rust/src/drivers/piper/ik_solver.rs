@@ -43,9 +43,9 @@
 
 use nalgebra::{SMatrix, SVector};
 
-use crate::math::kinematics::{lm_refine6, mat4_frob_diff};
-use crate::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
-pub use crate::math::tolerances::TolerancePolicy;
+use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff};
+use dexhal::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots, wrap_to_pi};
+pub use dexhal::math::tolerances::TolerancePolicy;
 
 use super::consts;
 use super::pq;
@@ -175,65 +175,72 @@ pub fn solve(
     // Ill-conditioned targets are routed through the deterministic spatial
     // bypass inside `solve_candidates`.
     let mut cands = [[0.0f64; 6]; 16];
-    let cand_count = solve_candidates(t, policy, &mut cands);
+    let mut cand_count = solve_candidates(t, policy, &mut cands);
 
-    for cand in cands.iter().take(cand_count) {
-        let q = *cand;
-        // Reject non-finite candidates (mirrors np.isfinite filter).
-        if !q.iter().all(|v| v.is_finite()) {
-            continue;
-        }
-        // FK closure check.
-        let residual = fk_residual(&q, t);
-        let accepted_q: [f64; 6];
-        if residual <= fk_atol {
-            // The candidate already closes the pose, but the bounded Francis-QR
-            // eigenvalues are slightly less precise than the reference LAPACK
-            // route, leaving the joint values up to ~1e-5 off the true root.
-            // Tighten onto exact FK closure with a bounded, deterministic LM
-            // pass so the configuration matches the reference to full precision.
-            // This never changes which roots are accepted (the gate above is
-            // unchanged) — it only sharpens an already-accepted solution.
-            accepted_q = refine6(&q, t, POLISH_MAX_ITERS, fk_atol).unwrap_or(q);
-        } else if allow_refinement {
-            match refine6(&q, t, refinement_max_iters, fk_atol) {
-                Some(refined) => accepted_q = refined,
-                None => continue,
+    for pass in 0..2 {
+        for cand in cands.iter().take(cand_count) {
+            let q = *cand;
+            // Reject non-finite candidates (mirrors np.isfinite filter).
+            if !q.iter().all(|v| v.is_finite()) {
+                continue;
             }
-        } else {
-            continue;
-        }
-
-        // Wrap-to-pi de-duplication against accepted solutions.
-        let mut dup = false;
-        for s in solutions.iter().take(solution_count).flatten() {
-            if q_close_wrap(&accepted_q, s, dedup_atol) {
-                dup = true;
-                break;
+            // FK closure check.
+            let residual = fk_residual(&q, t);
+            let accepted_q: [f64; 6];
+            if residual <= fk_atol {
+                // The candidate already closes the pose, but the bounded Francis-QR
+                // eigenvalues are slightly less precise than the reference LAPACK
+                // route, leaving the joint values up to ~1e-5 off the true root.
+                // Tighten onto exact FK closure with a bounded, deterministic LM
+                // pass so the configuration matches the reference to full precision.
+                // This never changes which roots are accepted (the gate above is
+                // unchanged) — it only sharpens an already-accepted solution.
+                accepted_q = refine6(&q, t, POLISH_MAX_ITERS, fk_atol).unwrap_or(q);
+            } else if allow_refinement {
+                match refine6(&q, t, refinement_max_iters, fk_atol) {
+                    Some(refined) => accepted_q = refined,
+                    None => continue,
+                }
+            } else {
+                continue;
             }
-        }
-        if dup {
-            continue;
-        }
-        if solution_count < 16 {
-            solutions[solution_count] = Some(accepted_q);
-            solution_count += 1;
-        }
-    }
 
-    // Post-processing (mirrors Python's _ps_wrap_to_limits + _ps_respect_limits).
-    if respect_limits {
-        let mut filtered: [Option<[f64; 6]>; 16] = [None; 16];
-        let mut count = 0usize;
-        for sol in solutions.iter().take(solution_count).flatten() {
-            let q = wrap_to_limits(sol);
-            if in_limits(&q) && count < 16 {
-                filtered[count] = Some(q);
-                count += 1;
+            // Wrap-to-pi de-duplication against accepted solutions.
+            let mut dup = false;
+            for s in solutions.iter().take(solution_count).flatten() {
+                if q_close_wrap(&accepted_q, s, dedup_atol) {
+                    dup = true;
+                    break;
+                }
+            }
+            if dup {
+                continue;
+            }
+            if solution_count < 16 {
+                solutions[solution_count] = Some(accepted_q);
+                solution_count += 1;
             }
         }
-        solutions = filtered;
-        solution_count = count;
+
+        // Post-processing (mirrors Python's _ps_wrap_to_limits + _ps_respect_limits).
+        if respect_limits {
+            let mut filtered: [Option<[f64; 6]>; 16] = [None; 16];
+            let mut count = 0usize;
+            for sol in solutions.iter().take(solution_count).flatten() {
+                let q = wrap_to_limits(sol);
+                if in_limits(&q) && count < 16 {
+                    filtered[count] = Some(q);
+                    count += 1;
+                }
+            }
+            solutions = filtered;
+            solution_count = count;
+        }
+
+        if solution_count > 0 || pass == 1 {
+            break;
+        }
+        cand_count = spatial_bypass(t, policy, &mut cands);
     }
 
     // Sort by seed distance (mirrors Python's _ps_nearest_to_seed).
