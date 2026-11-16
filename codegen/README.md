@@ -12,7 +12,7 @@
    - Everything in `codegen/` exists to give that coding agent clear instructions, reference examples, code templates, and deterministic scripts it can run and verify autonomously using its own file and shell tools.
 
 2. **Link Against `dexhal` — Never Duplicate Shared Code**
-   - Every generated vendor repository and driver crate depends directly on [`dexhal`](../repos/dexhal/README.md) (`dexhal = { ... }`).
+   - Every generated vendor repository and driver crate depends directly on [`dexhal`](../dexhal/README.md) (`dexhal = { ... }`).
    - Generated crates **do not** depend on `dexforge` and **never** vendor or copy `dexhal`'s shared math or contract modules (`ssik_core`, `kinematics`, `postprocess`, `tolerances`, `spatial`, `payload`, `chain`, `identify`, `model`, `arm`, `contract`).
    - `dexhal` owns the driver contract (`ArmModel`, `Arm`, `ArmDriver`, `ArmManifest`, `CoreState` / `CoreCommand` zero-copy views, `CalibrationData`) and shared `#![no_std]` math kernels; each OEM driver crate owns only its arm-specific generated kinematics/IK/dynamics and hardware I/O implementation.
 
@@ -31,19 +31,19 @@
 
 ## OEM Inputs
 
-Producing a new driver requires three inputs from the OEM (see [`repos/dexhal/README.md`](../repos/dexhal/README.md)):
+Producing a new driver requires three inputs from the OEM (see [`dexhal/README.md`](../dexhal/README.md)):
 
 | Input | Purpose |
 | :--- | :--- |
 | **1. URDF (`<arm>.urdf`) + `--base` / `--ee` link names** | Defines the nominal kinematic chain (joint axes, origins, types), mechanical position/velocity/effort limits, and per-link `<inertial>` properties (mass, CoM, inertia tensor). |
-| **2. Driver Manifest (`manifest.yaml`)** | Declares static driver capabilities, control loop rate, dispatch/staleness latency cycles, mandatory per-joint velocity/acceleration/effort ratings (and optional jerk limits), supported control modes, native compliance flags, I/O counts, and auxiliary state fields. Validated against `dexhal::math::ArmManifest::from_text` (see [`repos/dexhal/examples/manifest.yaml`](../repos/dexhal/examples/manifest.yaml)). |
+| **2. Driver Manifest (`manifest.yaml`)** | Declares static driver capabilities, control loop rate, dispatch/staleness latency cycles, mandatory per-joint velocity/acceleration/effort ratings (and optional jerk limits), supported control modes, native compliance flags, I/O counts, and auxiliary state fields. Validated against `dexhal::math::ArmManifest::from_text` (see [`dexhal/examples/manifest.yaml`](../dexhal/examples/manifest.yaml)). |
 | **3. OEM Hardware API / Protocol Specification** | Vendor SDK headers, wire protocol specification, or register map used by the agent to implement `ArmDriver::{connect, disconnect, read_state, write_command}`, optional native hooks (`set_payload_native`, `set_tcp_offset_native`, `set_gravity_native`), and optional vendor calibration file parsing. |
 
 ---
 
 ## Target Vendor Repository Structure
 
-Each OEM lives in its own repository under `repos/dexforge-<oem>/` (with [`repos/dexforge-ur`](../repos/dexforge-ur) as the reference partition and [`repos/dexhal/mock/rust`](../repos/dexhal/mock/rust) as the reference `ArmDriver` implementation):
+Each OEM lives in its own repository under `repos/dexforge-<oem>/` (with [`repos/dexforge-ur`](../repos/dexforge-ur) as the reference partition and [`dexhal/mock/rust`](../dexhal/mock/rust) as the reference `ArmDriver` implementation):
 
 ```text
 repos/dexforge-<oem>/

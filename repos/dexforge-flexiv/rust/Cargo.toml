@@ -16,7 +16,7 @@ default = ["std"]
 std = []
 
 [dependencies]
-dexhal = { path = "../../dexhal" }
+dexhal = { path = "../../../dexhal" }
 libm = "0.2"
 
 [dependencies.nalgebra]

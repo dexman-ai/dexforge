@@ -2,7 +2,7 @@
 //!
 //! Scaffolded by `codegen/scaffold.py`; the coding agent replaces every
 //! `TODO(agent)` with the OEM hardware API / protocol implementation (see
-//! `repos/dexhal/mock/rust` for a complete reference driver). Gate any OS or
+//! `dexhal/mock/rust` for a complete reference driver). Gate any OS or
 //! vendor-SDK I/O behind the crate's `std` feature.
 
 use dexhal::math::{Arm, ArmDriver, ArmError, ArmManifest, ArmMath, ManifestError};

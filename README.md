@@ -4,7 +4,7 @@ Deterministic, zero-allocation, `#![no_std]` robot arm kinematics, dynamics, and
 
 `dexforge` combines three layers in one repository:
 
-1. **[`dexhal`](repos/dexhal/README.md) — The Hardware Abstraction & Math Contract:**
+1. **[`dexhal`](dexhal/README.md) — The Hardware Abstraction & Math Contract:**
    Defines the single `#![no_std]` driver contract (`ArmModel`, `Arm`, `ArmDriver`, `ArmManifest`, zero-copy `CoreState` / `CoreCommand` wire views, `CalibrationData`) and the shared numerical kernels (`ssik_core`, `kinematics`, `postprocess`, `tolerances`, `spatial`, `payload`, `chain`, `identify`).
 2. **[`codegen`](codegen/README.md) — Agent-Driven OEM Driver Generator:**
    Prompts, templates, and deterministic Python compilers (`ssik` artifact builder/inspector, SymPy CSE symbolic FK/Jacobian/Lagrangian dynamics compiler, and `ssik` / Pinocchio ground-truth dataset generators) that enable an autonomous coding agent to turn an OEM's URDF, `manifest.yaml`, and hardware API specification into a verified driver crate.
@@ -28,7 +28,7 @@ Deterministic, zero-allocation, `#![no_std]` robot arm kinematics, dynamics, and
 
 ## Supported Arms
 
-All OEM crates live under `repos/dexforge-<oem>/rust` and link directly against [`dexhal`](repos/dexhal/README.md):
+All OEM crates live under `repos/dexforge-<oem>/rust` and link directly against [`dexhal`](dexhal/README.md):
 
 | Vendor Crate | Arm (`ArmModel::NAME`) | Model / Driver Types | DOF | IK Solver Family | `MAX_SOLUTIONS` | Dynamics (`HAS_DYNAMICS`) |
 | :--- | :--- | :--- | :---: | :--- | :---: | :---: |
@@ -40,7 +40,7 @@ All OEM crates live under `repos/dexforge-<oem>/rust` and link directly against 
 | `dexforge-flexiv-core` (`repos/dexforge-flexiv`) | `rizon10` | `Rizon10` / `Rizon10Driver` | 7 | Joint-lock 7R (`jointlock.seven_r`, RR inner) | 256 | Yes (Pinocchio-verified) |
 | `dexforge-unitree-core` (`repos/dexforge-unitree`) | `z1` | `Z1` / `Z1Driver` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | Yes (Pinocchio-verified) |
 
-In addition, [`dexforge-mock-core`](repos/dexhal/mock/rust) (`repos/dexhal/mock/rust`) provides a reference `MockDriver` and `MockArm` (`"mock-6r"`) for integration testing of `dexhal` clients.
+In addition, [`dexforge-mock-core`](dexhal/mock/rust) (`dexhal/mock/rust`) provides a reference `MockDriver` and `MockArm` (`"mock-6r"`) for integration testing of `dexhal` clients.
 
 ---
 
@@ -48,11 +48,11 @@ In addition, [`dexforge-mock-core`](repos/dexhal/mock/rust) (`repos/dexhal/mock/
 
 ### Rust
 
-Add [`dexhal`](repos/dexhal) and the target OEM driver crate to your `Cargo.toml` (minimum Rust version: **1.82**):
+Add [`dexhal`](dexhal) and the target OEM driver crate to your `Cargo.toml` (minimum Rust version: **1.82**):
 
 ```toml
 [dependencies]
-dexhal = { path = "repos/dexhal" }
+dexhal = { path = "dexhal" }
 dexforge-ur-core = { path = "repos/dexforge-ur/rust", default-features = false }
 ```
 
@@ -109,7 +109,7 @@ let driver = Ur5Driver::new()?;
 assert_eq!(driver.manifest().name, "ur5");
 ```
 
-See [`repos/dexhal/README.md`](repos/dexhal/README.md) for the complete `Arm`, `ArmDriver`, `CoreStateView` / `CoreCommandView`, `manifest.yaml`, and per-robot calibration documentation.
+See [`dexhal/README.md`](dexhal/README.md) for the complete `Arm`, `ArmDriver`, `CoreStateView` / `CoreCommandView`, `manifest.yaml`, and per-robot calibration documentation.
 
 ### Python
 
@@ -132,7 +132,7 @@ New drivers are generated from an OEM's URDF, `manifest.yaml` values, and hardwa
 
 ```sh
 # Run dexhal contract & math tests
-cargo test --manifest-path repos/dexhal/Cargo.toml
+cargo test --manifest-path dexhal/Cargo.toml
 
 # Run an OEM driver's IK, ArmModel, manifest, and Pinocchio dynamics parity tests
 cargo test --manifest-path repos/dexforge-ur/Cargo.toml
@@ -149,8 +149,8 @@ pytest repos/dexforge-*/python/tests -v
 
 ## Documentation Index
 
-- **[`repos/dexhal/README.md`](repos/dexhal/README.md):** Driver contract (`ArmModel`, `Arm`, `ArmDriver`, `ArmManifest`, `CoreState` / `CoreCommand`), payload math, and kinematic calibration.
-- **[`repos/dexhal/examples/manifest.yaml`](repos/dexhal/examples/manifest.yaml):** Annotated reference for the driver manifest schema.
+- **[`dexhal/README.md`](dexhal/README.md):** Driver contract (`ArmModel`, `Arm`, `ArmDriver`, `ArmManifest`, `CoreState` / `CoreCommand`), payload math, and kinematic calibration.
+- **[`dexhal/examples/manifest.yaml`](dexhal/examples/manifest.yaml):** Annotated reference for the driver manifest schema.
 - **[`codegen/README.md`](codegen/README.md):** Agent-driven codegen architecture, deterministic generators, and target vendor repository structure.
 - **[`codegen/new_driver.md`](codegen/new_driver.md) & [`codegen/translate_ssik_artifact.md`](codegen/translate_ssik_artifact.md):** Master and IK translation prompts for generating new OEM drivers.
 - **[`codegen/upgrade_ssik_version.md`](codegen/upgrade_ssik_version.md):** Runbook for upgrading the locked `ssik` version in [`SSIK_VERSION.txt`](SSIK_VERSION.txt).

@@ -2,12 +2,12 @@
 
 ## Overview
 
-This runbook describes how to upgrade the locked `ssik` version in [`SSIK_VERSION.txt`](../SSIK_VERSION.txt). The `ssik` library (`personalrobotics/ssik`) is the source of truth for analytical inverse kinematics solvers; dexforge translates those solvers into `#![no_std]` Rust inside each OEM driver crate (`repos/dexforge-<oem>/rust/src/drivers/<arm>/`) backed by shared numerical kernels in [`repos/dexhal/src/math/`](../repos/dexhal/src/math).
+This runbook describes how to upgrade the locked `ssik` version in [`SSIK_VERSION.txt`](../SSIK_VERSION.txt). The `ssik` library (`personalrobotics/ssik`) is the source of truth for analytical inverse kinematics solvers; dexforge translates those solvers into `#![no_std]` Rust inside each OEM driver crate (`repos/dexforge-<oem>/rust/src/drivers/<arm>/`) backed by shared numerical kernels in [`dexhal/src/math/`](../dexhal/src/math).
 
 When upgrading `ssik`:
 1. **Prepare** an isolated environment with the target `ssik` version and update `SSIK_VERSION.txt`.
 2. **Inspect** changes in `ssik` since the previously locked version.
-3. **Analyze and update** the shared math kernels in `repos/dexhal/src/math/` if solver algorithms or tolerances changed.
+3. **Analyze and update** the shared math kernels in `dexhal/src/math/` if solver algorithms or tolerances changed.
 4. **Diff** each arm's generated `<arm>_ik.py` artifact and retranslate `ik_solver.rs` (or refresh `arm.rs` / dynamics) if the artifact changed.
 5. **Regenerate** baked solver constants (`consts.rs` / `pq.rs`) and `ssik` IK reference datasets (`test_data.bin`, `test_data.rs`) for every arm.
 6. **Verify** with `ik_test_data.py --check`, `cargo test` across `dexhal` and all OEM crates, and the Python test suite where present.
@@ -57,20 +57,20 @@ Inspect changes under:
 
 ## Step 3: Analyze Impact on `dexhal::math` Kernels
 
-### 3.1 Map `ssik` modules to `repos/dexhal/src/math/`
+### 3.1 Map `ssik` modules to `dexhal/src/math/`
 
 | Python (`ssik`) | Rust (`dexhal::math`) | File |
 | :--- | :--- | :--- |
-| `ssik.solvers.sp6_runtime` (`solve`, subproblems, polynomial roots) | `ssik_core::{sp1_solve, sp3_solve, sp4_solve, sp5_solve, sp6_solve, quartic_roots, cubic_roots, rr_real_roots, wrap_to_pi}` | `repos/dexhal/src/math/ssik_core.rs` |
-| `ssik.kinematics` (FK, pose residuals, Levenberg-Marquardt refinement) | `kinematics::{Transform, lm_refine, lm_refine6, mat4_frob_diff, norm12}` | `repos/dexhal/src/math/kinematics.rs` |
-| Post-processing (joint limits, modulo-$2\pi$ dedup, seed ordering) | `postprocess::*` | `repos/dexhal/src/math/postprocess.rs` |
-| `ssik.core.tolerances.TolerancePolicy` | `tolerances::TolerancePolicy` | `repos/dexhal/src/math/tolerances.rs` |
+| `ssik.solvers.sp6_runtime` (`solve`, subproblems, polynomial roots) | `ssik_core::{sp1_solve, sp3_solve, sp4_solve, sp5_solve, sp6_solve, quartic_roots, cubic_roots, rr_real_roots, wrap_to_pi}` | `dexhal/src/math/ssik_core.rs` |
+| `ssik.kinematics` (FK, pose residuals, Levenberg-Marquardt refinement) | `kinematics::{Transform, lm_refine, lm_refine6, mat4_frob_diff, norm12}` | `dexhal/src/math/kinematics.rs` |
+| Post-processing (joint limits, modulo-$2\pi$ dedup, seed ordering) | `postprocess::*` | `dexhal/src/math/postprocess.rs` |
+| `ssik.core.tolerances.TolerancePolicy` | `tolerances::TolerancePolicy` | `dexhal/src/math/tolerances.rs` |
 
 ### 3.2 Update and test `dexhal` if needed
-- If a subproblem algorithm, root finder, or tolerance default changed in `ssik`, update the corresponding module in `repos/dexhal/src/math/` while keeping `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap allocation, and bounded loop ceilings.
+- If a subproblem algorithm, root finder, or tolerance default changed in `ssik`, update the corresponding module in `dexhal/src/math/` while keeping `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap allocation, and bounded loop ceilings.
 - Run the `dexhal` test suite:
   ```bash
-  cargo test --manifest-path repos/dexhal/Cargo.toml
+  cargo test --manifest-path dexhal/Cargo.toml
   ```
 
 ---
@@ -145,7 +145,7 @@ This confirms every arm's `test_data.bin` carries the version in `SSIK_VERSION.t
 
 ### 6.1 Run Rust tests (`dexhal` + OEM driver crates)
 ```bash
-cargo test --manifest-path repos/dexhal/Cargo.toml
+cargo test --manifest-path dexhal/Cargo.toml
 for toml in repos/dexforge-*/Cargo.toml; do
     cargo test --manifest-path "$toml"
 done
@@ -171,11 +171,11 @@ pytest repos/dexforge-*/python/tests -v
 - **`RuntimeError: Installed ssik version (...) does not match SSIK_VERSION.txt (...)`**
   Ensure `SSIK_VERSION.txt` was updated to `<NEW_VERSION>` before running `ssik_artifact.py`, `generate_test_data.py`, or `ik_test_data.py --check`.
 - **IK reference tests fail after regenerating `test_data.bin`**
-  Do not loosen test tolerances (`1e-5` FK closure / strict joint match, `1e-3` singular joint dedup). Diff the old and new `<arm>_ik.py` artifacts to identify which subproblem, lock-sample schedule, or algebraic coefficient changed, and update `ik_solver.rs` (or `repos/dexhal/src/math/`) to match.
+  Do not loosen test tolerances (`1e-5` FK closure / strict joint match, `1e-3` singular joint dedup). Diff the old and new `<arm>_ik.py` artifacts to identify which subproblem, lock-sample schedule, or algebraic coefficient changed, and update `ik_solver.rs` (or `dexhal/src/math/`) to match.
 - **Crate fails `#![no_std]` or embedded target check**
   Verify no `std` imports or heap allocations (`Vec`, `Box`) were introduced outside `#[cfg(test)]`:
   ```bash
-  cargo build --manifest-path repos/dexhal/Cargo.toml --release --target thumbv7em-none-eabihf
+  cargo build --manifest-path dexhal/Cargo.toml --release --target thumbv7em-none-eabihf
   ```
 
 ---
@@ -184,10 +184,10 @@ pytest repos/dexforge-*/python/tests -v
 
 - [ ] Updated `SSIK_VERSION.txt` to `ssik==<NEW_VERSION>`
 - [ ] Reviewed `ssik` changelog and diffed solver/kinematics modules
-- [ ] Updated `repos/dexhal/src/math/` kernels if needed (`cargo test --manifest-path repos/dexhal/Cargo.toml` passes)
+- [ ] Updated `dexhal/src/math/` kernels if needed (`cargo test --manifest-path dexhal/Cargo.toml` passes)
 - [ ] Diffed `<arm>_ik.py` for each arm and updated `ik_solver.rs` / `arm.rs` / `generated_dynamics.rs` if needed
 - [ ] Regenerated `consts.rs` / `pq.rs` where applicable (`generate_code.py`)
 - [ ] Regenerated `test_data.bin` and `test_data.rs` for all arms (`generate_test_data.py`)
 - [ ] `python codegen/ik_test_data.py --check` passes
-- [ ] `cargo test` passes for `repos/dexhal` and all `repos/dexforge-*` crates
+- [ ] `cargo test` passes for `dexhal` and all `repos/dexforge-*` crates
 - [ ] `pytest codegen/tests -v` passes

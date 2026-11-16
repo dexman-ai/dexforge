@@ -152,7 +152,7 @@ def urdf_has_dynamics(urdf: Path, base_link: str, ee_link: str) -> bool:
 
 def contract_version(repo_root: Path) -> str:
     """The dexhal ``CONTRACT_VERSION`` as ``"major.minor"``."""
-    text = (repo_root / "repos" / "dexhal" / "src" / "math" / "contract" / "mod.rs").read_text(
+    text = (repo_root / "dexhal" / "src" / "math" / "contract" / "mod.rs").read_text(
         encoding="utf-8"
     )
     m = re.search(
@@ -160,7 +160,7 @@ def contract_version(repo_root: Path) -> str:
         text,
     )
     if not m:
-        raise ValueError("cannot find CONTRACT_VERSION in repos/dexhal/src/math/contract/mod.rs")
+        raise ValueError("cannot find CONTRACT_VERSION in dexhal/src/math/contract/mod.rs")
     return f"{m.group(1)}.{m.group(2)}"
 
 
@@ -381,7 +381,7 @@ def scaffold(
     limits = urdf_limits(layout.urdf, info.joint_names)
 
     name = struct_name(arm)
-    dexhal_dir = repo_root / "repos" / "dexhal"
+    dexhal_dir = repo_root / "dexhal"
     values: Dict[str, object] = {
         "oem": oem,
         "oem_ident": oem.replace("-", "_"),

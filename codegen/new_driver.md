@@ -6,8 +6,8 @@ file and shell tools; run every command from the repository root. You are done
 only when `cargo test --manifest-path repos/dexforge-<oem>/Cargo.toml` passes.
 
 Read first: [`README.md`](README.md) (architecture and target layout),
-[`repos/dexhal/README.md`](../repos/dexhal/README.md) (driver contract),
-[`repos/dexhal/mock/rust`](../repos/dexhal/mock/rust) (reference `ArmDriver`).
+[`dexhal/README.md`](../dexhal/README.md) (driver contract),
+[`dexhal/mock/rust`](../dexhal/mock/rust) (reference `ArmDriver`).
 
 ## Inputs (from the user)
 
@@ -19,7 +19,7 @@ Read first: [`README.md`](README.md) (architecture and target layout),
 | OEM hardware API / protocol spec | `ArmDriver::{connect, disconnect, read_state, write_command}` and optional native hooks. |
 
 Ask for any missing input rather than inventing hardware facts. Never edit
-`repos/dexhal` and never copy its math into the vendor crate.
+`dexhal` and never copy its math into the vendor crate.
 
 ## Hard rules
 
@@ -106,7 +106,7 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    splits strict / singular cases or enables refinement, mirror that.
 4. **`manifest.yaml`**: replace every `TODO` from the OEM data; keep
    `driver: <arm>` and the scaffolded `version`. Check against
-   [`repos/dexhal/examples/manifest.yaml`](../repos/dexhal/examples/manifest.yaml).
+   [`dexhal/examples/manifest.yaml`](../dexhal/examples/manifest.yaml).
 5. **`driver.rs`**: implement `ArmDriver` from the OEM protocol (see the mock
    driver): reject wrong buffer lengths with `ArmError`, fill `CoreState` via
    the zero-copy views, honour `manifest().control_modes`, and keep sockets /
