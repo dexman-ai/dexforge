@@ -6,7 +6,7 @@ This document captures core tenets for contributors working on dexforge, a zero-
 
 Unless the user explicitly asks otherwise, **work only in these paths**:
 
-- `repos/dexhal/`
+- `dexhal/`
 - `repos/dexforge-ur/`
 - `ssik_shared_tests/`
 - `codegen/` (when regenerating dynamics / test data)

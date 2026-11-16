@@ -126,5 +126,5 @@ jobs:
           python -m pytest codegen/tests -v
 
       - name: Run dexhal Rust tests
-        run: cargo test --release --manifest-path repos/dexhal/Cargo.toml
+        run: cargo test --release --manifest-path dexhal/Cargo.toml
 

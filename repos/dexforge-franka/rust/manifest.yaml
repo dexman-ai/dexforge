@@ -2,7 +2,7 @@
 #
 # Loaded by `FrankaPandaDriver::new()` through
 # `ArmManifest::from_text::<FrankaPanda, 7, 128>`; see
-# repos/dexhal/examples/manifest.yaml for every key. Scaffolded by
+# dexhal/examples/manifest.yaml for every key. Scaffolded by
 # codegen/scaffold.py: `limits.velocity` / `limits.effort` come from the URDF
 # <limit> tags. Every `TODO` must be replaced from the OEM data sheet / protocol
 # specification (the manifest does not parse until they are).
