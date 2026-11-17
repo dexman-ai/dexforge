@@ -54,10 +54,10 @@ straight to `target_q`.
 
 ## P0 — make the surface real
 
-6. Postponed: **[codegen] Emit the full `ArmModel`.** Generate `NAME`, `JOINT_LIMITS`,
+6. Done: **[codegen] Emit the full `ArmModel`.** Generate `NAME`, `JOINT_LIMITS`,
    `HAS_DYNAMICS` and the dynamics hooks from the URDF, so no OEM writes them by
    hand. Until then no arm reports limits or dynamics through `Arm`.
-7. Postponed: **[codegen] Emit a nominal chain per arm.** Each driver exports its nominal
+7. Done: **[codegen] Emit a nominal chain per arm.** Each driver exports its nominal
    `KinematicChain` in driver frames, plus the DH-to-driver frame adapters where
    the vendor calibration is DH-based (UR).
 8. Postponed: **[driver] Real-driver tests.** Test `Arm` against an actual driver for a
@@ -77,7 +77,7 @@ straight to `target_q`.
     `examples/manifest.yaml`. Was: Define a schema (the `schema.yaml` files in the
     DexZero drivers are the starting point) and generate or load `ArmManifest`
     from it.
-12. Postponed: **[codegen] Driver template and agent prompt.** A skeleton crate plus a
+12. Done: **[codegen] Driver template and agent prompt.** A skeleton crate plus a
     prompt, alongside the IK translation prompts in `codegen/`, for generating
     `connect`, `disconnect`, `read_state` and `write_command` from an API spec.
 13. Postponed: **Conformance test kit.** A reusable suite an OEM runs against their driver:
