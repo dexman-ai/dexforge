@@ -35,6 +35,11 @@
 //! `allow_refinement` is set — polished by a bounded Levenberg-Marquardt step
 //! that holds the locked joint fixed ([`refine7`]).
 //!
+//! A seeded solve holds the locked joint at the seed's value instead: the seed
+//! and every sweep solution, with that joint set to the seed's, are polished
+//! on the other six joints ([`seed_locked`]), and the verified results replace
+//! the sweep (which remains the fallback when none closes).
+//!
 //! ## Deterministic-execution note
 //!
 //! As in the Piper port, the reference's randomised Möbius fallback for
@@ -74,7 +79,7 @@
 use nalgebra::{SMatrix, SVector};
 
 use dexhal::math::kinematics::{lm_refine_masked, mat4_frob_diff, mat4_mul, rot_homogeneous};
-use dexhal::math::postprocess::{dedup_solutions, wrap_distance};
+use dexhal::math::postprocess::{dedup_solutions, q_close, wrap_distance};
 use dexhal::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
 pub use dexhal::math::tolerances::TolerancePolicy;
 
@@ -263,14 +268,27 @@ pub fn solve(
     // De-duplicate modulo 2π, keeping the lower-residual representative.
     let mut d_q = [[0.0f64; 7]; CAND_CAP];
     let mut d_res = [0.0f64; CAND_CAP];
-    let n_d = dedup_solutions(&cand_q, &cand_res, n_cand, &mut d_q, &mut d_res, dedup_atol);
+    let mut n_d = dedup_solutions(&cand_q, &cand_res, n_cand, &mut d_q, &mut d_res, dedup_atol);
+
+    // Seeded solve: keep the locked joint at the seed's value instead of the
+    // nearest lock sample, so tracking never moves it without TCP motion.
+    let seeded = match q_seed {
+        Some(seed) => {
+            let n = seed_locked(model, seed, t, &mut d_q, n_d, respect_limits, policy);
+            if n > 0 {
+                n_d = n;
+            }
+            n > 0
+        }
+        None => false,
+    };
 
     let mut sol_count = 0usize;
     for i in 0..n_d {
         if sol_count >= MAX_SOLUTIONS {
             break;
         }
-        let q = if allow_refinement {
+        let q = if allow_refinement && !seeded {
             refine7(model, &d_q[i], t, refinement_max_iters)
         } else {
             d_q[i]
@@ -623,6 +641,51 @@ fn refine7(
 // ---------------------------------------------------------------------------
 // De-duplication and post-processing helpers
 // ---------------------------------------------------------------------------
+
+/// LM iteration ceiling of the seed-locked polish (it stops on convergence).
+const SEED_LOCK_ITERS: usize = 100;
+
+/// Seed-locked solutions of a seeded solve, written over `sols[..]`.
+///
+/// Starts from the seed and from each of the `n` sweep solutions in `sols`,
+/// with the locked joint set to the seed's value, and polishes the six other
+/// joints with [`refine7`] (which holds that joint). Keeps the FK-verified,
+/// de-duplicated (and, with `respect_limits`, in-limit) results. Returns their
+/// count; on `0`, `sols` is left untouched and the caller keeps the sweep.
+fn seed_locked(
+    model: &Model,
+    seed: &[f64; 7],
+    target: &SMatrix<f64, 4, 4>,
+    sols: &mut [[f64; 7]; CAND_CAP],
+    n: usize,
+    respect_limits: bool,
+    policy: TolerancePolicy,
+) -> usize {
+    let mut out = [[0.0f64; 7]; CAND_CAP];
+    let mut count = 0usize;
+    for k in 0..=n {
+        let mut start = if k == 0 { *seed } else { sols[k - 1] };
+        start[model.lock_idx] = seed[model.lock_idx];
+        let q = refine7(model, &start, target, SEED_LOCK_ITERS);
+        if !q.iter().all(|v| v.is_finite())
+            || fk_residual(model, &q, target) > policy.subproblem_numerical
+            || (respect_limits && !in_limits7(model, &wrap_to_limits7(model, &q)))
+            || out[..count]
+                .iter()
+                .any(|s| q_close::<7>(&q, s, policy.subproblem_dedup))
+        {
+            continue;
+        }
+        if count < CAND_CAP {
+            out[count] = q;
+            count += 1;
+        }
+    }
+    if count > 0 {
+        *sols = out;
+    }
+    count
+}
 
 /// Try `q[i] ± 2π` per joint to bring the vector into the model's joint limits.
 fn wrap_to_limits7(model: &Model, q: &[f64; 7]) -> [f64; 7] {

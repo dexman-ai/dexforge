@@ -28,9 +28,12 @@ use crate::math::payload::{
     payload_coriolis_torque, payload_gravity_torque, payload_inertia_matrix,
     payload_inverse_dynamics, Payload,
 };
+use crate::math::contract::WrenchFrame;
 use crate::math::postprocess::{q_close, within_limits};
-use crate::math::spatial::{jacobian_in_frame, pseudo_inverse, tcp_jacobian};
-use crate::math::ssik_core::{norm3, wrap_to_pi};
+use crate::math::spatial::{
+    jacobian_in_frame, pose_rotation, pseudo_inverse, tcp_jacobian, wrench_tool_to_base,
+};
+use crate::math::ssik_core::{add3, cross3, mat3_vec, norm3, wrap_to_pi};
 use crate::math::tolerances::TolerancePolicy;
 
 /// Standard gravity (m/s²) used for the default gravity vector `[0, 0, -g]`.
@@ -481,6 +484,57 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
         }
         Some(tau)
     }
+
+    // --- sensing -----------------------------------------------------------
+
+    /// The external wrench on the tool at the TCP origin in base axes, from a
+    /// [`CoreState::wrench`](crate::math::contract::CoreState::wrench)
+    /// reported in `frame` at configuration `q`.
+    ///
+    /// Unless `gravity_compensated`, the payload's weight under the configured
+    /// gravity is removed, so a still arm holding its declared payload in free
+    /// space reads zero.
+    pub fn external_wrench(
+        &self,
+        q: &[f64; DOF],
+        reported: &[f64; 6],
+        frame: WrenchFrame,
+        gravity_compensated: bool,
+    ) -> [f64; 6] {
+        let flange = self.flange_fk(q);
+        let tcp = flange * self.tcp;
+        let p_tcp = [tcp[(0, 3)], tcp[(1, 3)], tcp[(2, 3)]];
+        let mut w = match frame {
+            WrenchFrame::Base => *reported,
+            WrenchFrame::Tcp => wrench_tool_to_base(&tcp, reported),
+            WrenchFrame::Flange => {
+                let at_flange = wrench_tool_to_base(&flange, reported);
+                let f = [at_flange[0], at_flange[1], at_flange[2]];
+                let lever = [
+                    flange[(0, 3)] - p_tcp[0],
+                    flange[(1, 3)] - p_tcp[1],
+                    flange[(2, 3)] - p_tcp[2],
+                ];
+                let m = add3(&[at_flange[3], at_flange[4], at_flange[5]], &cross3(&lever, &f));
+                [f[0], f[1], f[2], m[0], m[1], m[2]]
+            }
+        };
+        if !gravity_compensated && self.payload.mass != 0.0 {
+            let r = pose_rotation(&flange);
+            let com = add3(
+                &[flange[(0, 3)], flange[(1, 3)], flange[(2, 3)]],
+                &mat3_vec(&r, &self.payload.com),
+            );
+            let weight = self.gravity.map(|g| self.payload.mass * g);
+            let lever = [com[0] - p_tcp[0], com[1] - p_tcp[1], com[2] - p_tcp[2]];
+            let moment = cross3(&lever, &weight);
+            for k in 0..3 {
+                w[k] -= weight[k];
+                w[3 + k] -= moment[k];
+            }
+        }
+        w
+    }
 }
 
 #[cfg(test)]
@@ -849,5 +903,49 @@ mod tests {
             arm.fk_residual(&q, &Pose::zeros()),
             Err(ModelError::NotRigid)
         );
+    }
+
+    #[test]
+    fn external_wrench_moves_to_the_tcp_and_removes_payload_weight() {
+        let mut arm = Arm::<SixR, 6, 1>::new();
+        arm.set_tcp(&tool()).unwrap();
+        arm.set_payload(Payload::new(2.0, [0.01, 0.02, 0.1])).unwrap();
+        let q = sample_q::<6>(5, 1.5);
+        let flange = arm.flange_fk(&q);
+        let tcp = arm.fk(&q);
+        let close = |a: &[f64; 6], b: &[f64; 6]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9);
+
+        // A pure external force at the TCP, seen by each sensor frame.
+        let f_base = [3.0, -1.0, 2.0, 0.1, 0.2, -0.3];
+        let at_tcp_axes = crate::math::spatial::wrench_base_to_tool(&tcp, &f_base);
+        assert!(close(
+            &arm.external_wrench(&q, &at_tcp_axes, WrenchFrame::Tcp, true),
+            &f_base
+        ));
+        // The same wrench about the flange origin, in flange axes.
+        let lever = [
+            tcp[(0, 3)] - flange[(0, 3)],
+            tcp[(1, 3)] - flange[(1, 3)],
+            tcp[(2, 3)] - flange[(2, 3)],
+        ];
+        let m_flange = add3(&[f_base[3], f_base[4], f_base[5]], &cross3(&lever, &[f_base[0], f_base[1], f_base[2]]));
+        let at_flange = crate::math::spatial::wrench_base_to_tool(
+            &flange,
+            &[f_base[0], f_base[1], f_base[2], m_flange[0], m_flange[1], m_flange[2]],
+        );
+        assert!(close(
+            &arm.external_wrench(&q, &at_flange, WrenchFrame::Flange, true),
+            &f_base
+        ));
+
+        // A still arm with only its payload: the sensor reads the weight.
+        let r = pose_rotation(&flange);
+        let com = add3(&[flange[(0, 3)], flange[(1, 3)], flange[(2, 3)]], &mat3_vec(&r, &[0.01, 0.02, 0.1]));
+        let weight = arm.gravity().map(|g| 2.0 * g);
+        let lever = [com[0] - tcp[(0, 3)], com[1] - tcp[(1, 3)], com[2] - tcp[(2, 3)]];
+        let m = cross3(&lever, &weight);
+        let raw = [weight[0], weight[1], weight[2], m[0], m[1], m[2]];
+        assert!(close(&arm.external_wrench(&q, &raw, WrenchFrame::Base, false), &[0.0; 6]));
+        assert!(close(&arm.external_wrench(&q, &raw, WrenchFrame::Base, true), &raw));
     }
 }

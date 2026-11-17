@@ -98,6 +98,9 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    Respect joint limits when asked, order nearest-first when `q_seed` is given,
    guard every `acos`/`asin`/`sqrt` domain edge, and include the reference arm's
    IK tests against `test_data.rs` (`#[cfg(test)] #[path = "test_data.rs"] mod test_data;`).
+   Joint-lock 7-DOF arms (categories 3–4) must hold the locked joint at the
+   seed's value on a seeded solve (copy the reference arm's `seed_locked`
+   pass and its `seeded_solve_keeps_the_seed_locked_joint` test).
 2. **`codegen/generate_code.py`** (categories 2–4): adapt the reference arm's
    script so it reads `codegen/<arm>_ik.py` and writes `../consts.rs` / `../pq.rs`;
    add `pub mod consts;` / `pub mod pq;` to `mod.rs` if the scaffold did not.

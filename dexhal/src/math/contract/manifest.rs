@@ -18,7 +18,7 @@
 //! // In a driver: include_str!("../manifest.yaml")
 //! static MANIFEST: &str = "
 //! driver: demo
-//! version: \"0.2\"
+//! version: \"0.3\"
 //! control_freq_hz: 500
 //! control_modes: [joint_pos, joint_vel]
 //! latency:
@@ -48,20 +48,60 @@
 //! | `control_modes` | yes | List of `joint_pos`, `joint_vel`, `joint_torque`, `cartesian_pose`, `cartesian_twist`, `cartesian_wrench` |
 //! | `realtime` | no | Needs a real-time thread (default `false`) |
 //! | `latency.state_staleness_cycles`, `latency.command_dispatch_cycles` | yes | Delays in control cycles |
+//! | `latency.hardware_watchdog_ms` | no | Timeout of the hardware command-stream watchdog armed in `connect` (`NAN` when omitted: none) |
 //! | `limits.velocity`, `limits.acceleration`, `limits.effort` | yes | One positive finite value per joint (rad/s, rad/s², N·m) |
 //! | `limits.jerk` | no | One positive finite value per joint (rad/s³); `NAN` when omitted so the kernel applies its ramp-time fallback |
 //! | `limits.position_min`, `limits.position_max` | no | Override [`ArmModel::JOINT_LIMITS`] (rad) |
-//! | `has_static_inertials` | no | Static link mass / inertia model is trustworthy for host impedance (default [`ArmModel::HAS_DYNAMICS`]) |
+//! | `limits.cartesian_velocity`, `limits.cartesian_acceleration` | no | TCP bound `[linear, angular]` (m/s, rad/s; m/s², rad/s²) |
+//! | `has_static_inertials` | no | Static link mass / inertia model is trustworthy for host impedance, Route 3 (default [`ArmModel::HAS_DYNAMICS`]; must be `false` when `!HAS_DYNAMICS`) |
+//! | `has_residual_inertials` | no | Static link mass / inertia model is trustworthy for torque-residual admittance, Route 6 (default `has_static_inertials`; must be `false` when `!HAS_DYNAMICS`) |
+//! | `dynamics_source` | no | `model` (default) or `vendor` (`aux`): whether per-tick control routes use [`ArmModel`] SymPy dynamics or runtime `gravity_torque`, `coriolis_torque`, `mass_matrix` streamed in `aux` |
 //! | `sensing.torque`, `.wrench`, `.gripper` | no | Hardware sensing (default `false`) |
-//! | `native.cartesian_impedance`, `.cartesian_admittance`, `.joint_impedance`, `.joint_admittance`, `.contact_detection`, `.reflexes`, `.payload`, `.tcp_offset` | no | Features the controller executes itself (default `false`) |
+//! | `sensing.torque_constants` | no | Per-joint raw-unit → N·m factor when [`CoreState::torques`] carries motor current |
+//! | `sensing.wrench_frame` | no | `base` (default), `flange` or `tcp`: reference of [`CoreState::wrench`] |
+//! | `sensing.wrench_is_gravity_compensated` | no | The wrench already excludes tool weight (default `false`) |
+//! | `native.cartesian_impedance`, `.cartesian_admittance`, `.joint_impedance`, `.contact_detection`, `.reflexes`, `.payload`, `.tcp_offset`, `.gravity_compensation`, `.realtime_mode_switch`, `.nullspace_posture` | no | Features the controller executes itself (default `false`) |
+//! | `compliance.max_stiffness_k`, `.min_damping_b`, `.min_mass_m`, `.max_wrench` | no | Six positive values `[X, Y, Z, RX, RY, RZ]`: native compliance stability bounds |
+//! | `gripper.max_width`, `gripper.max_force` | no | Integrated gripper range (m, N) |
 //! | `aux` | no | List of `- name: … / type: f64 / count: …` items following [`CoreState`] in the state buffer |
 
-use super::{control_mode, ContractVersion, CoreCommand, CoreState, CONTRACT_VERSION, MAX_DOF};
+use super::{
+    control_mode, ActiveMode, ContractVersion, CoreCommand, CoreState, CoreStateView,
+    DynamicsState, CONTRACT_VERSION, MAX_DOF,
+};
 use crate::math::chain::ModelError;
 use crate::math::model::ArmModel;
 
 /// Capacity of [`AuxSchema`].
 pub const MAX_AUX_FIELDS: usize = 16;
+
+/// Canonical [`AuxField`] labels when [`ArmManifest::dynamics_source`] is
+/// [`DynamicsSource::Vendor`].
+pub mod aux_dynamics {
+    /// Link-side gravity torque `G(q)` (N·m, `DOF` slots).
+    pub const GRAVITY_TORQUE: &str = "gravity_torque";
+    /// Link-side Coriolis / centrifugal torque `C(q, qd) qd` (N·m, `DOF` slots).
+    pub const CORIOLIS_TORQUE: &str = "coriolis_torque";
+    /// Link-side mass matrix `M(q)` (kg·m², `DOF * DOF` row-major slots).
+    pub const MASS_MATRIX: &str = "mass_matrix";
+}
+
+/// Where the real-time kernel obtains link dynamics (`M`, `C qd`, `G` and
+/// inverse dynamics) at the measured state (`dynamics_source`).
+///
+/// Planning, trajectory scrubbing and simulation at arbitrary poses always
+/// query [`ArmMath`](super::ArmMath) directly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DynamicsSource {
+    /// Host-side [`ArmModel`] SymPy dynamics (`model`, default).
+    #[default]
+    Model,
+    /// Controller-computed dynamics passed through in the [`CoreState`] `aux`
+    /// tail (`vendor`): [`aux_dynamics::GRAVITY_TORQUE`] (`DOF`),
+    /// [`aux_dynamics::CORIOLIS_TORQUE`] (`DOF`) and
+    /// [`aux_dynamics::MASS_MATRIX`] (`DOF * DOF`, row-major).
+    Vendor,
+}
 
 /// One field of the driver-specific tail following [`CoreState`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +149,37 @@ impl AuxSchema {
     pub fn slots(&self) -> usize {
         self.fields().iter().map(|f| f.size as usize).sum()
     }
+
+    /// `(offset, size)` in `f64` slots within [`CoreStateView::tail`] of the
+    /// field named `label`.
+    pub fn offset_of(&self, label: &str) -> Option<(usize, usize)> {
+        let mut offset = 0;
+        for f in self.fields() {
+            let size = f.size as usize;
+            if f.label == label {
+                return Some((offset, size));
+            }
+            offset += size;
+        }
+        None
+    }
+
+    /// Slice of `tail` ([`CoreStateView::tail`]) belonging to `label`.
+    pub fn slice<'a>(&self, tail: &'a [f64], label: &str) -> Option<&'a [f64]> {
+        let (offset, size) = self.offset_of(label)?;
+        tail.get(offset..offset + size)
+    }
+
+    /// Whether `self` declares the three [`aux_dynamics`] fields with exact
+    /// sizes for `dof` joints.
+    pub fn has_vendor_dynamics(&self, dof: usize) -> bool {
+        if dof == 0 || dof > MAX_DOF {
+            return false;
+        }
+        matches!(self.offset_of(aux_dynamics::GRAVITY_TORQUE), Some((_, n)) if n == dof)
+            && matches!(self.offset_of(aux_dynamics::CORIOLIS_TORQUE), Some((_, n)) if n == dof)
+            && matches!(self.offset_of(aux_dynamics::MASS_MATRIX), Some((_, n)) if n == dof * dof)
+    }
 }
 
 /// What the host-side model of an arm can compute.
@@ -153,9 +224,64 @@ impl<const DOF: usize> JointRatings<DOF> {
     }
 }
 
+/// Where [`CoreState::wrench`] is referenced (`sensing.wrench_frame`).
+///
+/// The driver copies its sensor's six floats straight into the buffer; the
+/// kernel moves them to the TCP origin in base axes with
+/// [`Arm::external_wrench`](crate::math::arm::Arm::external_wrench).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WrenchFrame {
+    /// TCP origin, base axes (`base`).
+    #[default]
+    Base,
+    /// Flange origin, flange axes (`flange`): a wrist sensor as mounted.
+    Flange,
+    /// TCP origin, TCP axes (`tcp`).
+    Tcp,
+}
+
+/// Stability bounds of the controller's native compliance, per task axis
+/// `[X, Y, Z, RX, RY, RZ]` (N/m · N·m/rad, N·s/m · N·m·s/rad, kg · kg·m², N ·
+/// N·m). `NAN` where the OEM gives no bound; the kernel then applies its
+/// latency-derived defaults.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ComplianceLimits {
+    /// Largest stiffness the controller renders stably.
+    pub max_stiffness_k: [f64; 6],
+    /// Smallest damping the controller renders stably.
+    pub min_damping_b: [f64; 6],
+    /// Smallest virtual mass the controller renders stably.
+    pub min_mass_m: [f64; 6],
+    /// Largest spring wrench; the kernel derives the deflection clamp
+    /// `Δx_max = F_max / K`.
+    pub max_wrench: [f64; 6],
+}
+
+impl ComplianceLimits {
+    /// No bound given.
+    pub const UNSPECIFIED: ComplianceLimits = ComplianceLimits {
+        max_stiffness_k: [f64::NAN; 6],
+        min_damping_b: [f64::NAN; 6],
+        min_mass_m: [f64::NAN; 6],
+        max_wrench: [f64::NAN; 6],
+    };
+}
+
 /// Static description of an arm, read once by the kernel at boot.
 ///
-/// Arrays are [`MAX_DOF`]-padded; entries beyond `active_dof_count` are zero.
+/// Arrays are [`MAX_DOF`]-padded; entries beyond `active_dof_count` are zero
+/// (`NAN` for the optional per-joint arrays). Optional scalar and Cartesian
+/// bounds are `NAN` when the manifest omits them.
+///
+/// # Lifecycle
+///
+/// `ArmDriver::connect` powers the arm on, releases the brakes, arms the
+/// hardware command-stream watchdog (if any) and leaves the arm enabled and
+/// ready for `write_command`; `disconnect` stops and disables it cleanly.
+/// There are no separate enable / brake hooks: a protective stop or disabled
+/// state at runtime is reported through [`CoreState::robot_mode`] /
+/// [`CoreState::fault_code`], `clear_faults` re-enables, and commissioning
+/// actions (e.g. manual brake release) go through `handle_vendor_command`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArmManifest {
     pub name: &'static str,
@@ -173,19 +299,47 @@ pub struct ArmManifest {
     pub state_staleness_cycles: u32,
     /// Cycles between `write_command` returning and the hardware acting.
     pub command_dispatch_cycles: u32,
+    /// Timeout (ms) of the hardware's own command-stream watchdog, armed in
+    /// `connect`; `NAN` when the hardware has none. The driver never runs a
+    /// software watchdog: if the kernel stops calling `write_command`, only
+    /// this hardware timer acts.
+    pub hardware_watchdog_ms: f64,
     pub has_torque_sensing: bool,
     pub has_wrench_sensing: bool,
     pub has_integrated_gripper: bool,
+    /// Per-joint factor (N·m per raw unit, e.g. `k_t · n_gear`) from the raw
+    /// motor current / effort the driver reports in [`CoreState::torques`]
+    /// to link-side torque; `NAN` when the driver reports N·m itself. See
+    /// [`link_torques`](Self::link_torques).
+    pub torque_constants: [f64; MAX_DOF],
+    /// Reference of [`CoreState::wrench`].
+    pub wrench_frame: WrenchFrame,
+    /// [`CoreState::wrench`] already has the tool / payload weight removed.
+    pub wrench_is_gravity_compensated: bool,
     pub native_cartesian_impedance: bool,
     pub native_cartesian_admittance: bool,
+    /// The controller executes the MIT 5-tuple ([`ActiveMode::JointImpedance`]).
     pub native_joint_impedance: bool,
-    pub native_joint_admittance: bool,
     pub native_contact_detection: bool,
     pub native_reflexes: bool,
     /// The controller accepts payload changes itself.
     pub native_payload: bool,
     /// The controller accepts TCP changes itself.
     pub native_tcp_offset: bool,
+    /// In [`ActiveMode::JointTorque`] the controller adds its own gravity
+    /// (and friction) compensation to `target_torques`, so the kernel sends
+    /// only task / impedance torque (plus payload gravity when the payload was
+    /// [`Applied::Host`](super::Applied::Host)). When `false` the kernel sends
+    /// total torque.
+    pub native_gravity_compensation: bool,
+    /// The controller can switch [`ActiveMode`] between two cycles while
+    /// moving. When `false` the kernel only switches modes at rest.
+    pub native_realtime_mode_switch: bool,
+    /// In native Cartesian impedance / admittance the controller takes
+    /// `target_q` (with `joint_stiffness_k` / `joint_damping_b` when finite)
+    /// as the null-space posture of a redundant arm. When `false` it manages
+    /// redundancy itself and ignores `target_q`.
+    pub native_nullspace_posture: bool,
     /// Position limits (rad); `±INFINITY` for a continuous joint.
     pub joint_limits_min: [f64; MAX_DOF],
     pub joint_limits_max: [f64; MAX_DOF],
@@ -197,10 +351,32 @@ pub struct ArmManifest {
     pub jerk_limits: [f64; MAX_DOF],
     /// Torque limits (N·m).
     pub effort_limits: [f64; MAX_DOF],
+    /// TCP speed limit `[linear (m/s), angular (rad/s)]`; `NAN` when omitted.
+    pub cartesian_velocity_limits: [f64; 2],
+    /// TCP acceleration limit `[linear (m/s²), angular (rad/s²)]`; `NAN` when
+    /// omitted.
+    pub cartesian_acceleration_limits: [f64; 2],
+    /// Native compliance stability bounds.
+    pub compliance: ComplianceLimits,
+    /// Largest opening (m) of the integrated gripper; `NAN` when omitted.
+    pub gripper_max_width: f64,
+    /// Largest grip force (N) of the integrated gripper; `NAN` when omitted.
+    pub gripper_max_force: f64,
     /// Whether static link inertials are available and accurate enough for
-    /// host-side inverse dynamics (`HostImpedance` / torque-residual
-    /// admittance). Defaults to [`ArmModel::HAS_DYNAMICS`].
+    /// closed-loop torque host impedance (Route 3, `HostImpedance`). Defaults
+    /// to [`ArmModel::HAS_DYNAMICS`]; cannot be `true` when
+    /// [`ModelCapabilities::dynamics`] is `false`.
     pub has_static_inertials: bool,
+    /// Whether static link inertials are available and accurate enough for
+    /// torque-residual wrench estimation on a position/velocity-controlled arm
+    /// (Route 6, `HostAdmittanceTorque`). Defaults to
+    /// [`has_static_inertials`](Self::has_static_inertials) (which defaults to
+    /// [`ArmModel::HAS_DYNAMICS`]); cannot be `true` when
+    /// [`ModelCapabilities::dynamics`] is `false`.
+    pub has_residual_inertials: bool,
+    /// Where per-tick control routes obtain link dynamics at the measured
+    /// state (`dynamics_source`, default [`DynamicsSource::Model`]).
+    pub dynamics_source: DynamicsSource,
     pub model: ModelCapabilities,
 }
 
@@ -240,24 +416,37 @@ impl ArmManifest {
             aux: AuxSchema::EMPTY,
             state_staleness_cycles: 0,
             command_dispatch_cycles: 0,
+            hardware_watchdog_ms: f64::NAN,
             has_torque_sensing: false,
             has_wrench_sensing: false,
             has_integrated_gripper: false,
+            torque_constants: [f64::NAN; MAX_DOF],
+            wrench_frame: WrenchFrame::Base,
+            wrench_is_gravity_compensated: false,
             native_cartesian_impedance: false,
             native_cartesian_admittance: false,
             native_joint_impedance: false,
-            native_joint_admittance: false,
             native_contact_detection: false,
             native_reflexes: false,
             native_payload: false,
             native_tcp_offset: false,
+            native_gravity_compensation: false,
+            native_realtime_mode_switch: false,
+            native_nullspace_posture: false,
             joint_limits_min: lo,
             joint_limits_max: hi,
             velocity_limits: padded(&ratings.velocity),
             acceleration_limits: padded(&ratings.acceleration),
             jerk_limits: [f64::NAN; MAX_DOF],
             effort_limits: padded(&ratings.effort),
+            cartesian_velocity_limits: [f64::NAN; 2],
+            cartesian_acceleration_limits: [f64::NAN; 2],
+            compliance: ComplianceLimits::UNSPECIFIED,
+            gripper_max_width: f64::NAN,
+            gripper_max_force: f64::NAN,
             has_static_inertials: A::HAS_DYNAMICS,
+            has_residual_inertials: A::HAS_DYNAMICS,
+            dynamics_source: DynamicsSource::Model,
             model: ModelCapabilities {
                 dof: DOF as u8,
                 max_ik_solutions: MAX as u16,
@@ -266,9 +455,92 @@ impl ArmManifest {
         })
     }
 
+    /// Whether per-tick inverse dynamics are usable for closed-loop torque
+    /// `HostImpedance` (Route 3): either trustworthy static URDF inertials on
+    /// the host model or runtime dynamics streamed by the vendor controller in
+    /// `aux`.
+    pub fn has_impedance_dynamics(&self) -> bool {
+        (self.model.dynamics && self.has_static_inertials)
+            || self.dynamics_source == DynamicsSource::Vendor
+    }
+
+    /// Whether per-tick inverse dynamics are usable for torque-residual
+    /// wrench estimation in `HostAdmittanceTorque` (Route 6): either static
+    /// URDF inertials usable for residual estimation or runtime dynamics
+    /// streamed by the vendor controller in `aux`.
+    pub fn has_residual_dynamics(&self) -> bool {
+        (self.model.dynamics && self.has_residual_inertials)
+            || self.dynamics_source == DynamicsSource::Vendor
+    }
+
+    /// Extract the vendor-streamed [`DynamicsState`] (`gravity_torque`,
+    /// `coriolis_torque`, `mass_matrix`) from `state_buffer`'s `aux` tail,
+    /// padded to [`MAX_DOF`].
+    ///
+    /// Returns `None` if `state_buffer` is shorter than [`state_len`](Self::state_len),
+    /// any of the three [`aux_dynamics`] fields is missing or has the wrong
+    /// size, or any entry is non-finite.
+    pub fn aux_dynamics(&self, state_buffer: &[f64]) -> Option<DynamicsState> {
+        if state_buffer.len() < self.state_len() {
+            return None;
+        }
+        let dof = usize::from(self.active_dof_count);
+        if !self.aux.has_vendor_dynamics(dof) {
+            return None;
+        }
+        let tail = CoreStateView::new(state_buffer).ok()?.tail();
+        let g = self.aux.slice(tail, aux_dynamics::GRAVITY_TORQUE)?;
+        let c = self.aux.slice(tail, aux_dynamics::CORIOLIS_TORQUE)?;
+        let m = self.aux.slice(tail, aux_dynamics::MASS_MATRIX)?;
+        if !g.iter().chain(c).chain(m).all(|v| v.is_finite()) {
+            return None;
+        }
+        let mut out = DynamicsState {
+            m_matrix: [[0.0; MAX_DOF]; MAX_DOF],
+            c_vector: [0.0; MAX_DOF],
+            g_vector: [0.0; MAX_DOF],
+        };
+        out.g_vector[..dof].copy_from_slice(g);
+        out.c_vector[..dof].copy_from_slice(c);
+        for i in 0..dof {
+            out.m_matrix[i][..dof].copy_from_slice(&m[i * dof..(i + 1) * dof]);
+        }
+        Some(out)
+    }
+
     /// Whether every flag in `modes` is executed natively.
     pub fn supports(&self, modes: u32) -> bool {
         self.control_modes & modes == modes
+    }
+
+    /// Whether the driver accepts a command in `mode` ([`ActiveMode::Idle`]
+    /// always is).
+    pub fn supports_mode(&self, mode: ActiveMode) -> bool {
+        match mode {
+            ActiveMode::Idle => true,
+            ActiveMode::JointPos => self.supports(control_mode::JOINT_POS),
+            ActiveMode::JointVel => self.supports(control_mode::JOINT_VEL),
+            ActiveMode::JointTorque => self.supports(control_mode::JOINT_TORQUE),
+            ActiveMode::CartesianPose => self.supports(control_mode::CARTESIAN_POSE),
+            ActiveMode::CartesianTwist => self.supports(control_mode::CARTESIAN_TWIST),
+            ActiveMode::CartesianWrench => self.supports(control_mode::CARTESIAN_WRENCH),
+            ActiveMode::JointImpedance => self.native_joint_impedance,
+            ActiveMode::CartesianImpedance => self.native_cartesian_impedance,
+            ActiveMode::CartesianAdmittance => self.native_cartesian_admittance,
+        }
+    }
+
+    /// Link-side joint torque (N·m) from the [`CoreState::torques`] the
+    /// driver reported: scaled by [`torque_constants`](Self::torque_constants)
+    /// where given, unchanged elsewhere.
+    pub fn link_torques(&self, reported: &[f64; MAX_DOF]) -> [f64; MAX_DOF] {
+        let mut out = *reported;
+        for (v, k) in out.iter_mut().zip(&self.torque_constants) {
+            if !k.is_nan() {
+                *v *= k;
+            }
+        }
+        out
     }
 
     /// Length in `f64` of the state buffer: [`CoreState`] plus the aux tail.
@@ -388,6 +660,48 @@ fn parse_joint_list<const DOF: usize>(s: &str) -> Parsed<[f64; DOF]> {
     Ok(out)
 }
 
+/// Every value finite and strictly positive.
+fn check_positive(values: &[f64]) -> Parsed<()> {
+    for v in values {
+        if !v.is_finite() {
+            return Err(ManifestErrorKind::Model(ModelError::NonFinite));
+        }
+        if *v <= 0.0 {
+            return Err(ManifestErrorKind::Model(ModelError::NonPositive));
+        }
+    }
+    Ok(())
+}
+
+fn parse_positive_list<const N: usize>(s: &str) -> Parsed<[f64; N]> {
+    let values = parse_joint_list::<N>(s)?;
+    check_positive(&values)?;
+    Ok(values)
+}
+
+fn parse_positive(s: &str) -> Parsed<f64> {
+    let v: f64 = s.parse().map_err(|_| ManifestErrorKind::InvalidValue)?;
+    check_positive(&[v])?;
+    Ok(v)
+}
+
+fn parse_wrench_frame(s: &str) -> Parsed<WrenchFrame> {
+    match unquote(s) {
+        "base" => Ok(WrenchFrame::Base),
+        "flange" => Ok(WrenchFrame::Flange),
+        "tcp" => Ok(WrenchFrame::Tcp),
+        _ => Err(ManifestErrorKind::InvalidValue),
+    }
+}
+
+fn parse_dynamics_source(s: &str) -> Parsed<DynamicsSource> {
+    match unquote(s) {
+        "model" => Ok(DynamicsSource::Model),
+        "vendor" | "aux" => Ok(DynamicsSource::Vendor),
+        _ => Err(ManifestErrorKind::InvalidValue),
+    }
+}
+
 fn parse_modes(s: &str) -> Parsed<u32> {
     let mut modes = 0;
     for item in list_items(s)? {
@@ -481,7 +795,26 @@ impl<const DOF: usize> Parser<DOF> {
             }
             "has_static_inertials" => {
                 mark(&mut self.seen, 24)?;
-                m.has_static_inertials = parse_bool(value)?;
+                let v = parse_bool(value)?;
+                if v && !m.model.dynamics {
+                    return Err(ManifestErrorKind::InvalidValue);
+                }
+                m.has_static_inertials = v;
+                if self.seen & (1 << 39) == 0 {
+                    m.has_residual_inertials = v;
+                }
+            }
+            "has_residual_inertials" => {
+                mark(&mut self.seen, 39)?;
+                let v = parse_bool(value)?;
+                if v && !m.model.dynamics {
+                    return Err(ManifestErrorKind::InvalidValue);
+                }
+                m.has_residual_inertials = v;
+            }
+            "dynamics_source" => {
+                mark(&mut self.seen, 40)?;
+                m.dynamics_source = parse_dynamics_source(value)?;
             }
             _ => return Err(ManifestErrorKind::UnknownKey),
         }
@@ -516,18 +849,65 @@ impl<const DOF: usize> Parser<DOF> {
                 self.ratings.effort = parse_joint_list(value)?;
                 return Ok(());
             }
+            ("latency", "hardware_watchdog_ms") => {
+                mark(&mut self.seen, 32)?;
+                m.hardware_watchdog_ms = parse_positive(value)?;
+                return Ok(());
+            }
             ("limits", "jerk") => {
                 mark(&mut self.seen, 23)?;
-                let jerk = parse_joint_list::<DOF>(value)?;
-                for v in &jerk {
-                    if !v.is_finite() {
-                        return Err(ManifestErrorKind::Model(ModelError::NonFinite));
-                    }
-                    if *v <= 0.0 {
-                        return Err(ManifestErrorKind::Model(ModelError::NonPositive));
-                    }
-                }
+                let jerk = parse_positive_list::<DOF>(value)?;
                 m.jerk_limits = padded(&jerk);
+                return Ok(());
+            }
+            ("limits", "cartesian_velocity") => {
+                mark(&mut self.seen, 30)?;
+                m.cartesian_velocity_limits = parse_positive_list(value)?;
+                return Ok(());
+            }
+            ("limits", "cartesian_acceleration") => {
+                mark(&mut self.seen, 31)?;
+                m.cartesian_acceleration_limits = parse_positive_list(value)?;
+                return Ok(());
+            }
+            ("sensing", "wrench_frame") => {
+                mark(&mut self.seen, 27)?;
+                m.wrench_frame = parse_wrench_frame(value)?;
+                return Ok(());
+            }
+            ("sensing", "torque_constants") => {
+                mark(&mut self.seen, 29)?;
+                let k = parse_joint_list::<DOF>(value)?;
+                if !k.iter().all(|v| v.is_finite()) {
+                    return Err(ManifestErrorKind::Model(ModelError::NonFinite));
+                }
+                if k.contains(&0.0) {
+                    return Err(ManifestErrorKind::Model(ModelError::NonPositive));
+                }
+                m.torque_constants = [f64::NAN; MAX_DOF];
+                m.torque_constants[..DOF].copy_from_slice(&k);
+                return Ok(());
+            }
+            ("compliance", key) => {
+                let (bit, slot) = match key {
+                    "max_stiffness_k" => (33, &mut m.compliance.max_stiffness_k),
+                    "min_damping_b" => (34, &mut m.compliance.min_damping_b),
+                    "min_mass_m" => (35, &mut m.compliance.min_mass_m),
+                    "max_wrench" => (36, &mut m.compliance.max_wrench),
+                    _ => return Err(ManifestErrorKind::UnknownKey),
+                };
+                mark(&mut self.seen, bit)?;
+                *slot = parse_positive_list(value)?;
+                return Ok(());
+            }
+            ("gripper", key) => {
+                let (bit, slot) = match key {
+                    "max_width" => (37, &mut m.gripper_max_width),
+                    "max_force" => (38, &mut m.gripper_max_force),
+                    _ => return Err(ManifestErrorKind::UnknownKey),
+                };
+                mark(&mut self.seen, bit)?;
+                *slot = parse_positive(value)?;
                 return Ok(());
             }
             ("limits", "position_min") => {
@@ -546,11 +926,16 @@ impl<const DOF: usize> Parser<DOF> {
             ("native", "cartesian_impedance") => (15, &mut m.native_cartesian_impedance),
             ("native", "cartesian_admittance") => (16, &mut m.native_cartesian_admittance),
             ("native", "joint_impedance") => (17, &mut m.native_joint_impedance),
-            ("native", "joint_admittance") => (18, &mut m.native_joint_admittance),
+            ("native", "gravity_compensation") => (18, &mut m.native_gravity_compensation),
             ("native", "contact_detection") => (19, &mut m.native_contact_detection),
             ("native", "reflexes") => (20, &mut m.native_reflexes),
             ("native", "payload") => (21, &mut m.native_payload),
             ("native", "tcp_offset") => (22, &mut m.native_tcp_offset),
+            ("native", "realtime_mode_switch") => (25, &mut m.native_realtime_mode_switch),
+            ("native", "nullspace_posture") => (26, &mut m.native_nullspace_posture),
+            ("sensing", "wrench_is_gravity_compensated") => {
+                (28, &mut m.wrench_is_gravity_compensated)
+            }
             _ => return Err(ManifestErrorKind::UnknownKey),
         };
         mark(&mut self.seen, bit)?;
@@ -647,6 +1032,8 @@ impl ArmManifest {
                         "sensing" => 2,
                         "native" => 3,
                         "aux" => 4,
+                        "compliance" => 5,
+                        "gripper" => 6,
                         _ => return Err(ManifestErrorKind::UnknownKey),
                     };
                     section = Some(key);
@@ -668,6 +1055,11 @@ impl ArmManifest {
             if parser.seen & (1 << bit) == 0 {
                 return Err(at(0)(ManifestErrorKind::MissingKey(key)));
             }
+        }
+        if parser.manifest.dynamics_source == DynamicsSource::Vendor
+            && !parser.manifest.aux.has_vendor_dynamics(DOF)
+        {
+            return Err(at(0)(ManifestErrorKind::InvalidAux));
         }
         let checked = ArmManifest::for_model::<A, DOF, MAX>(1, 0, &parser.ratings)
             .map_err(|e| at(0)(ManifestErrorKind::Model(e)))?;
@@ -788,6 +1180,29 @@ mod tests {
         assert!(m.has_torque_sensing && !m.has_wrench_sensing && !m.has_integrated_gripper);
         assert!(m.native_cartesian_admittance && m.native_payload && m.native_tcp_offset);
         assert!(!m.native_cartesian_impedance && !m.native_reflexes);
+        assert!(m.native_gravity_compensation);
+        assert!(!m.native_realtime_mode_switch && !m.native_nullspace_posture);
+        assert_eq!(m.hardware_watchdog_ms, 20.0);
+        assert_eq!(m.cartesian_velocity_limits, [1.0, 3.0]);
+        assert_eq!(m.cartesian_acceleration_limits, [5.0, 15.0]);
+        assert_eq!(m.wrench_frame, WrenchFrame::Flange);
+        assert!(!m.wrench_is_gravity_compensated);
+        assert_eq!(m.torque_constants[..6], [12.0, 12.0, 12.0, 3.1, 3.1, 3.1]);
+        assert!(m.torque_constants[6..].iter().all(|v| v.is_nan()));
+        let mut raw = [0.0; MAX_DOF];
+        raw[0] = 2.0;
+        raw[5] = -1.0;
+        assert_eq!(m.link_torques(&raw)[..6], [24.0, 0.0, 0.0, 0.0, 0.0, -3.1]);
+        assert_eq!(m.compliance.max_stiffness_k[0], 3000.0);
+        assert_eq!(m.compliance.min_damping_b[5], 1.0);
+        assert_eq!(m.compliance.min_mass_m[3], 0.05);
+        assert_eq!(m.compliance.max_wrench[2], 80.0);
+        assert_eq!((m.gripper_max_width, m.gripper_max_force), (0.085, 140.0));
+        assert!(m.supports_mode(ActiveMode::Idle));
+        assert!(m.supports_mode(ActiveMode::CartesianPose));
+        assert!(m.supports_mode(ActiveMode::CartesianAdmittance));
+        assert!(!m.supports_mode(ActiveMode::JointTorque));
+        assert!(!m.supports_mode(ActiveMode::JointImpedance));
         assert_eq!(m.velocity_limits[..6], [3.15, 3.15, 3.15, 3.2, 3.2, 3.2]);
         assert_eq!(m.acceleration_limits[..6], [15.0; 6]);
         assert_eq!(m.jerk_limits[..6], [300.0; 6]);
@@ -821,7 +1236,7 @@ mod tests {
     }
 
     const MINIMAL: &str = "driver: six-r
-version: \"0.2\"
+version: \"0.3\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 latency:
@@ -853,6 +1268,15 @@ limits:
         assert_eq!(m.joint_limits_max, direct.joint_limits_max);
         assert!(m.jerk_limits.iter().all(|v| v.is_nan()));
         assert_eq!(m.has_static_inertials, direct.has_static_inertials);
+        // Every optional bound is unspecified, and raw torques pass through.
+        assert!(m.hardware_watchdog_ms.is_nan());
+        assert!(m.cartesian_velocity_limits.iter().all(|v| v.is_nan()));
+        assert!(m.compliance.max_wrench.iter().all(|v| v.is_nan()));
+        assert!(m.gripper_max_width.is_nan());
+        assert_eq!(m.wrench_frame, WrenchFrame::Base);
+        let raw = [1.5; MAX_DOF];
+        assert_eq!(m.link_torques(&raw), raw);
+        assert!(!m.native_gravity_compensation);
     }
 
     #[test]
@@ -860,7 +1284,7 @@ limits:
         use ManifestErrorKind::*;
         assert_eq!(kind(""), (0, MissingKey("driver")));
         assert_eq!(
-            kind("driver: six-r\nversion: \"0.2\"\ncontrol_freq_hz: 250\ncontrol_modes: [joint_pos]\nlatency:\n  state_staleness_cycles: 0\n  command_dispatch_cycles: 0\nlimits:\n  velocity: [1, 1, 1, 1, 1, 1]\n  effort: [3, 3, 3, 3, 3, 3]\n"),
+            kind("driver: six-r\nversion: \"0.3\"\ncontrol_freq_hz: 250\ncontrol_modes: [joint_pos]\nlatency:\n  state_staleness_cycles: 0\n  command_dispatch_cycles: 0\nlimits:\n  velocity: [1, 1, 1, 1, 1, 1]\n  effort: [3, 3, 3, 3, 3, 3]\n"),
             (0, MissingKey("limits.acceleration"))
         );
         assert_eq!(kind("driver: other-arm\n"), (1, ModelMismatch));
@@ -877,6 +1301,34 @@ limits:
             (2, Model(ModelError::NonPositive))
         );
         assert_eq!(kind("limits:\n  velocity: [1, 2, 3]\n"), (2, WrongLength));
+        assert_eq!(
+            kind("limits:\n  cartesian_velocity: [1, 2, 3]\n"),
+            (2, WrongLength)
+        );
+        assert_eq!(
+            kind("limits:\n  cartesian_acceleration: [1, -2]\n"),
+            (2, Model(ModelError::NonPositive))
+        );
+        assert_eq!(kind("native:\n  joint_admittance: false\n"), (2, UnknownKey));
+        assert_eq!(kind("sensing:\n  wrench_frame: world\n"), (2, InvalidValue));
+        assert_eq!(
+            kind("sensing:\n  torque_constants: [1, 1, 0, 1, 1, 1]\n"),
+            (2, Model(ModelError::NonPositive))
+        );
+        assert_eq!(
+            kind("latency:\n  hardware_watchdog_ms: 0\n"),
+            (2, Model(ModelError::NonPositive))
+        );
+        assert_eq!(
+            kind("compliance:\n  max_stiffness_k: [1, 1, 1, 1, 1, .inf]\n"),
+            (2, Model(ModelError::NonFinite))
+        );
+        assert_eq!(kind("compliance:\n  max_k: [1]\n"), (2, UnknownKey));
+        assert_eq!(kind("gripper:\n  max_width: wide\n"), (2, InvalidValue));
+        assert_eq!(
+            kind("gripper:\n  max_force: 10\n  max_force: 10\n"),
+            (3, DuplicateKey)
+        );
         assert_eq!(
             kind("limits:\n  velocity: [1, 2, 3, 4, 5, x]\n"),
             (2, InvalidValue)
@@ -900,7 +1352,7 @@ limits:
 
         // Ratings must be positive and finite, position limits ordered.
         let zero_velocity: &'static str = "driver: six-r
-version: \"0.2\"
+version: \"0.3\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 latency:
@@ -914,5 +1366,147 @@ limits:
   position_max: [0, 1, 1, 1, 1, 1]
 ";
         assert_eq!(kind(zero_velocity), (0, Model(ModelError::NonPositive)));
+    }
+
+    #[test]
+    fn inertials_flags_and_vendor_dynamics_override() {
+        use crate::math::model::Pose;
+        use crate::math::tolerances::TolerancePolicy;
+        use ManifestErrorKind::*;
+
+        struct NoDyn;
+        impl ArmModel<6, 1> for NoDyn {
+            const NAME: &'static str = "six-r";
+            const HAS_DYNAMICS: bool = false;
+            fn flange_fk(_q: &[f64; 6]) -> Pose {
+                Pose::identity()
+            }
+            fn flange_jacobian(_q: &[f64; 6]) -> [[f64; 6]; 6] {
+                [[0.0; 6]; 6]
+            }
+            fn flange_solve(
+                _t: &Pose,
+                _m: Option<usize>,
+                _s: Option<&[f64; 6]>,
+                _l: bool,
+                _r: bool,
+                _p: TolerancePolicy,
+                _i: usize,
+            ) -> [Option<[f64; 6]>; 1] {
+                [None]
+            }
+        }
+
+        // Item 56: when HAS_DYNAMICS == false, defaults are false and setting true is rejected.
+        let m_no_dyn = ArmManifest::from_text::<NoDyn, 6, 1>(MINIMAL).unwrap();
+        assert!(!m_no_dyn.model.dynamics);
+        assert!(!m_no_dyn.has_static_inertials);
+        assert!(!m_no_dyn.has_residual_inertials);
+        assert!(!m_no_dyn.has_impedance_dynamics());
+        assert!(!m_no_dyn.has_residual_dynamics());
+
+        let err_static = ArmManifest::from_text::<NoDyn, 6, 1>("has_static_inertials: true\n")
+            .unwrap_err();
+        assert_eq!((err_static.line, err_static.kind), (1, InvalidValue));
+        let err_residual = ArmManifest::from_text::<NoDyn, 6, 1>("has_residual_inertials: true\n")
+            .unwrap_err();
+        assert_eq!((err_residual.line, err_residual.kind), (1, InvalidValue));
+
+        // Item 57: has_residual_inertials defaults to has_static_inertials when omitted,
+        // and can be enabled independently for Route 6 while Route 3 is disabled.
+        let both_off: &'static str = "driver: six-r
+version: \"0.3\"
+control_freq_hz: 250
+control_modes: [joint_pos]
+has_static_inertials: false
+latency:
+  state_staleness_cycles: 0
+  command_dispatch_cycles: 0
+limits:
+  velocity: [1, 1, 1, 1, 1, 1]
+  acceleration: [2, 2, 2, 2, 2, 2]
+  effort: [3, 3, 3, 3, 3, 3]
+";
+        let m_off = ArmManifest::from_text::<SixR, 6, 1>(both_off).unwrap();
+        assert!(!m_off.has_static_inertials);
+        assert!(!m_off.has_residual_inertials);
+        assert!(!m_off.has_impedance_dynamics());
+        assert!(!m_off.has_residual_dynamics());
+
+        let route6_only: &'static str = "driver: six-r
+version: \"0.3\"
+control_freq_hz: 250
+control_modes: [joint_pos]
+has_static_inertials: false
+has_residual_inertials: true
+latency:
+  state_staleness_cycles: 0
+  command_dispatch_cycles: 0
+limits:
+  velocity: [1, 1, 1, 1, 1, 1]
+  acceleration: [2, 2, 2, 2, 2, 2]
+  effort: [3, 3, 3, 3, 3, 3]
+";
+        let m_r6 = ArmManifest::from_text::<SixR, 6, 1>(route6_only).unwrap();
+        assert!(!m_r6.has_static_inertials);
+        assert!(m_r6.has_residual_inertials);
+        assert!(!m_r6.has_impedance_dynamics());
+        assert!(m_r6.has_residual_dynamics());
+
+        // Item 58: dynamics_source: vendor requires canonical aux fields and extracts DynamicsState.
+        let missing_aux: &'static str = "driver: six-r
+version: \"0.3\"
+control_freq_hz: 250
+control_modes: [joint_pos]
+dynamics_source: vendor
+latency:
+  state_staleness_cycles: 0
+  command_dispatch_cycles: 0
+limits:
+  velocity: [1, 1, 1, 1, 1, 1]
+  acceleration: [2, 2, 2, 2, 2, 2]
+  effort: [3, 3, 3, 3, 3, 3]
+";
+        assert_eq!(kind(missing_aux), (0, InvalidAux));
+
+        let vendor_ok: &'static str = "driver: six-r
+version: \"0.3\"
+control_freq_hz: 250
+control_modes: [joint_pos, joint_torque]
+has_static_inertials: false
+dynamics_source: vendor
+latency:
+  state_staleness_cycles: 0
+  command_dispatch_cycles: 0
+limits:
+  velocity: [1, 1, 1, 1, 1, 1]
+  acceleration: [2, 2, 2, 2, 2, 2]
+  effort: [3, 3, 3, 3, 3, 3]
+aux:
+  - name: gravity_torque
+    count: 6
+  - name: coriolis_torque
+    count: 6
+  - name: mass_matrix
+    count: 36
+";
+        let m_vendor = ArmManifest::from_text::<NoDyn, 6, 1>(vendor_ok).unwrap();
+        assert_eq!(m_vendor.dynamics_source, DynamicsSource::Vendor);
+        assert!(m_vendor.has_impedance_dynamics());
+        assert!(m_vendor.has_residual_dynamics());
+
+        let mut state_buf = [0.0; CoreState::LEN + 48];
+        let tail = &mut state_buf[CoreState::LEN..];
+        for i in 0..6 {
+            tail[i] = (i + 1) as f64;
+            tail[6 + i] = (i + 10) as f64;
+            tail[12 + i * 6 + i] = (i + 100) as f64;
+        }
+        let d = m_vendor.aux_dynamics(&state_buf).unwrap();
+        assert_eq!(d.g_vector[..6], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(d.c_vector[..6], [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+        assert_eq!(d.m_matrix[0][0], 100.0);
+        assert_eq!(d.m_matrix[5][5], 105.0);
+        assert_eq!(d.g_vector[6..], [0.0, 0.0]);
     }
 }
