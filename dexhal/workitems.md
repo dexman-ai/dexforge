@@ -552,3 +552,6 @@ Each item below originates from the gap analysis in `c:\code\dexzero\workitems.m
     `ArmManifest::from_text` (and `ManifestDesc::to_manifest`) validate that
     when `dynamics_source: vendor` is set, all three `aux` fields are declared
     with exact sizes (`ManifestErrorKind::InvalidAux` otherwise).
+
+## P1 — missing capability (cont.)
+59. **[dexhal] FACTR 2 (NEXT) Virtual Torque Sensor Integration.** see specs\factr2.md 
