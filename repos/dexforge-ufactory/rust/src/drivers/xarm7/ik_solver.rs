@@ -451,10 +451,14 @@ pub fn fk(q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
 /// * `target_tf` — 4×4 SE(3) target pose of `ee_link` in `base_link`.
 /// * `max_solutions` — cap on returned solutions (post-dedup, post-limits).
 ///   `None` returns the full algebraic set (at most [`MAX_SOLUTIONS`]).
-/// * `q_seed` — when `Some`, lock-joint samples are visited nearest-first
-///   (closest to `q_seed[4]`), and the output solutions are sorted by
-///   wrap-to-pi distance from the seed (closest first). Combined with
-///   `max_solutions = Some(1)` this gives the trajectory-tracking fast path.
+/// * `q_seed` — when `Some`, the locked joint 4 is held at `q_seed[4]`:
+///   the seed and every sweep solution, with joint 4 set to the seed's value,
+///   are polished on the other six joints (always, regardless of
+///   `allow_refinement`), and the FK-verified results replace the sweep. Only
+///   when none closes does the solve fall back to the 16-sample sweep. The
+///   output is sorted by wrap-to-pi distance from the seed (closest first).
+///   Combined with `max_solutions = Some(1)` this gives the
+///   trajectory-tracking fast path.
 /// * `respect_limits` — when `true`, solutions outside the baked URDF joint
 ///   limits are dropped (after a `±2π` wrap-into-limits attempt). Pass
 ///   `false` for the raw geometric set.
@@ -592,16 +596,29 @@ pub fn solve(
 
     let mut f_q = [[0.0f64; 7]; CAND_CAP];
     let mut f_res = [0.0f64; CAND_CAP];
-    let n_final = dedup_solutions::<7, CAND_CAP>(
+    let mut n_final = dedup_solutions::<7, CAND_CAP>(
         &v_q, &v_res, n_v, &mut f_q, &mut f_res, dedup_atol,
     );
+
+    // Seeded solve: keep the locked joint at the seed's value instead of the
+    // nearest lock sample, so tracking never moves it without TCP motion.
+    let seeded = match q_seed {
+        Some(seed) => {
+            let n = seed_locked(seed, &target, &mut f_q, n_final, respect_limits, policy);
+            if n > 0 {
+                n_final = n;
+            }
+            n > 0
+        }
+        None => false,
+    };
 
     let mut sol_count = 0usize;
     for i in 0..n_final {
         if sol_count >= MAX_SOLUTIONS {
             break;
         }
-        let q = if allow_refinement {
+        let q = if allow_refinement && !seeded {
             refine7(&f_q[i], &target, refinement_max_iters)
         } else {
             f_q[i]
@@ -658,6 +675,53 @@ pub fn solve(
 // ---------------------------------------------------------------------------
 // Post-processing helpers
 // ---------------------------------------------------------------------------
+
+/// The joint the sweep locks.
+const LOCKED_JOINT: usize = 4;
+
+/// LM iteration ceiling of the seed-locked polish (it stops on convergence).
+const SEED_LOCK_ITERS: usize = 100;
+
+/// Seed-locked solutions of a seeded solve, written over `sols[..]`.
+///
+/// Starts from the seed and from each of the `n` sweep solutions in `sols`,
+/// with [`LOCKED_JOINT`] set to the seed's value, and polishes the six other
+/// joints with [`refine7`] (which holds that joint). Keeps the FK-verified,
+/// de-duplicated (and, with `respect_limits`, in-limit) results. Returns their
+/// count; on `0`, `sols` is left untouched and the caller keeps the sweep.
+fn seed_locked(
+    seed: &[f64; 7],
+    target: &Transform,
+    sols: &mut [[f64; 7]; CAND_CAP],
+    n: usize,
+    respect_limits: bool,
+    policy: TolerancePolicy,
+) -> usize {
+    let mut out = [[0.0f64; 7]; CAND_CAP];
+    let mut count = 0usize;
+    for k in 0..=n {
+        let mut start = if k == 0 { *seed } else { sols[k - 1] };
+        start[LOCKED_JOINT] = seed[LOCKED_JOINT];
+        let q = refine7(&start, target, SEED_LOCK_ITERS);
+        if !q.iter().all(|v| v.is_finite())
+            || frob_diff(&fk7(&q), target) > policy.subproblem_numerical
+            || (respect_limits && !in_limits7(&wrap_to_limits7(&q)))
+            || out[..count]
+                .iter()
+                .any(|s| q_close::<7>(&q, s, policy.subproblem_dedup))
+        {
+            continue;
+        }
+        if count < CAND_CAP {
+            out[count] = q;
+            count += 1;
+        }
+    }
+    if count > 0 {
+        *sols = out;
+    }
+    count
+}
 
 /// Try `q[i] ± 2π` per joint to bring the vector into [`JOINT_LIMITS`].
 /// Mirrors Python's `_ps_wrap_to_limits`.
@@ -945,6 +1009,37 @@ mod tests {
                     "q_seed sort: first solution is not the nearest to seed"
                 );
             }
+        }
+    }
+
+    /// Item 54: a seeded solve keeps the seed's locked joint (off the sample
+    /// grid) instead of snapping it to the nearest lock sample, also along a
+    /// path.
+    #[test]
+    fn seeded_solve_keeps_the_seed_locked_joint() {
+        let mut q = [0.3, -0.4, 0.2, 1.2, 0.37, 0.8, 0.5];
+        let mut seed = q;
+        for v in seed.iter_mut() {
+            *v += 0.02;
+        }
+        for step in 0..20 {
+            let target = fk(&q);
+            let sols = solve(
+                &target,
+                Some(1),
+                Some(&seed),
+                true,
+                true,
+                TolerancePolicy::DEFAULT,
+                REFINE_ITERS,
+            );
+            let sol = sols[0].expect("seeded solve finds a solution");
+            assert_eq!(sol[LOCKED_JOINT], seed[LOCKED_JOINT], "step {step}");
+            assert!((fk(&sol) - target).norm() < 1e-9, "step {step}");
+            assert!(seed_dist7(&sol, &seed) < 0.1, "step {step}: jumped to {sol:?}");
+            seed = sol;
+            q[0] += 0.01;
+            q[3] += 0.005;
         }
     }
 }

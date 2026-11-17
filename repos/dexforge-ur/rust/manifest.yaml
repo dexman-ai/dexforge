@@ -8,7 +8,7 @@
 # specification (the manifest does not parse until they are).
 
 driver: ur5               # must equal Ur5::NAME
-version: "0.2"
+version: "0.3"
 control_freq_hz: 500          # rate at which the controller expects commands
 control_modes: [joint_pos, joint_vel, cartesian_pose]
 realtime: true
@@ -33,8 +33,10 @@ native:
   cartesian_impedance: false
   cartesian_admittance: true
   joint_impedance: false
-  joint_admittance: false
   contact_detection: false
   reflexes: false
   payload: true
   tcp_offset: true
+  gravity_compensation: false
+  realtime_mode_switch: false
+  nullspace_posture: false

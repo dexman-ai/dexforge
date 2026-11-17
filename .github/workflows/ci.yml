@@ -125,6 +125,9 @@ jobs:
           source .venv/bin/activate
           python -m pytest codegen/tests -v
 
-      - name: Run dexhal Rust tests
-        run: cargo test --release --manifest-path dexhal/Cargo.toml
+      - name: Build mock driver plugin (cdylib)
+        run: cargo build --release -p dexforge-mock-core
+
+      - name: Run dexhal workspace Rust tests (core, mock, plugin)
+        run: cargo test --release --workspace
 

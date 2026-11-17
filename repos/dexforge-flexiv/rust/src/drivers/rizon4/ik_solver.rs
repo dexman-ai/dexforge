@@ -277,4 +277,28 @@ mod tests {
             assert_eq!(n_capped, 1, "max_solutions=1 should return exactly 1 solution");
         }
     }
+
+    /// Item 54: a seeded solve keeps the seed's locked joint 2 (off the sample
+    /// grid) instead of snapping it to the nearest lock sample, also along a
+    /// path.
+    #[test]
+    fn seeded_solve_keeps_the_seed_locked_joint() {
+        let mut q = [0.3, -0.4, 0.37, 1.2, 0.2, 0.8, 0.5];
+        let mut seed = q;
+        for v in seed.iter_mut() {
+            *v += 0.02;
+        }
+        for step in 0..20 {
+            let target = fk(&q);
+            let sols = solve(&target, Some(1), Some(&seed), true, true, TolerancePolicy::DEFAULT, 15);
+            let sol = sols[0].expect("seeded solve finds a solution");
+            assert_eq!(sol[2], seed[2], "step {step}");
+            assert!(fk_residual(&sol, &target) < 1e-9, "step {step}");
+            let jump = sol.iter().zip(&seed).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(jump < 0.1, "step {step}: jumped to {sol:?}");
+            seed = sol;
+            q[0] += 0.01;
+            q[3] += 0.005;
+        }
+    }
 }

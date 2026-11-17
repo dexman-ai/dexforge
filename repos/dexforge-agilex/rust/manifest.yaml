@@ -8,7 +8,7 @@
 # specification (the manifest does not parse until they are).
 
 driver: piper               # must equal Piper::NAME
-version: "0.2"
+version: "0.3"
 control_freq_hz: 500          # rate at which the controller expects commands
 control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose]
 realtime: true
@@ -33,8 +33,10 @@ native:
   cartesian_impedance: false
   cartesian_admittance: false
   joint_impedance: true
-  joint_admittance: false
   contact_detection: false
   reflexes: false
   payload: false
   tcp_offset: false
+  gravity_compensation: false
+  realtime_mode_switch: false
+  nullspace_posture: false

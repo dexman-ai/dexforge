@@ -201,10 +201,10 @@ excited every joint (`4·DOF + 6` for pose samples). See the module docs.
 
 | Role | dexhal item |
 | :-- | :-- |
-| Version & modes | `MAX_DOF` (8), `ContractVersion`, `CONTRACT_VERSION` (0.2.0), `control_mode` |
+| Version & modes | `MAX_DOF` (8), `ContractVersion`, `CONTRACT_VERSION` (0.3.0), `ActiveMode` |
 | Static capabilities, read once at boot | `ArmManifest` (from `manifest.yaml`) |
 | Driver → kernel buffer, every cycle | `CoreState` (56 × f64) + aux tail, `CoreStateView` / `CoreStateViewMut` |
-| Kernel → driver buffer, every cycle | `CoreCommand` (96 × f64), `CoreCommandView` / `CoreCommandViewMut` |
+| Kernel → driver buffer, every cycle | `CoreCommand` (109 × f64, no tail), `CoreCommandView` / `CoreCommandViewMut` |
 | Host-side model & dynamics | `ArmMath` (`Send`), `DynamicsState`, `CalibrationData` (95 × f64) |
 | Driver trait | `ArmDriver` (`Send`) |
 
@@ -232,13 +232,21 @@ position limits and model capabilities come from the `ArmModel`. Velocity,
 acceleration and effort limits have no default: the file (or
 `ArmManifest::for_model` with a `JointRatings`) must give a finite, positive
 value per joint. `limits.jerk` is optional (`NAN` when omitted so the kernel
-applies its acceleration / ramp-time fallback), and `has_static_inertials`
-defaults to `ArmModel::HAS_DYNAMICS` (`false` disables `HostImpedance` when an
-arm obscures URDF inertials or relies on proprietary drive friction models).
+applies its acceleration / ramp-time fallback). `has_static_inertials`
+defaults to `ArmModel::HAS_DYNAMICS` (`false` disables Route 3 `HostImpedance`
+when an arm obscures URDF inertials or relies on proprietary drive friction
+models), `has_residual_inertials` defaults to `has_static_inertials` (allowing
+Route 6 `HostAdmittanceTorque` torque-residual wrench estimation to stay
+enabled when `has_static_inertials: false`), and both are validated against
+`ArmModel::HAS_DYNAMICS` (setting either to `true` when `!HAS_DYNAMICS` is
+rejected). `dynamics_source` (`model` default, or `vendor` / `aux`) declares
+whether per-tick control routes use `ArmModel` SymPy dynamics or controller
+dynamics (`gravity_torque`, `coriolis_torque`, `mass_matrix`) passed through in
+the `CoreState` `aux` tail (`ArmManifest::aux_dynamics`).
 
 ### Buffers
 
-`CoreState` (56 × `f64`) and `CoreCommand` (96 × `f64`) are `#[repr(C)]`
+`CoreState` (56 × `f64`) and `CoreCommand` (109 × `f64`) are `#[repr(C)]`
 all-`f64` structs whose layout is the wire layout. Cartesian wire fields
 (`tcp_pose`, `tcp_twist`, `wrench`, `target_pose`, `target_twist`,
 `target_wrench`) are at the TCP origin in base axes; `CoreCommand::task_frame`
@@ -262,6 +270,22 @@ Slot offsets come from the struct definitions (`offset_of!`), so there is no
 `unsafe` and no copy. `CoreState::read_from` / `write_to` remain for code that
 wants an owned value.
 
+`write_command` is one `match` on `CoreCommandView::active_mode()`
+(`ActiveMode`, carried in `CoreCommand::control_mode`; `NAN` = `Idle`, which
+the driver answers with the hardware's hold or zero-damped command). Each mode
+names the fields the driver forwards, so precedence between finite targets is
+never guessed; peripheral fields (digital / analog outputs, gripper, reflex
+thresholds) apply whenever they are finite. There is no command-side tail:
+vendor features outside the layout go through
+`handle_vendor_command(name, payload, response)`, which writes its reply into
+the caller's buffer and returns its length.
+
+`ArmDriver::external_wrench(state)` turns a reported `CoreState::wrench` into
+the external wrench at the TCP in base axes, using `sensing.wrench_frame` and
+removing the configured payload weight unless the sensor is already
+gravity-compensated; `ArmManifest::link_torques` applies
+`sensing.torque_constants` to raw motor currents.
+
 ### Configuration plane
 
 | `ArmDriver` method | Driver hook | Result |
@@ -281,6 +305,164 @@ flat, `MAX_DOF`-padded form (95 × f64).
 share a name with `Arm`'s own: queries with a typed twin end in `_padded`,
 configuration methods are `apply_*`.
 
+## Driver implementation tiers: Minimal vs. Advanced
+
+A hardware driver is a pass-through between the wire buffers (`CoreState`,
+`CoreCommand`) and the robot's transport (CAN, EtherCAT, UDP, RTDE, vendor SDK).
+All kinematics, dynamics, compliance integration, force conditioning, latency
+compensation, and trajectory scrubbing live in `dexhal` and the DexZero kernel.
+Because the kernel inspects `ArmManifest` at boot and automatically falls back
+to its host model whenever a hardware capability is absent or a `CoreState`
+slot is left `NAN`, a **minimal pass-through driver** (for example, a raw CAN
+bus reading encoder counts and motor phase currents) can participate in full
+Cartesian motion, compliant force control, and protective reflexes without
+implementing any control theory or coordinate transforms in the driver.
+
+An **advanced controller driver** (for example, Franka `libfranka`, Flexiv RDK,
+or Universal Robots RTDE + URScript `force_mode`) can additionally declare the
+loops its hardware controller closes natively so the kernel delegates those
+loops directly.
+
+### Knob-by-knob comparison (Minimal vs. Advanced alternatives)
+
+| Knob / Capability | Minimal driver (pass-through) | Advanced driver (controller-delegated) | What the kernel does |
+| :-- | :-- | :-- | :-- |
+| **Kinematics (`tcp_pose`, `tcp_twist`)** | Leave `CoreState::tcp_pose` and `tcp_twist` as `NAN`. Report only `q` and `qd`. | Populate `tcp_pose` and `tcp_twist` at the TCP origin in base axes if the controller already computes them. | Computes `fk(q_actual)` and `J(q_actual) · qd_actual` from the host `ArmModel` whenever `NAN`; uses hardware `tcp_pose` for `calibration_residual` self-checks when present. |
+| **Motion command mode (`control_modes`)** | Implement a single joint mode: `joint_pos`, `joint_vel`, or `joint_torque`. | Expose multiple modes (`joint_pos`, `joint_vel`, `joint_torque`, `cartesian_pose`, `cartesian_twist`, `cartesian_wrench`) and switch on `CoreCommand::control_mode` (`native.realtime_mode_switch`). | Selects the best available output mode at boot and streams dense joint or Cartesian references at `control_freq_hz`. |
+| **Joint acceleration (`target_qdd`)** | Ignore `target_qdd`. | Forward `target_qdd` to the controller's feedforward acceleration input (e.g., `servoj` / `speedj` / CAN feedforward). | Always evaluates `reference.qdd` from the quintic / reactive generator and uses it in host inverse dynamics. |
+| **Joint torque sensing (`sensing.torque`, `CoreState::torques`)** | Read motor phase current $i$ and write link-side effort $\tau = k_t \cdot n_{\text{gear}} \cdot i$ (a single constant multiply per joint, or declare `sensing.torque_constants` in `manifest.yaml` and pass raw motor current). Includes gravity and payload. | Report link-side torque sensor readings in the positive joint direction (including gravity and payload). | Runs the torque-residual observer (Route 6): $r = \tau_{\text{model}}(q_{\text{actual}}, \dot{q}_{\text{actual}}, \ddot{q}_{\text{ref}}) - \tau_{\text{measured}}$ and projects $F_{\text{ext}} = (J^T)^+ r$ onto the TCP. |
+| **Wrist F/T sensing (`sensing.wrench`, `CoreState::wrench`)** | Copy the 6 raw sensor floats `[Fx, Fy, Fz, Tx, Ty, Tz]` straight into `CoreState::wrench`; set `sensing.wrench_frame: flange` (or `tcp`) and `sensing.wrench_is_gravity_compensated: false` in `manifest.yaml`. No `fk(q)` in the driver. | Report wrench already transformed to the TCP origin in base axes (`sensing.wrench_frame: base`), or set `sensing.wrench_is_gravity_compensated: true` if the controller subtracts gravity internally. | Rotates the wrench into the compliance frame, shifts moments to the TCP, subtracts configured payload gravity and inertial load, applies low-pass filtering + deadband, and handles `tare_wrench()`. |
+| **Compliance & force control (`native.*_impedance`, `native.*_admittance`)** | Set all `native.*` compliance flags to `false`. | Set `native.cartesian_impedance`, `native.cartesian_admittance`, or `native.joint_impedance` (MIT 5-tuple `(q_ref, qd_ref, kp, kd, tau_ff)`) to `true` and forward `task_frame`, `task_stiffness_k`, `task_damping_b`, `task_mass_m`, `target_wrench`, or `joint_stiffness_k` / `joint_damping_b`. | Selects one of the 7 compliance routes (`compliance.md` §2–3). For minimal drivers, closes the loop on the host via `HostImpedance` (Route 3), `HostAdmittanceWrench` (Route 5), or `HostAdmittanceTorque` (Route 6). |
+| **Static link inertials & runtime dynamics (`has_static_inertials`, `has_residual_inertials`, `dynamics_source`)** | Leave at defaults (`has_static_inertials` and `has_residual_inertials` default to `ArmModel::HAS_DYNAMICS`; `dynamics_source: model`). Both flags must be `false` when `ArmModel::HAS_DYNAMICS` is `false`. | Set `has_static_inertials: false` when URDF inertials are obscured (e.g., Flexiv) or dominated by harmonic-drive friction (e.g., UR); optionally keep `has_residual_inertials: true` if static URDF dynamics are still usable for Route 6 torque-residual wrench estimation, or set `dynamics_source: vendor` and pass through `gravity_torque` (`DOF`), `coriolis_torque` (`DOF`), and `mass_matrix` (`DOF * DOF`) in `CoreState` `aux`. | Uses `has_impedance_dynamics()` to gate Route 3 (`HostImpedance`) and `has_residual_dynamics()` to gate Route 6 (`HostAdmittanceTorque`). When `dynamics_source: vendor`, per-tick control routes read $(M, C\dot{q}, G)$ from `aux` (`ArmManifest::aux_dynamics`, plus host payload when `native.payload == false`), while planning and simulation continue to query `ArmMath` at arbitrary poses. |
+| **Gravity compensation in `JOINT_TORQUE` mode** | Set `native.gravity_compensation: false`. Driver forwards `target_torques` straight to the actuators. | Set `native.gravity_compensation: true` if the controller's torque mode already adds link gravity/friction internally (e.g., `libfranka`, Flexiv RDK). | Includes $\tau_{\text{model}}(q_{\text{actual}}, \dot{q}_{\text{actual}})$ in `target_torques` when `false`; sends only task/impedance torque (plus host payload gravity if `Applied::Host`) when `true`. |
+| **7-DOF null-space posture** | Leave `native.nullspace_posture: false`. | Set `native.nullspace_posture: true` and read `CoreCommand::target_q` alongside `target_pose` during `NativeCartesianImpedance` / `NativeCartesianAdmittance`. | On host routes (Routes 3–6), projects $\tau_{\text{null}}$ or commands all 7 joints directly. On native Cartesian routes, populates `target_q = reference.q` when `native.nullspace_posture` is `true`. |
+| **Protective reflexes (`native.contact_detection`, `native.reflexes`)** | Set both to `false`; leave `in_contact` and `native_reflex_fired` as `NAN`. | Report `in_contact` (`0.0`/`1.0`), accept `reflex_threshold` and `reflex_action_code` (`STOP`/`YIELD`/`RETRACT`), and set `CoreState::native_reflex_fired = 1.0` when a controller reflex or script triggers. | Monitors the conditioned host wrench (from sensor or motor-current residual) every cycle and triggers `STOP`, `YIELD`, or `RETRACT` on the host; coordinates with `native_reflex_fired` when delegated. |
+| **Tool, payload & gravity (`native.payload`, `native.tcp_offset`, `set_*_native`)** | Leave `set_payload_native`, `set_tcp_offset_native`, and `set_gravity_native` at their default `Err(ArmError::NotSupported)`. | Implement the `set_*_native` hooks to inform the controller's internal kinematics/gravity model and return `Ok(())` (`Applied::Native`). | Applies the change to the host `Arm` model in both cases; when `Applied::Host`, compensates TCP offset, payload dynamics, and gravity direction entirely on the host. |
+| **Latency & timing (`CoreState::timestamp`, `latency.*_cycles`)** | Declare static `state_staleness_cycles` and `command_dispatch_cycles` in `manifest.yaml`; write a packet counter or bus timestamp to `CoreState::timestamp` if available, else `NAN`. | Stamp `CoreState::timestamp` with the hardware clock (s) or monotonic sample counter on every packet. | Aligns delayed measurements against its $K$-deep reference history ring using `timestamp` (falling back to static `state_staleness_cycles` when `NAN`) and rolls the state forward to $(q_{\text{actual}}, \dot{q}_{\text{actual}})$. |
+| **Watchdog / command stop** | No software timer thread in the driver. Configure the motor drive's hardware watchdog register in `connect()` if present; on `CoreCommand::IDLE` (all `NAN`), send a static hold or zero-damped command (`kp = 0, kd = kd_safe, tau = 0`). | Configure the controller's native stream watchdog (e.g., RTDE / `libfranka` timeout) in `connect()` and report timeout faults in `CoreState::fault_code`. | Streams a jerk-limited `stop()` whenever a client disconnects or a command expires; relies on the hardware watchdog only if the kernel process itself dies. |
+| **Lifecycle & faults (`connect`, `disconnect`, `clear_faults`)** | `connect()` opens the bus and enables drives; `disconnect()` disables drives and closes the bus; report drive faults in `CoreState::fault_code`. No separate `enable`/`disable` state machine. | Same 3 lifecycle hooks (`connect`, `disconnect`, `clear_faults`), plus detailed `CoreState::robot_mode` and `fault_code` reporting from the controller. | Latches faults from `CoreState::fault_code` or `Err(ArmError::Fault(..))`, rejects new motion until `clear_faults()`, and re-seeds $q_{\text{ref}} \leftarrow q_{\text{actual}}$ upon recovery. |
+| **Limits (`limits.jerk`, `compliance.*`, `limits.cartesian_*`, `gripper.*`)** | Supply only the required `limits.velocity`, `limits.acceleration`, and `limits.effort`. Omit optional jerk, Cartesian, compliance, and gripper limits (`NAN`). | Populate `limits.jerk`, `limits.cartesian_velocity`, `limits.cartesian_acceleration`, `compliance.*` ($K_{\max}, D_{\min}, M_{\min}, F_{\max}$), and `gripper.*` from vendor specs. | Derives missing `limits.jerk` from acceleration and ramp time, and derives missing compliance clamps from loop latency $T_d$ and `effort_limits`. |
+| **Peripherals & extensions (`aux`, `handle_vendor_command`)** | `AuxSchema::EMPTY` (no state tail); default `handle_vendor_command` (`Err(ArmError::NotSupported)`). No command-side tail. | Declare `aux` fields in `manifest.yaml` (e.g., joint temperatures, bus voltage, or streamed $M, C, G$) and write them into `state.tail()`; implement `handle_vendor_command` with caller-supplied response slice. | Publishes `aux` fields by label in shared memory (`meta` + `state` channels) and forwards `vendor_command` over `ctl_req` / `ctl_rsp`. |
+
+---
+
+### Implementing a Minimal Driver
+
+A minimal driver is a pure pass-through: it owns no control loop, no kinematic
+or dynamic math, no background threads, and no mode-switching state machine.
+Even so, when paired with the generated `ArmModel` from `dexforge` (which
+supplies `fk`, `jacobian`, `solve`, and SymPy `gravity` / `mass_matrix` /
+`coriolis` / `inverse_dynamics` from the arm's URDF), a minimal driver gets
+**full DexZero functionality** on the host.
+
+#### What a minimal driver provides
+
+1. **`manifest.yaml`** with only the required keys:
+   - `driver`, `version`, `control_freq_hz`
+   - `control_modes`: typically `[joint_pos]`, `[joint_torque]`, or `[joint_pos, joint_torque]`
+   - `latency.state_staleness_cycles` and `latency.command_dispatch_cycles`
+   - `limits.velocity`, `limits.acceleration`, `limits.effort` (from the URDF / datasheet)
+   - `sensing.torque: true` if motor currents or joint torques are readable, or `sensing.wrench: true` if a 6-axis F/T sensor is attached
+   - All `native.*` flags omitted (default `false`)
+2. **`connect(&mut self)` and `disconnect(&mut self)`**:
+   - Open the hardware bus (CAN, serial, UDP, EtherCAT), arm the drive's
+     built-in hardware watchdog register if it has one, and enable the
+     actuators in `connect()`.
+   - Disable the actuators and close the bus in `disconnect()`.
+3. **`read_state(&mut self, state_buffer: &mut [f64])`**:
+   - Call `state.clear()` (sets all 56 slots of `CoreState` to `NAN`).
+   - Copy joint encoder angles into `state.q()[..DOF]` and joint velocities
+     into `state.qd()[..DOF]`.
+   - If motor phase currents $i$ are available, write link-side effort
+     $\tau = k_t \cdot n_{\text{gear}} \cdot i$ into `state.torques()[..DOF]`
+     (or raw sensor floats into `state.wrench()`).
+   - Write `state.fault_code()` (`0.0` when healthy) and `state.timestamp()` if
+     the bus provides a packet counter or timestamp.
+   - Leave `tcp_pose`, `tcp_twist`, and every unmeasured slot as `NAN`.
+4. **`write_command(&mut self, cmd_buffer: &[f64])`**:
+   - Read the slice for the supported mode (`cmd.target_q()[..DOF]`,
+     `cmd.target_qd()[..DOF]`, or `cmd.target_torques()[..DOF]`, or the MIT
+     5-tuple if `native.joint_impedance: true`) and put it on the wire.
+   - If the command is `CoreCommand::IDLE` (all `NAN`), send a static hold or
+     zero-damped packet.
+
+#### Expected functionality of a minimal driver in DexZero
+
+Because the host model fills in everything the hardware omits:
+
+- **Cartesian & joint motion (`move()`, `speed()`):** Full Pipeline 1A
+  (geometry-first), Pipeline 1B (time-first), and Pipeline 2 (velocity
+  streaming) with quintic jerk verification, chord-error bisection, singularity
+  braking, workspace bounds, and constraint funnels.
+- **Force-based control & compliance from motor current alone:**
+  - If the minimal driver supports `joint_torque` (`control_mode::JOINT_TORQUE`)
+    and its URDF provides inertials (`has_static_inertials: true`), the kernel
+    selects **Route 3 (`HostImpedance`)**: it evaluates $J(q_{\text{actual}})$
+    and $\tau_{\text{model}}(q_{\text{actual}}, \dot{q}_{\text{actual}}, \ddot{q}_{\text{ref}})$
+    on the host and commands $\tau = J^T (K e + D \dot{e} + F_{\text{virt}}) + \tau_{\text{null}} + \tau_{\text{model}}$.
+  - If the minimal driver only supports `joint_pos` or `joint_vel`, reports
+    motor-current torques (`sensing.torque: true`), and provides usable
+    residual dynamics (`has_residual_inertials: true` or
+    `dynamics_source: vendor`), the kernel selects
+    **Route 6 (`HostAdmittanceTorque`)**: it estimates the external TCP wrench
+    from the torque residual $r = \tau_{\text{model}} - \tau_{\text{measured}}$
+    via $F_{\text{ext}} = (J^T)^+ r$, integrates virtual mass-damper-spring
+    admittance on the host, solves seeded IK, and streams displaced `target_q`.
+  - If a raw wrist F/T sensor is wired into `CoreState::wrench`
+    (`sensing.wrench: true`), the kernel selects **Route 5 (`HostAdmittanceWrench`)**,
+    rotates and tares the wrench on the host, and integrates admittance in
+    position mode.
+- **Protective reflexes (`STOP`, `YIELD`, `RETRACT`):** The kernel monitors the
+  host-conditioned wrench (from the F/T sensor or motor-current torque residual)
+  every cycle and executes `STOP`, `YIELD` (freedrive), or path `RETRACT`
+  entirely on the host.
+- **Runtime tool, payload, gravity & calibration:** Handled on the host model
+  (`Applied::Host`) with zero driver code.
+
+---
+
+### Implementing an Advanced Driver
+
+An advanced driver wraps a robot controller that runs its own internal high-rate
+servo, impedance/admittance loop, kinematics, or safety supervisor (such as
+Franka `libfranka`, Flexiv RDK, Universal Robots RTDE + URScript, or smart
+MIT-mode actuators with onboard PD loops).
+
+#### What an advanced driver adds
+
+1. **Rich `manifest.yaml` declarations:**
+   - Multiple `control_modes` (e.g., `[joint_pos, joint_vel, joint_torque, cartesian_pose, cartesian_twist, cartesian_wrench]`).
+   - Native compliance capabilities:
+     - `native.cartesian_impedance: true` (Route 1) or `native.cartesian_admittance: true` (Route 2): the driver reads `target_pose` (or `target_q`/`target_qd`), `target_twist`, `task_frame: [f64; 7]`, diagonal `task_stiffness_k`, `task_damping_b`, `task_mass_m`, and `target_wrench` ($F_{\text{virt}}$) from `CoreCommandView` and streams them to the controller's native compliance API (e.g., URScript `force_mode`, Franka Cartesian impedance).
+     - `native.joint_impedance: true` (Route 4, MIT mode): the driver reads the 5-tuple `(target_q, target_qd, joint_stiffness_k, joint_damping_b, target_torques)` and packs it into the actuator's MIT frame.
+   - Inertial and gravity flags:
+     - `has_static_inertials: false` when the vendor obscures URDF link masses/inertias or when unmodelled harmonic-drive friction makes static URDF open-loop torque impedance (Route 3) inaccurate. Set `has_residual_inertials: true` when static URDF dynamics are still accurate enough for torque-residual wrench estimation (Route 6), or set `dynamics_source: vendor` to pass through the controller's internal `gravity_torque` (`DOF`), `coriolis_torque` (`DOF`), and `mass_matrix` (`DOF * DOF`) in the `CoreState` `aux` tail for per-tick control and shared memory.
+     - `native.gravity_compensation: true` when the controller's `joint_torque` mode automatically adds link gravity and friction compensation.
+   - Explicit controller compliance and Cartesian bounds: `limits.cartesian_velocity`, `limits.cartesian_acceleration`, and `compliance.*` ($K_{\max}, D_{\min}, M_{\min}, F_{\max}$).
+2. **Hardware state & reflex reporting in `read_state`:**
+   - Populate `tcp_pose` and `tcp_twist` (at the TCP origin in base axes) from the controller's internal model so `calibration_residual` can verify host-vs-controller agreement.
+   - Populate `timestamp` with the controller's hardware clock or packet counter so the kernel's $K$-deep latency compensation tracks variable network/RTDE jitter cycle by cycle.
+   - Populate `robot_mode`, `fault_code`, `in_contact`, and `native_reflex_fired` (`1.0` when a controller protective reflex or URScript contract break occurs).
+   - Populate `state.tail()` with any `aux` fields declared in `manifest.yaml`.
+3. **Native configuration & reflex delegation:**
+   - Implement `set_payload_native`, `set_tcp_offset_native`, and `set_gravity_native` so the controller's internal gravity compensation and force-mode frames stay synchronized with the kernel (`Applied::Native`).
+   - When `native.reflexes: true`, forward `reflex_threshold` and `reflex_action_code` to the controller so contact stops or yields happen inside the controller's microsecond loop, and set `CoreState::native_reflex_fired = 1.0` when triggered.
+   - Implement `clear_faults` to reset protective stops on the controller, and `handle_vendor_command` for vendor-specific actions outside the portable contract.
+
+#### Expected functionality of an advanced driver in DexZero
+
+- **Controller-rate stiffness and passivity (Routes 1, 2, 4):** Compliance is
+  closed inside the hardware controller or actuator drive (often at 1–10 kHz),
+  giving higher stable stiffness $K_{\max}$ and passive behavior against stiff
+  surfaces without round-trip bus delay.
+- **Seamless host fallback (`(primary_route, fallback_host_route)`):** Even on
+  an advanced driver, the kernel precomputes `fallback_host_route` at boot and
+  keeps the host `Arm` model synchronized on every `set_payload` /
+  `set_tcp_offset` / `set_gravity` call. If the user requests a capability the
+  native controller does not cover (such as path `RETRACT` after a native
+  reflex stop, or an arbitrary compliance frame on a controller that does not
+  accept `task_frame`), the kernel handles it on the host automatically.
+
 ## Tests
 
 ```
@@ -297,5 +479,19 @@ command queue whose depth is the manifest latency, and state computed from the
 oldest queued command. The crate ships a client manifest (`MANIFEST`) and a
 simple six-R arm model (`MockArm`, NAME `"mock-6r"`), so `MockDriver::default_arm()`
 works without any extra setup. Test it with `cargo test -p dexforge-mock-core`.
+
+## Loading drivers at run time (`dexhal-plugin`)
+
+`plugin/` (`dexhal-plugin`) is a stable C ABI around `ArmDriver` and `ArmMath`,
+so a host can load a driver it was not compiled with. A driver crate builds as
+a `cdylib`, implements `PluginDriver` (`create(config)` + `create_math()`) and calls
+`export_plugin!(MyDriver<…>)`, which exports `dexhal_plugin_entry`. The host
+loads it with `Plugin::load(path)` (ABI and contract major / minor are checked),
+then calls `create_driver(config)` and `create_math()` to get a
+`LoadedDriver: ArmDriver` and a `LoadedMath: ArmMath`. The mock driver is the
+reference export (`mock/rust/src/plugin.rs`); its tests in
+`mock/rust/tests/plugin.rs` check plugin-vs-direct parity and load
+`dexforge_mock_core` dynamically (`cargo build --release -p dexforge-mock-core`
+first).
 
 Open work is tracked in [`workitems.md`](workitems.md).

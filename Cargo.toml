@@ -1,5 +1,5 @@
 [workspace]
-members = ["dexhal", "dexhal/mock/rust"]
+members = ["dexhal", "dexhal/mock/rust", "dexhal/plugin"]
 resolver = "2"
 
 [profile.release]

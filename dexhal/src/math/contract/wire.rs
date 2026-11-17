@@ -34,10 +34,25 @@ fn array_at_mut<const N: usize>(buffer: &mut [f64], at: usize) -> &mut [f64; N] 
 }
 
 /// Generates the borrowed and mutable views of a wire struct. Arrays are
-/// accessed as `&[f64; N]`, scalars by value (and `&mut f64`).
+/// accessed as `&[f64; N]`, scalars by value (and `&mut f64`). `tail` adds
+/// accessors for the slots following the fixed prefix; `no_tail` omits them.
 macro_rules! wire_views {
+    (@tail tail, $strukt:ident) => {
+        /// The slots following the fixed prefix (the driver-specific tail).
+        pub fn tail(&self) -> &'a [f64] {
+            &self.0[$strukt::LEN..]
+        }
+    };
+    (@tail no_tail, $strukt:ident) => {};
+    (@tail_mut tail, $strukt:ident) => {
+        /// The slots following the fixed prefix (the driver-specific tail).
+        pub fn tail(&mut self) -> &mut [f64] {
+            &mut self.0[$strukt::LEN..]
+        }
+    };
+    (@tail_mut no_tail, $strukt:ident) => {};
     (
-        $strukt:ident, $view:ident, $view_mut:ident;
+        $strukt:ident, $view:ident, $view_mut:ident, $tail:ident;
         $( $field:ident : $kind:tt ),* $(,)?
     ) => {
         #[doc = concat!("Zero-copy read access to the [`", stringify!($strukt),
@@ -54,10 +69,7 @@ macro_rules! wire_views {
                 Ok($view(buffer))
             }
 
-            /// The slots following the fixed prefix (the driver-specific tail).
-            pub fn tail(&self) -> &'a [f64] {
-                &self.0[$strukt::LEN..]
-            }
+            wire_views!(@tail $tail, $strukt);
 
             $( wire_views!(@get $strukt, $field, $kind); )*
         }
@@ -81,10 +93,7 @@ macro_rules! wire_views {
                 self.0[..$strukt::LEN].fill(f64::NAN);
             }
 
-            /// The slots following the fixed prefix (the driver-specific tail).
-            pub fn tail(&mut self) -> &mut [f64] {
-                &mut self.0[$strukt::LEN..]
-            }
+            wire_views!(@tail_mut $tail, $strukt);
 
             /// Read-only view of the same buffer.
             pub fn as_view(&self) -> $view<'_> {
@@ -153,8 +162,24 @@ impl Writer<'_> {
 /// Typed prefix of the driver → kernel state buffer. Fields the hardware does
 /// not provide stay `NAN`; the kernel then falls back to the host model.
 ///
-/// Cartesian quantities (`tcp_pose`, `tcp_twist`, `wrench`) are at the TCP
-/// origin expressed in base axes.
+/// Signals are raw and uncompensated: the driver is a pass-through and never
+/// runs kinematics, dynamics or frame transforms. Any pre-processing the
+/// hardware already did is declared in the manifest instead.
+///
+/// * `tcp_pose` and `tcp_twist` are at the TCP origin in base axes.
+/// * `torques` is the link-side joint effort (N·m) in the positive joint
+///   direction, *including* gravity, payload, friction and inertial load — the
+///   total effort the joint transmits, not an external-torque estimate. When
+///   the manifest sets `sensing.torque_constants`, the driver instead passes
+///   the raw motor current / effort through and the kernel scales it
+///   ([`ArmManifest::link_torques`](super::ArmManifest::link_torques)).
+/// * `wrench` is `[Fx, Fy, Fz, Tx, Ty, Tz]` that the environment and payload
+///   apply *onto* the tool, in the frame of `sensing.wrench_frame` (default:
+///   TCP origin, base axes; see [`WrenchFrame`](super::WrenchFrame)), and
+///   including the tool / payload weight unless
+///   `sensing.wrench_is_gravity_compensated` is set.
+/// * Digital I/O bitmasks are carried as `f64` and are exact for bits
+///   `0..53` only.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreState {
@@ -165,12 +190,16 @@ pub struct CoreState {
     pub tcp_pose: [f64; 7],
     /// `[vx, vy, vz, wx, wy, wz]` at the TCP origin, base axes.
     pub tcp_twist: [f64; 6],
+    /// Link-side joint effort (N·m), positive joint direction, including
+    /// gravity and payload; raw motor current / effort when the manifest
+    /// declares `sensing.torque_constants`.
     pub torques: [f64; MAX_DOF],
-    /// `[Fx, Fy, Fz, Tx, Ty, Tz]` at the TCP origin, base axes.
+    /// `[Fx, Fy, Fz, Tx, Ty, Tz]` applied onto the tool, in
+    /// `sensing.wrench_frame` (default TCP origin, base axes).
     pub wrench: [f64; 6],
     /// 1.0 = contact, 0.0 = free, NAN = unknown.
     pub in_contact: f64,
-    /// Digital input bitmask carried as a float (exact up to 53 bits).
+    /// Digital input bitmask carried as a float (exact for bits `0..53`).
     pub io_digital_in: f64,
     pub io_analog_in: [f64; 4],
     pub gripper_width: f64,
@@ -267,7 +296,7 @@ impl CoreState {
 }
 
 wire_views! {
-    CoreState, CoreStateView, CoreStateViewMut;
+    CoreState, CoreStateView, CoreStateViewMut, tail;
     q: [MAX_DOF],
     qd: [MAX_DOF],
     tcp_pose: [7],
@@ -286,18 +315,114 @@ wire_views! {
     native_reflex_fired: scalar,
 }
 
+/// The control mode a [`CoreCommand`] selects, carried in
+/// [`CoreCommand::control_mode`] as a small integer code (`NAN` = idle).
+///
+/// `write_command` is a single `match` on this tag: each mode names the
+/// command fields the driver forwards. Peripheral fields (digital / analog
+/// outputs, gripper, reflex thresholds) are independent of the mode and apply
+/// whenever they are finite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveMode {
+    /// No motion target (`NAN`). The driver forwards the hardware's native
+    /// hold or zero-damped command (hold the current position, or
+    /// `kp = 0, kd = kd_safe, tau = 0` on an MIT bus). [`CoreCommand::IDLE`]
+    /// selects it.
+    Idle,
+    /// `target_q`; `target_qd` / `target_qdd` as feedforward when finite.
+    JointPos,
+    /// `target_qd`; `target_qdd` as feedforward when finite.
+    JointVel,
+    /// `target_torques`. Whether the controller adds its own gravity
+    /// compensation is declared by `native.gravity_compensation`.
+    JointTorque,
+    /// `target_pose`; `target_twist` as feedforward when finite.
+    CartesianPose,
+    /// `target_twist`.
+    CartesianTwist,
+    /// `target_wrench`.
+    CartesianWrench,
+    /// Native joint impedance / MIT mode: the 5-tuple `(target_q, target_qd,
+    /// joint_stiffness_k, joint_damping_b, target_torques)`.
+    JointImpedance,
+    /// Native Cartesian impedance: `target_pose`, `target_twist`, `task_frame`,
+    /// `task_stiffness_k`, `task_damping_b` and `target_wrench` (`F_virt`);
+    /// `target_q` (with `joint_stiffness_k` / `joint_damping_b` when finite)
+    /// is the null-space posture when `native.nullspace_posture` is set.
+    CartesianImpedance,
+    /// Native Cartesian admittance: as [`CartesianImpedance`](Self::CartesianImpedance)
+    /// plus `task_mass_m`.
+    CartesianAdmittance,
+}
+
+impl ActiveMode {
+    /// Every mode, in code order (`Idle` first).
+    pub const ALL: [ActiveMode; 10] = [
+        ActiveMode::Idle,
+        ActiveMode::JointPos,
+        ActiveMode::JointVel,
+        ActiveMode::JointTorque,
+        ActiveMode::CartesianPose,
+        ActiveMode::CartesianTwist,
+        ActiveMode::CartesianWrench,
+        ActiveMode::JointImpedance,
+        ActiveMode::CartesianImpedance,
+        ActiveMode::CartesianAdmittance,
+    ];
+
+    /// The wire value: `NAN` for [`Idle`](Self::Idle), else `1.0`, `2.0`, …
+    /// in [`ALL`](Self::ALL) order.
+    pub const fn code(self) -> f64 {
+        match self {
+            ActiveMode::Idle => f64::NAN,
+            ActiveMode::JointPos => 1.0,
+            ActiveMode::JointVel => 2.0,
+            ActiveMode::JointTorque => 3.0,
+            ActiveMode::CartesianPose => 4.0,
+            ActiveMode::CartesianTwist => 5.0,
+            ActiveMode::CartesianWrench => 6.0,
+            ActiveMode::JointImpedance => 7.0,
+            ActiveMode::CartesianImpedance => 8.0,
+            ActiveMode::CartesianAdmittance => 9.0,
+        }
+    }
+
+    /// Decode a wire value; `None` for a value that names no mode (a kernel
+    /// bug, which a driver answers like [`Idle`](Self::Idle)).
+    pub fn from_code(code: f64) -> Option<ActiveMode> {
+        if code.is_nan() {
+            return Some(ActiveMode::Idle);
+        }
+        ActiveMode::ALL.into_iter().find(|m| m.code() == code)
+    }
+}
+
 /// Typed prefix of the kernel → driver command buffer. Targets the kernel does
 /// not drive are `NAN`.
 ///
-/// Cartesian targets (`target_pose`, `target_twist`, `target_wrench`) are at
-/// the TCP origin in base axes; task-space gains (`task_stiffness_k`,
+/// [`control_mode`](Self::control_mode) selects which targets the driver
+/// executes ([`ActiveMode`]); precedence between finite targets is never
+/// guessed. Cartesian targets (`target_pose`, `target_twist`, `target_wrench`)
+/// are at the TCP origin in base axes; task-space gains (`task_stiffness_k`,
 /// `task_damping_b`, `task_mass_m`) are diagonal in `task_frame` (or base axes
 /// when `task_frame` is `NAN`).
+///
+/// There is no command-side tail: [`ArmManifest::command_len`](super::ArmManifest::command_len)
+/// is always [`CoreCommand::LEN`]. Vendor features outside this layout go
+/// through `ArmDriver::handle_vendor_command`.
+///
+/// When commands stop arriving the driver does nothing on its own (no timer
+/// threads); the hardware's native command-stream watchdog, armed in
+/// `connect` and declared by `latency.hardware_watchdog_ms`, is what acts.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoreCommand {
+    /// [`ActiveMode::code`]; `NAN` = idle / hold.
+    pub control_mode: f64,
     pub target_q: [f64; MAX_DOF],
     pub target_qd: [f64; MAX_DOF],
+    /// Feedforward joint acceleration (rad/s²) of the reference.
+    pub target_qdd: [f64; MAX_DOF],
     pub target_torques: [f64; MAX_DOF],
     pub target_pose: [f64; 7],
     pub target_twist: [f64; 6],
@@ -313,8 +438,12 @@ pub struct CoreCommand {
     pub reflex_threshold: [f64; 6],
     /// 0 = stop, 1 = yield / freedrive, 2 = retract.
     pub reflex_action_code: f64,
+    /// Digital outputs to drive, as a bitmask (exact for bits `0..53`).
     pub io_digital_out_mask: f64,
+    /// Levels of the masked outputs, as a bitmask (exact for bits `0..53`).
     pub io_digital_out_state: f64,
+    /// Analog outputs, symmetric with [`CoreState::io_analog_in`].
+    pub io_analog_out: [f64; 4],
     pub gripper_target_width: f64,
     pub gripper_target_speed: f64,
     pub gripper_max_force: f64,
@@ -324,10 +453,12 @@ impl CoreCommand {
     /// Number of `f64` slots.
     pub const LEN: usize = size_of::<CoreCommand>() / SLOT;
 
-    /// Every field `NAN` ("not commanded").
+    /// Every field `NAN` ("not commanded"); [`ActiveMode::Idle`].
     pub const IDLE: CoreCommand = CoreCommand {
+        control_mode: f64::NAN,
         target_q: [f64::NAN; MAX_DOF],
         target_qd: [f64::NAN; MAX_DOF],
+        target_qdd: [f64::NAN; MAX_DOF],
         target_torques: [f64::NAN; MAX_DOF],
         target_pose: [f64::NAN; 7],
         target_twist: [f64::NAN; 6],
@@ -342,10 +473,16 @@ impl CoreCommand {
         reflex_action_code: f64::NAN,
         io_digital_out_mask: f64::NAN,
         io_digital_out_state: f64::NAN,
+        io_analog_out: [f64::NAN; 4],
         gripper_target_width: f64::NAN,
         gripper_target_speed: f64::NAN,
         gripper_max_force: f64::NAN,
     };
+
+    /// The decoded [`control_mode`](Self::control_mode).
+    pub fn active_mode(&self) -> Option<ActiveMode> {
+        ActiveMode::from_code(self.control_mode)
+    }
 
     /// Copy out of the front of `buffer`.
     pub fn read_from(buffer: &[f64]) -> Result<CoreCommand, ArmError> {
@@ -354,8 +491,10 @@ impl CoreCommand {
         }
         let mut r = Reader(buffer);
         Ok(CoreCommand {
+            control_mode: r.scalar(),
             target_q: r.array(),
             target_qd: r.array(),
+            target_qdd: r.array(),
             target_torques: r.array(),
             target_pose: r.array(),
             target_twist: r.array(),
@@ -370,6 +509,7 @@ impl CoreCommand {
             reflex_action_code: r.scalar(),
             io_digital_out_mask: r.scalar(),
             io_digital_out_state: r.scalar(),
+            io_analog_out: r.array(),
             gripper_target_width: r.scalar(),
             gripper_target_speed: r.scalar(),
             gripper_max_force: r.scalar(),
@@ -382,8 +522,10 @@ impl CoreCommand {
             return Err(ArmError::BufferTooSmall);
         }
         let mut w = Writer(buffer);
+        w.array(&[self.control_mode]);
         w.array(&self.target_q);
         w.array(&self.target_qd);
+        w.array(&self.target_qdd);
         w.array(&self.target_torques);
         w.array(&self.target_pose);
         w.array(&self.target_twist);
@@ -399,6 +541,9 @@ impl CoreCommand {
             self.reflex_action_code,
             self.io_digital_out_mask,
             self.io_digital_out_state,
+        ]);
+        w.array(&self.io_analog_out);
+        w.array(&[
             self.gripper_target_width,
             self.gripper_target_speed,
             self.gripper_max_force,
@@ -408,9 +553,11 @@ impl CoreCommand {
 }
 
 wire_views! {
-    CoreCommand, CoreCommandView, CoreCommandViewMut;
+    CoreCommand, CoreCommandView, CoreCommandViewMut, no_tail;
+    control_mode: scalar,
     target_q: [MAX_DOF],
     target_qd: [MAX_DOF],
+    target_qdd: [MAX_DOF],
     target_torques: [MAX_DOF],
     target_pose: [7],
     target_twist: [6],
@@ -425,23 +572,38 @@ wire_views! {
     reflex_action_code: scalar,
     io_digital_out_mask: scalar,
     io_digital_out_state: scalar,
+    io_analog_out: [4],
     gripper_target_width: scalar,
     gripper_target_speed: scalar,
     gripper_max_force: scalar,
+}
+
+impl CoreCommandView<'_> {
+    /// The decoded `control_mode` slot.
+    pub fn active_mode(&self) -> Option<ActiveMode> {
+        ActiveMode::from_code(self.control_mode())
+    }
+}
+
+impl CoreCommandViewMut<'_> {
+    /// Write the `control_mode` slot.
+    pub fn set_active_mode(&mut self, mode: ActiveMode) {
+        *self.control_mode() = mode.code();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ramp() -> [f64; 104] {
+    fn ramp() -> [f64; 128] {
         core::array::from_fn(|i| i as f64)
     }
 
     #[test]
     fn copying_helpers_round_trip() {
         assert_eq!(CoreState::LEN, 56);
-        assert_eq!(CoreCommand::LEN, 96);
+        assert_eq!(CoreCommand::LEN, 109);
 
         let buf = ramp();
         let state = CoreState::read_from(&buf).unwrap();
@@ -458,31 +620,37 @@ mod tests {
             ),
             ([45.0, 46.0, 47.0, 48.0], 51.0, 52.0, 55.0)
         );
-        let mut out = [-1.0f64; 104];
+        let mut out = [-1.0f64; 128];
         state.write_to(&mut out).unwrap();
         assert_eq!(out[..CoreState::LEN], buf[..CoreState::LEN]);
         assert_eq!(out[CoreState::LEN], -1.0);
 
         let cmd = CoreCommand::read_from(&buf).unwrap();
         assert_eq!(
+            (cmd.control_mode, cmd.target_q[0], cmd.target_qdd[0]),
+            (0.0, 1.0, 17.0)
+        );
+        assert_eq!(
             (
                 cmd.target_pose[0],
                 cmd.task_frame[0],
                 cmd.reflex_threshold[0],
+                cmd.io_analog_out,
                 cmd.gripper_max_force
             ),
-            (24.0, 43.0, 84.0, 95.0)
+            (33.0, 52.0, 93.0, [102.0, 103.0, 104.0, 105.0], 108.0)
         );
-        let mut out = [-1.0f64; 104];
+        let mut out = [-1.0f64; 128];
         cmd.write_to(&mut out).unwrap();
         assert_eq!(out[..CoreCommand::LEN], buf[..CoreCommand::LEN]);
+        assert_eq!(out[CoreCommand::LEN], -1.0);
 
         assert_eq!(
             CoreState::read_from(&buf[..55]),
             Err(ArmError::BufferTooSmall)
         );
         assert_eq!(
-            CoreCommand::IDLE.write_to(&mut out[..95]),
+            CoreCommand::IDLE.write_to(&mut out[..108]),
             Err(ArmError::BufferTooSmall)
         );
     }
@@ -508,13 +676,15 @@ mod tests {
         assert_eq!(view.robot_mode(), state.robot_mode);
         assert_eq!(view.fault_code(), state.fault_code);
         assert_eq!(view.native_reflex_fired(), state.native_reflex_fired);
-        assert_eq!(view.tail().len(), 104 - CoreState::LEN);
+        assert_eq!(view.tail().len(), 128 - CoreState::LEN);
         assert_eq!(view.tail()[0], 56.0);
 
         let cmd = CoreCommand::read_from(&buf).unwrap();
         let view = CoreCommandView::new(&buf).unwrap();
+        assert_eq!(view.control_mode(), cmd.control_mode);
         assert_eq!(view.target_q(), &cmd.target_q);
         assert_eq!(view.target_qd(), &cmd.target_qd);
+        assert_eq!(view.target_qdd(), &cmd.target_qdd);
         assert_eq!(view.target_torques(), &cmd.target_torques);
         assert_eq!(view.target_pose(), &cmd.target_pose);
         assert_eq!(view.target_twist(), &cmd.target_twist);
@@ -529,10 +699,10 @@ mod tests {
         assert_eq!(view.reflex_action_code(), cmd.reflex_action_code);
         assert_eq!(view.io_digital_out_mask(), cmd.io_digital_out_mask);
         assert_eq!(view.io_digital_out_state(), cmd.io_digital_out_state);
+        assert_eq!(view.io_analog_out(), &cmd.io_analog_out);
         assert_eq!(view.gripper_target_width(), cmd.gripper_target_width);
         assert_eq!(view.gripper_target_speed(), cmd.gripper_target_speed);
         assert_eq!(view.gripper_max_force(), cmd.gripper_max_force);
-        assert_eq!(view.tail().len(), 104 - CoreCommand::LEN);
     }
 
     #[test]
@@ -561,21 +731,43 @@ mod tests {
         let mut cmd = [0.0f64; CoreCommand::LEN];
         let mut view = CoreCommandViewMut::new(&mut cmd).unwrap();
         view.clear();
+        assert_eq!(view.as_view().active_mode(), Some(ActiveMode::Idle));
+        view.set_active_mode(ActiveMode::JointImpedance);
         view.target_q()[0] = 1.5;
+        view.target_qdd()[1] = -2.0;
         *view.task_frame() = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        view.io_analog_out()[2] = 3.3;
         *view.gripper_max_force() = 20.0;
         let decoded = CoreCommand::read_from(&cmd).unwrap();
+        assert_eq!(decoded.active_mode(), Some(ActiveMode::JointImpedance));
         assert_eq!(
             (
                 decoded.target_q[0],
+                decoded.target_qdd[1],
                 decoded.task_frame[6],
+                decoded.io_analog_out[2],
                 decoded.gripper_max_force
             ),
-            (1.5, 1.0, 20.0)
+            (1.5, -2.0, 1.0, 3.3, 20.0)
         );
         assert!(decoded.target_pose[0].is_nan());
 
         assert!(CoreStateView::new(&buf[..55]).is_err());
-        assert!(CoreCommandViewMut::new(&mut cmd[..95]).is_err());
+        assert!(CoreCommandViewMut::new(&mut cmd[..108]).is_err());
+    }
+
+    #[test]
+    fn active_mode_codes_round_trip() {
+        for (i, mode) in ActiveMode::ALL.into_iter().enumerate() {
+            assert_eq!(ActiveMode::from_code(mode.code()), Some(mode));
+            if i > 0 {
+                assert_eq!(mode.code(), i as f64);
+            }
+        }
+        assert!(ActiveMode::Idle.code().is_nan());
+        assert_eq!(CoreCommand::IDLE.active_mode(), Some(ActiveMode::Idle));
+        for bad in [0.0, 1.5, 10.0, -1.0, f64::INFINITY] {
+            assert_eq!(ActiveMode::from_code(bad), None, "{bad}");
+        }
     }
 }

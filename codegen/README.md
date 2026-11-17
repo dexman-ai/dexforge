@@ -104,7 +104,7 @@ The master agent prompt guides the coding agent through four sequential phases t
 1. **Analytical IK (`ik_solver.rs`):**
    - Following [`translate_ssik_artifact.md`](translate_ssik_artifact.md) and the selected reference arm's `ik_solver.rs`, translate the Python solver's constants and straight-line algebraic blocks into `#![no_std]` Rust.
    - Import and call shared numerical kernels directly from `dexhal::math` (`ssik_core`, `kinematics`, `postprocess`, `tolerances`). Never reimplement subproblem solvers, root finders, LM refinement, joint wrapping, or seed sorting.
-   - Ensure `solve()` respects joint limits when `respect_limits == true`, orders solutions nearest-first when `q_seed` is provided, and guards all `acos`/`asin`/`sqrt` domain boundaries without panicking.
+   - Ensure `solve()` respects joint limits when `respect_limits == true`, orders solutions nearest-first when `q_seed` is provided, and guards all `acos`/`asin`/`sqrt` domain boundaries without panicking. Joint-lock 7-DOF solvers hold the locked joint at the seed's value when `q_seed` is provided (`seed_locked` in the reference arms).
 2. **Hardware Driver (`driver.rs` & `manifest.yaml`):**
    - Place and validate `manifest.yaml` so `ArmManifest::from_text::<Model, DOF, MAX>(MANIFEST)` succeeds.
    - Implement `dexhal::math::ArmDriver` (`manifest`, `connect`, `disconnect`, `read_state`, `write_command`, `arm`, `arm_mut`) against the OEM hardware API documentation using zero-copy `CoreStateViewMut` and `CoreCommandView` buffer views.
