@@ -11,6 +11,7 @@ Standalone OEM package layout for in-workspace builds.
 To run with URSim:
 
 docker pull universalrobots/ursim_e-series
+
 docker run -d --name ursim `
   -e ROBOT_MODEL=UR5 `
   -p 5900:5900 `
