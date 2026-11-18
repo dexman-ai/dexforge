@@ -243,9 +243,14 @@ pub fn solve(
 
     let mut inner = [[0.0f64; 6]; INNER_MAX];
 
+    // Seeded early exit: the first lock sample (nearest-first) whose candidates
+    // yield a seed-locked solution ends the sweep.
+    let mut early: Option<([[f64; 7]; CAND_CAP], usize)> = None;
+
     for &sample in sample_order.iter() {
         let q_lock = model.lock_samples[sample];
         let n_inner = solve_sample(model, sample, t, &mut inner);
+        let cand_start = n_cand;
         for sub in inner.iter().take(n_inner) {
             // Pad the locked angle back in at `lock_idx` (no chain reversal):
             // full = [sub0, sub1, q_lock, sub2, sub3, sub4, sub5] for lock_idx 2.
@@ -263,6 +268,19 @@ pub fn solve(
                 n_cand += 1;
             }
         }
+
+        if let Some(seed) = q_seed {
+            let m = n_cand - cand_start;
+            if m > 0 {
+                let mut sub = [[0.0f64; 7]; CAND_CAP];
+                sub[..m].copy_from_slice(&cand_q[cand_start..n_cand]);
+                let k = seed_locked(model, seed, t, &mut sub, m, respect_limits, policy);
+                if k > 0 {
+                    early = Some((sub, k));
+                    break;
+                }
+            }
+        }
     }
 
     // De-duplicate modulo 2π, keeping the lower-residual representative.
@@ -271,16 +289,22 @@ pub fn solve(
     let mut n_d = dedup_solutions(&cand_q, &cand_res, n_cand, &mut d_q, &mut d_res, dedup_atol);
 
     // Seeded solve: keep the locked joint at the seed's value instead of the
-    // nearest lock sample, so tracking never moves it without TCP motion.
-    let seeded = match q_seed {
-        Some(seed) => {
+    // nearest lock sample, so tracking never moves it without TCP motion. An
+    // early hit from the sweep above is already seed-locked.
+    let seeded = match (q_seed, early) {
+        (_, Some((eq, en))) => {
+            d_q = eq;
+            n_d = en;
+            true
+        }
+        (Some(seed), None) => {
             let n = seed_locked(model, seed, t, &mut d_q, n_d, respect_limits, policy);
             if n > 0 {
                 n_d = n;
             }
             n > 0
         }
-        None => false,
+        (None, None) => false,
     };
 
     let mut sol_count = 0usize;

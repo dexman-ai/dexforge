@@ -14,8 +14,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  python-bindings:
-    name: Python Bindings (${{ matrix.oem }})
+  oem-crates:
+    name: OEM Driver Crates (${{ matrix.oem }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -32,21 +32,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Create virtual environment
-        run: python -m venv .venv
-
-      - name: Install Python dependencies
-        run: |
-          source .venv/bin/activate
-          python -m pip install --upgrade pip
-          python -m pip install maturin pytest hypothesis scipy numpy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -75,22 +60,6 @@ jobs:
       - name: Run OEM Rust tests
         run: cargo test --release --manifest-path repos/${{ matrix.oem }}/rust/Cargo.toml
 
-      - name: Verify ssik reference data version
-        run: |
-          source .venv/bin/activate
-          python codegen/ik_test_data.py --check
-
-      - name: Build and install Python bindings
-        run: |
-          source .venv/bin/activate
-          cd repos/${{ matrix.oem }}/python
-          python -m maturin develop --release
-
-      - name: Run Python tests
-        run: |
-          source .venv/bin/activate
-          python -m pytest repos/${{ matrix.oem }}/python/tests -v
-
   codegen-and-core:
     name: Codegen & Core Tests
     runs-on: ubuntu-latest
@@ -113,7 +82,7 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pip install --upgrade pip
-          python -m pip install pytest numpy sympy pin $(grep '^ssik==' SSIK_VERSION.txt)
+          python -m pip install .
 
       - name: Verify ssik reference data version
         run: |

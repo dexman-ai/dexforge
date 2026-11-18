@@ -2,15 +2,15 @@
 
 ## Overview
 
-This runbook describes how to upgrade the locked `ssik` version in [`SSIK_VERSION.txt`](../SSIK_VERSION.txt). The `ssik` library (`personalrobotics/ssik`) is the source of truth for analytical inverse kinematics solvers; dexforge translates those solvers into `#![no_std]` Rust inside each OEM driver crate (`repos/dexforge-<oem>/rust/src/drivers/<arm>/`) backed by shared numerical kernels in [`dexhal/src/math/`](../dexhal/src/math).
+This runbook describes how to upgrade the locked `ssik` version in [`pyproject.toml`](../pyproject.toml). The `ssik` library (`personalrobotics/ssik`) is the source of truth for analytical inverse kinematics solvers; dexforge translates those solvers into `#![no_std]` Rust inside each OEM driver crate (`repos/dexforge-<oem>/rust/src/drivers/<arm>/`) backed by shared numerical kernels in [`dexhal/src/math/`](../dexhal/src/math).
 
 When upgrading `ssik`:
-1. **Prepare** an isolated environment with the target `ssik` version and update `SSIK_VERSION.txt`.
+1. **Prepare** an isolated environment with the target `ssik` version and update `pyproject.toml`.
 2. **Inspect** changes in `ssik` since the previously locked version.
 3. **Analyze and update** the shared math kernels in `dexhal/src/math/` if solver algorithms or tolerances changed.
 4. **Diff** each arm's generated `<arm>_ik.py` artifact and retranslate `ik_solver.rs` (or refresh `arm.rs` / dynamics) if the artifact changed.
 5. **Regenerate** baked solver constants (`consts.rs` / `pq.rs`) and `ssik` IK reference datasets (`test_data.bin`, `test_data.rs`) for every arm.
-6. **Verify** with `ik_test_data.py --check`, `cargo test` across `dexhal` and all OEM crates, and the Python test suite where present.
+6. **Verify** with `ik_test_data.py --check`, `cargo test` across `dexhal` and all OEM crates, and `pytest codegen/tests -v`.
 
 ---
 
@@ -18,21 +18,16 @@ When upgrading `ssik`:
 
 ### 1.1 Read the current locked version
 ```bash
-cat SSIK_VERSION.txt
+grep 'ssik==' pyproject.toml
 ```
-This shows the currently pinned version (e.g., `ssik==1.2.3`).
+This shows the currently pinned version (e.g., `"ssik==1.2.3",`).
 
-### 1.2 Install the target `ssik` version and update `SSIK_VERSION.txt`
-Use a virtual environment so you can test the upgrade cleanly:
+### 1.2 Update `pyproject.toml` and install the target `ssik` version
+Update `"ssik==<NEW_VERSION>"` under `[project].dependencies` in `pyproject.toml` so `codegen/ssik_artifact.py` and `codegen/ik_test_data.py` (which enforce that the installed `ssik.__version__` matches `pyproject.toml`) accept the newly installed version, then install into a clean virtual environment:
 ```bash
 python -m venv /tmp/ssik-upgrade
 source /tmp/ssik-upgrade/bin/activate
-pip install ssik==<NEW_VERSION> numpy
-```
-
-Update `SSIK_VERSION.txt` now so `codegen/ssik_artifact.py` and `codegen/ik_test_data.py` (which enforce that the installed `ssik.__version__` matches `SSIK_VERSION.txt`) accept the newly installed version:
-```bash
-echo "ssik==<NEW_VERSION>" > SSIK_VERSION.txt
+pip install .
 ```
 
 ---
@@ -122,7 +117,7 @@ python repos/dexforge-flexiv/rust/src/drivers/rizon10/codegen/generate_code.py
 ```
 
 ### 5.2 Regenerate `ssik` IK reference datasets (`test_data.bin` & `test_data.rs`)
-Every arm's `test_data.bin` records the `ssik` version header and is checked against `SSIK_VERSION.txt`:
+Every arm's `test_data.bin` records the `ssik` version header and is checked against `pyproject.toml`:
 ```bash
 python repos/dexforge-ur/rust/src/drivers/ur5/codegen/generate_test_data.py
 python repos/dexforge-franka/rust/src/drivers/franka_panda/codegen/generate_test_data.py
@@ -137,7 +132,7 @@ python repos/dexforge-unitree/rust/src/drivers/z1/codegen/generate_test_data.py
 ```bash
 python codegen/ik_test_data.py --check
 ```
-This confirms every arm's `test_data.bin` carries the version in `SSIK_VERSION.txt` and a non-empty case list.
+This confirms every arm's `test_data.bin` carries the version in `pyproject.toml` and a non-empty case list.
 
 ---
 
@@ -156,20 +151,12 @@ done
 pytest codegen/tests -v
 ```
 
-### 6.3 Rebuild and test Python bindings (for OEM repos that include `python/`)
-```bash
-for py_dir in repos/dexforge-*/python; do
-    (cd "$py_dir" && maturin develop --release)
-done
-pytest repos/dexforge-*/python/tests -v
-```
-
 ---
 
 ## Troubleshooting
 
-- **`RuntimeError: Installed ssik version (...) does not match SSIK_VERSION.txt (...)`**
-  Ensure `SSIK_VERSION.txt` was updated to `<NEW_VERSION>` before running `ssik_artifact.py`, `generate_test_data.py`, or `ik_test_data.py --check`.
+- **`RuntimeError: Installed ssik version (...) does not match pyproject.toml (...)`**
+  Ensure `pyproject.toml` was updated to `"ssik==<NEW_VERSION>"` before running `ssik_artifact.py`, `generate_test_data.py`, or `ik_test_data.py --check`.
 - **IK reference tests fail after regenerating `test_data.bin`**
   Do not loosen test tolerances (`1e-5` FK closure / strict joint match, `1e-3` singular joint dedup). Diff the old and new `<arm>_ik.py` artifacts to identify which subproblem, lock-sample schedule, or algebraic coefficient changed, and update `ik_solver.rs` (or `dexhal/src/math/`) to match.
 - **Crate fails `#![no_std]` or embedded target check**
@@ -182,7 +169,7 @@ pytest repos/dexforge-*/python/tests -v
 
 ## Checklist
 
-- [ ] Updated `SSIK_VERSION.txt` to `ssik==<NEW_VERSION>`
+- [ ] Updated `pyproject.toml` to `"ssik==<NEW_VERSION>"`
 - [ ] Reviewed `ssik` changelog and diffed solver/kinematics modules
 - [ ] Updated `dexhal/src/math/` kernels if needed (`cargo test --manifest-path dexhal/Cargo.toml` passes)
 - [ ] Diffed `<arm>_ik.py` for each arm and updated `ik_solver.rs` / `arm.rs` / `generated_dynamics.rs` if needed
