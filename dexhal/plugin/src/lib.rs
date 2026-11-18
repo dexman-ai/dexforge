@@ -58,7 +58,7 @@ pub use host::{LoadedDriver, LoadedMath, Plugin, PluginError};
 
 /// Version of [`PluginVTable`] and the types it passes. Bumped on any change
 /// to their layout.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 /// Name of the entry point a driver library exports (an [`EntryFn`]).
 pub const ENTRY_SYMBOL: &str = "dexhal_plugin_entry";
@@ -598,6 +598,15 @@ pub struct PluginVTable {
         target: *const [f64; 7],
         seed: *const Q,
         out: *mut Q,
+    ) -> bool,
+    /// Writes up to `cap` solutions to `out` (driver order, no seed ranking)
+    /// and the number written to `count`. Returns `false` on a panic.
+    pub math_inverse_kinematics_all: unsafe extern "C" fn(
+        math: MathHandle,
+        target: *const [f64; 7],
+        out: *mut Q,
+        cap: usize,
+        count: *mut usize,
     ) -> bool,
     pub math_dynamics: unsafe extern "C" fn(
         math: MathHandle,

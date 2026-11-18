@@ -145,6 +145,11 @@ fn math_matches_the_direct_model() {
         math.inverse_kinematics(&pose, &q),
         ArmMath::inverse_kinematics(&direct, &pose, &q)
     );
+    let (mut via_plugin, mut via_direct) = ([[0.0; MAX_DOF]; 4], [[0.0; MAX_DOF]; 4]);
+    let n = math.inverse_kinematics_all(&pose, &mut via_plugin);
+    let m = ArmMath::inverse_kinematics_all(&direct, &pose, &mut via_direct);
+    assert_eq!(n, m);
+    assert_eq!(via_plugin[..n], via_direct[..m]);
     let (a, b) = (
         math.dynamics_padded(&q, &qd),
         direct.dynamics_padded(&q, &qd),

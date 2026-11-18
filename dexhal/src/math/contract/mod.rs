@@ -24,7 +24,7 @@ pub mod wire;
 pub use manifest::*;
 pub use wire::*;
 
-use crate::math::arm::{Arm, PoseResidual};
+use crate::math::arm::{Arm, IK_NEAREST_REFINEMENT_ITERS, PoseResidual};
 use crate::math::chain::{
     pose_from_xyz_quat, pose_to_xyz_quat, ChainJoint, KinematicChain, ModelError,
 };
@@ -244,6 +244,12 @@ pub trait ArmMath: Send {
         q_seed: &[f64; MAX_DOF],
     ) -> Option<[f64; MAX_DOF]>;
 
+    /// Up to `out.len()` joint solutions reaching `target_pose`, with no seed
+    /// ranking: the caller selects among them (for example by end-effector
+    /// orientation). Writes them to the front of `out` and returns how many
+    /// were written (0 if unreachable). Order is the driver's.
+    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [[f64; MAX_DOF]]) -> usize;
+
     /// `M`, `C qd`, `G` including the payload.
     fn dynamics_padded(&self, q: &[f64; MAX_DOF], qd: &[f64; MAX_DOF]) -> Option<DynamicsState>;
 
@@ -346,6 +352,27 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmMath for Arm<
         let target = pose_from_xyz_quat(target_pose).ok()?;
         let q = self.ik_nearest(&target, &unpad(q_seed)?, TolerancePolicy::DEFAULT)?;
         Some(pad(&q))
+    }
+
+    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [[f64; MAX_DOF]]) -> usize {
+        let Ok(target) = pose_from_xyz_quat(target_pose) else {
+            return 0;
+        };
+        let solutions = self.ik(
+            &target,
+            Some(out.len().min(MAX)),
+            None,
+            true,
+            true,
+            TolerancePolicy::DEFAULT,
+            IK_NEAREST_REFINEMENT_ITERS,
+        );
+        let mut n = 0;
+        for q in solutions.iter().flatten().take(out.len()) {
+            out[n] = pad(q);
+            n += 1;
+        }
+        n
     }
 
     fn dynamics_padded(&self, q: &[f64; MAX_DOF], qd: &[f64; MAX_DOF]) -> Option<DynamicsState> {

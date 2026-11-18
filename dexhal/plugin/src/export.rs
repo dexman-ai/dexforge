@@ -356,6 +356,28 @@ unsafe extern "C" fn math_dynamics<T: PluginDriver>(
     unsafe { query(out, || math_ref::<T>(h).dynamics_padded(&*q, &*qd)) }
 }
 
+unsafe extern "C" fn math_inverse_kinematics_all<T: PluginDriver>(
+    h: MathHandle,
+    target: *const [f64; 7],
+    out: *mut Q,
+    cap: usize,
+    count: *mut usize,
+) -> bool {
+    guard_some(|| {
+        if out.is_null() || count.is_null() {
+            return None;
+        }
+        // SAFETY: the host passes `cap` writable slots starting at `out`.
+        let slots = unsafe { core::slice::from_raw_parts_mut(out, cap) };
+        // SAFETY: live handle and valid pointers.
+        let (target, math) = unsafe { (&*target, math_ref::<T>(h)) };
+        let n = math.inverse_kinematics_all(target, slots);
+        // SAFETY: `count` is valid for a write.
+        unsafe { count.write(n) };
+        Some(())
+    })
+}
+
 unsafe extern "C" fn math_inverse_dynamics<T: PluginDriver>(
     h: MathHandle,
     q: *const Q,
@@ -481,6 +503,7 @@ pub const fn vtable<T: PluginDriver>() -> PluginVTable {
         math_tool_jacobian: math_tool_jacobian::<T>,
         math_jacobian_pseudo_inverse: math_jacobian_pseudo_inverse::<T>,
         math_inverse_kinematics: math_inverse_kinematics::<T>,
+        math_inverse_kinematics_all: math_inverse_kinematics_all::<T>,
         math_dynamics: math_dynamics::<T>,
         math_inverse_dynamics: math_inverse_dynamics::<T>,
         math_pose_residual: math_pose_residual::<T>,

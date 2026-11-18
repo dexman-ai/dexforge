@@ -300,7 +300,7 @@ $$\Delta\tau_{\text{payload}} = \tau_{\text{payload}}(q, \dot{q}, \ddot{q}, P_{\
 
 3. **`dexhal-plugin` (`dexhal/plugin/src/{lib,export,host}.rs`):**
    * Only two runtime calls cross `PluginVTable` (`math_step_free_torque` and `math_reset_torque_observer`, plus the `has_torque_observer` manifest flag bit on `ManifestDesc::flags`); weights never cross the C-ABI boundary.
-   * Map `ModelError::InvalidObserver` in `model_error_code` / `model_error_from_code`, bump `ABI_VERSION` (`1 -> 2`), and bump `CONTRACT_VERSION` (`0.3.0 -> 0.4.0`).
+   * Map `ModelError::InvalidObserver` in `model_error_code` / `model_error_from_code`, bump `ABI_VERSION`, and bump `CONTRACT_VERSION`.
 
 ---
 

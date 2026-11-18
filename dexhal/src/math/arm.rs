@@ -677,6 +677,36 @@ mod tests {
     }
 
     #[test]
+    fn ik_all_is_seedless_bounded_and_contains_the_seeded_answer() {
+        let arm = Arm::<Scripted, 6, 3>::new();
+        let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];
+        let target = arm.fk(&q_true);
+        let policy = TolerancePolicy::DEFAULT;
+
+        let all = arm.ik(&target, Some(3), None, true, true, policy, IK_NEAREST_REFINEMENT_ITERS);
+        let found = all.iter().flatten().count();
+        assert!((1..=3).contains(&found));
+        // `Scripted` includes a deliberately inexact twin (2e-4 off in joint 3).
+        for q in all.iter().flatten() {
+            assert!((arm.fk(q) - target).norm() < 1e-3);
+        }
+
+        let nearest = arm.ik_nearest(&target, &q_true, policy).unwrap();
+        assert!(all
+            .iter()
+            .flatten()
+            .any(|q| (0..6).all(|i| (q[i] - nearest[i]).abs() < 1e-6)));
+
+        assert_eq!(
+            arm.ik(&target, Some(0), None, true, true, policy, IK_NEAREST_REFINEMENT_ITERS)
+                .iter()
+                .flatten()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn ik_nearest_follows_the_seed_branch_within_limits() {
         let arm = Arm::<SixR, 6, 1>::new();
         let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];

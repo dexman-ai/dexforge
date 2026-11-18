@@ -390,6 +390,25 @@ impl ArmMath for LoadedMath {
         })
     }
 
+    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [Q]) -> usize {
+        let mut count = 0usize;
+        // SAFETY: live handle; `out` holds `out.len()` writable slots.
+        let ok = unsafe {
+            (self.vtable.math_inverse_kinematics_all)(
+                self.handle,
+                target_pose,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut count,
+            )
+        };
+        if ok {
+            count.min(out.len())
+        } else {
+            0
+        }
+    }
+
     fn dynamics_padded(&self, q: &Q, qd: &Q) -> Option<DynamicsState> {
         // SAFETY: live handle and valid pointers.
         self.query(|h, out| unsafe { (self.vtable.math_dynamics)(h, q, qd, out) })
