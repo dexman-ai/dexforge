@@ -1,6 +1,6 @@
 # dexforge
 
-**Sub-10 µs kinematics, dynamics, and hardware drivers for 500–1000 Hz robot control loops—in pure, zero-allocation `#![no_std]` Rust.**
+**Sub-ms kinematics, dynamics, and hardware drivers for 500–1000 Hz robot control loops—in pure, zero-allocation `#![no_std]` Rust.**
 
 `#![no_std]` · `#![forbid(unsafe_code)]` · **Zero heap allocations** · **Bounded Execution Time (WCET)** · **Pinocchio & `ssik` verified**
 
