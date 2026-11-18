@@ -41,12 +41,13 @@ cd /tmp/ssik-repo
 git log --oneline <OLD_TAG>..<NEW_TAG>
 ```
 
-### 2.2 Check core solver and kinematics modules
+### 2.2 Check core solver, kinematics, and test modules
 Inspect changes under:
 - `ssik/solvers/` — Subproblem solvers (`sp6_runtime`), Raghavan-Roth elimination, joint-lock schedules.
 - `ssik/kinematics/` — Product-of-exponentials chain extraction, chain reversal, LM refinement, and residual calculation.
 - `ssik/core/tolerances.py` — Default numerical and deduplication tolerances.
 - `ssik/prebuilt/` — Prebuilt artifacts (reflects solver codegen changes).
+- `tests/` (specifically `test_prebuilt_sanity.py`, `test_prebuilt_uniform_fuzz.py`, `_hypothesis_strategies.py`, and per-solver contract tests) — Check for any modified assertions, tolerance ceilings, singularity filters, or newly added common prebuilt tests so they can be mirrored in our Rust test suites (`codegen/templates/arm/arm.rs.tmpl` and per-arm `ik_solver.rs`).
 
 ---
 
@@ -101,6 +102,8 @@ python codegen/ssik_artifact.py inspect /tmp/upgrade/<arm>_ik.py --arm <arm>
   3. Recompile symbolic kinematics/dynamics (`python codegen/generate_dynamics.py --artifact $D/codegen/<arm>_ik.py --urdf $D/<arm>.urdf --base <base> --ee <ee> --arm <arm> --output $D/generated_dynamics.rs`).
 - **Solver algorithm or algebraic block change:**
   - Retranslate `ik_solver.rs` with a coding agent following [`codegen/new_driver.md`](new_driver.md) (Steps 3–4) and [`codegen/translate_ssik_artifact.md`](translate_ssik_artifact.md).
+- **Upstream `ssik` test suite changes (`tests/test_prebuilt_*.py`, `_hypothesis_strategies.py`):**
+  - If `ssik` modified its shared prebuilt sanity/fuzz tests (e.g., non-singular `q*` sampling filters, `tight_policy` + `allow_refinement` checks, or FK residual ceilings) or added new common prebuilt contract tests, port those changes into [`codegen/templates/arm/arm.rs.tmpl`](templates/arm/arm.rs.tmpl) (see `flange_solve_closes_on_fk_targets` and `ssik_non_singular_roundtrip_and_tight_policy_suite`) and per-arm `ik_solver.rs` test modules, then regenerate `arm.rs` across all arms (`python codegen/scaffold.py ... --only arm.rs`).
 
 ---
 
@@ -171,6 +174,7 @@ pytest codegen/tests -v
 
 - [ ] Updated `pyproject.toml` to `"ssik==<NEW_VERSION>"`
 - [ ] Reviewed `ssik` changelog and diffed solver/kinematics modules
+- [ ] Diffed upstream `ssik` shared prebuilt tests (`test_prebuilt_sanity.py`, `test_prebuilt_uniform_fuzz.py`, `_hypothesis_strategies.py`) and ported any updated/new common tests into `codegen/templates/arm/arm.rs.tmpl` (and regenerated `arm.rs`)
 - [ ] Updated `dexhal/src/math/` kernels if needed (`cargo test --manifest-path dexhal/Cargo.toml` passes)
 - [ ] Diffed `<arm>_ik.py` for each arm and updated `ik_solver.rs` / `arm.rs` / `generated_dynamics.rs` if needed
 - [ ] Regenerated `consts.rs` / `pq.rs` where applicable (`generate_code.py`)
