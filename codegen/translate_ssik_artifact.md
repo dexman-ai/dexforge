@@ -82,10 +82,12 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
    `JOINT_LIMITS`; with `q_seed`, order nearest-first; honour `max_solutions`.
    Use the `dexhal::math::postprocess` helpers like the reference arm does.
    Joint-lock (`jointlock.*`) solvers additionally hold the locked joint at
-   the seed's value on a seeded solve (the reference arm's `seed_locked`):
-   polish the seed and every sweep solution with the locked joint set to the
-   seed's, keep the FK-verified results, and fall back to the 16-sample sweep
-   only when none closes.
+   the seed's value on a seeded solve. Visit the lock samples nearest-first
+   (by wrap-to-pi distance of the sample to `q_seed[LOCKED_JOINT]`). After each
+   sample's candidates are collected, polish them with the reference arm's
+   `seed_locked` (locked joint set to the seed's value, seed also used as a
+   start). The first sample that yields a result ends the sweep. Only when no
+   sample closes, run the full sweep and the post-processing above.
 
 ## 5. Tests
 

@@ -3,9 +3,7 @@
 
 Each arm's reference dataset lives in ``test_data.bin`` alongside a thin
 ``#[cfg(test)]`` Rust loader ``test_data.rs`` in the arm's driver directory
-(``repos/dexforge-<oem>/rust/src/drivers/<arm>/``). Both Rust unit tests and
-the shared Python test suite (``ssik_shared_tests/``) read the same binary
-blob, ensuring a single source of truth for FK and IK cross-validation.
+(``repos/dexforge-<oem>/rust/src/drivers/<arm>/``).
 
 Binary layout of ``test_data.bin`` (all integers and floats little-endian):
   - ``magic``: 4 bytes ``b"DXIK"``
@@ -27,6 +25,7 @@ Binary layout of ``test_data.bin`` (all integers and floats little-endian):
 from __future__ import annotations
 
 import argparse
+import re
 import struct
 import sys
 from dataclasses import dataclass
@@ -93,26 +92,20 @@ class IKDataset:
 
 
 def get_locked_ssik_version(repo_root: Optional[Path] = None) -> str:
-    """Read the pinned ssik version from ``SSIK_VERSION.txt``."""
+    """Read the pinned ssik version from ``pyproject.toml``."""
     root = repo_root or _REPO_ROOT
-    version_file = root / "SSIK_VERSION.txt"
-    if not version_file.is_file():
-        raise FileNotFoundError(f"SSIK_VERSION.txt not found at {version_file}")
-    content = version_file.read_text(encoding="utf-8").strip()
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("ssik=="):
-            return line[len("ssik==") :].strip()
-        if line.startswith("ssik"):
-            return line[len("ssik") :].strip().lstrip("=").strip()
-        return line
-    raise ValueError(f"SSIK_VERSION.txt at {version_file} is empty")
+    pyproject_file = root / "pyproject.toml"
+    if not pyproject_file.is_file():
+        raise FileNotFoundError(f"pyproject.toml not found at {pyproject_file}")
+    content = pyproject_file.read_text(encoding="utf-8")
+    match = re.search(r'["\']ssik==([^"\'\s]+)["\']', content)
+    if match:
+        return match.group(1)
+    raise ValueError(f"Could not find 'ssik==<version>' in {pyproject_file}")
 
 
 def get_installed_ssik_version(repo_root: Optional[Path] = None) -> str:
-    """Return the installed ``ssik.__version__`` and verify it matches ``SSIK_VERSION.txt``."""
+    """Return the installed ``ssik.__version__`` and verify it matches ``pyproject.toml``."""
     locked = get_locked_ssik_version(repo_root)
     try:
         import ssik
@@ -124,7 +117,7 @@ def get_installed_ssik_version(repo_root: Optional[Path] = None) -> str:
     if installed != locked:
         raise RuntimeError(
             f"Installed ssik version ({installed}) does not match "
-            f"SSIK_VERSION.txt ({locked}). Install with: pip install ssik=={locked}"
+            f"pyproject.toml ({locked}). Install with: pip install ssik=={locked}"
         )
     return installed
 
@@ -259,8 +252,7 @@ def emit_ik_test_data_rs(
     return f"""\
 //! Auto-generated ssik IK reference dataset loader for `{arm}`.
 //!
-//! Reads the shared binary dataset `{bin_filename}` (also consumed by the
-//! Python cross-validation suite in `ssik_shared_tests/`).
+//! Reads the binary dataset `{bin_filename}`.
 //! Do not edit by hand; regenerate with `codegen/generate_test_data.py`.
 
 #![allow(dead_code, clippy::all)]
@@ -404,7 +396,7 @@ def write_ik_test_data(
 
 
 def verify_all_arms_ssik_version(repo_root: Optional[Path] = None) -> List[str]:
-    """Verify every known arm's ``test_data.bin`` matches ``SSIK_VERSION.txt``.
+    """Verify every known arm's ``test_data.bin`` matches ``pyproject.toml``.
 
     :returns: List of verified arm names.
     :raises RuntimeError: If any arm is missing ``test_data.bin`` or has a
@@ -420,7 +412,7 @@ def verify_all_arms_ssik_version(repo_root: Optional[Path] = None) -> List[str]:
         if dataset.ssik_version != expected:
             raise RuntimeError(
                 f"{arm}: test_data.bin ssik_version={dataset.ssik_version!r} "
-                f"does not match SSIK_VERSION.txt ({expected!r})"
+                f"does not match pyproject.toml ({expected!r})"
             )
         if not dataset.cases:
             raise RuntimeError(f"{arm}: test_data.bin contains 0 cases")
@@ -432,7 +424,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Verify that every arm's test_data.bin matches SSIK_VERSION.txt.",
+        help="Verify that every arm's test_data.bin matches pyproject.toml.",
     )
     parser.add_argument(
         "--repo-root",

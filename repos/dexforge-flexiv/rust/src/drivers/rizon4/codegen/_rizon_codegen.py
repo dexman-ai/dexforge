@@ -47,6 +47,28 @@ def load_ref(arm: str):
 
 
 def _sub_kb(ref, qlock: float):
+    # Temporarily patch ssik's _line_line_perpendicular parallel projection sign
+    # (`t2 = dot(p1 - p2, d2)` rather than `-dot(p1 - p2, d2)`) before calling
+    # `_G6.compose(sub)` so parallel sub-chain axes (such as Rizon4 sample 8 at
+    # `q_lock = 0.0`) produce an exact orthogonal DH frame where
+    # `T_pre @ FK_DH(q + theta_offset) @ T_post == FK_POE(q)`.
+    import ssik.kinematics.poe_to_dh as p2d
+
+    def _fixed_line_line_perpendicular(p1, d1, p2, d2, *, parallel_tol=1e-9):
+        cross = p2d._cross3(d1, d2)
+        cross_norm = p2d._norm3(cross)
+        if cross_norm < parallel_tol:
+            delta = p1 - p2
+            t2 = p2d._dot3(delta, d2)
+            foot2 = p2 + t2 * d2
+            return p1.copy(), foot2, True
+        n2 = p2d._dot3(cross, cross)
+        delta = p2 - p1
+        t1 = p2d._dot3(p2d._cross3(delta, d2), cross) / n2
+        t2 = p2d._dot3(p2d._cross3(delta, d1), cross) / n2
+        return p1 + t1 * d1, p2 + t2 * d2, False
+
+    p2d._line_line_perpendicular = _fixed_line_line_perpendicular
     return _lock_joint(ref._build_kb(), ref._LOCK_IDX, float(qlock))
 
 

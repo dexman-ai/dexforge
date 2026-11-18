@@ -3,7 +3,7 @@
 
 Deterministic Step 1 of the agent workflow in ``codegen/README.md``:
 
-* ``build``   — verify the installed ``ssik`` matches ``SSIK_VERSION.txt`` and
+* ``build``   — verify the installed ``ssik`` matches ``pyproject.toml`` and
   run ``ssik build`` on a URDF, writing ``drivers/<arm>/codegen/<arm>_ik.py``.
 * ``inspect`` — load an artifact and report ``DOF``, ``MAX_SOLUTIONS``, the
   ``SOLVER_NAME``, the kinematic solver family and the in-repo reference arm

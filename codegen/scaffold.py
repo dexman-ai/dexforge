@@ -59,7 +59,7 @@ from ssik_artifact import (  # noqa: E402
     nominal_chain,
 )
 
-ARM_OUTPUTS = ("arm.rs", "mod.rs", "driver.rs", "manifest.yaml", "generate_test_data.py")
+ARM_OUTPUTS = ("arm.rs", "mod.rs", "driver.rs", "manifest.yaml", "generate_test_data.py", "rust/tests/perf.rs")
 VENDOR_OUTPUTS = ("Cargo.toml", "README.md", "rust/Cargo.toml", "rust/src/lib.rs", "rust/src/drivers/mod.rs")
 
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
@@ -326,6 +326,18 @@ def _append_line(path: Path, line: str, written: List[Path]) -> None:
     _write(path, text + line + "\n", written)
 
 
+def _write_perf_test(path: Path, values: Dict[str, object], written: List[Path]) -> None:
+    """Create ``rust/tests/perf.rs`` with the shared-harness header, then append one test per arm."""
+    block = render_template("arm/rust/tests/perf_arm.rs.tmpl", values)
+    if not path.is_file():
+        _write(path, render_template("vendor/rust/tests/perf.rs.tmpl", values) + block, written)
+        return
+    text = path.read_text(encoding="utf-8")
+    if f"fn {values['arm']}_arm_timing()" in text:
+        return
+    _write(path, text.rstrip("\n") + "\n" + block, written)
+
+
 @dataclass
 class ScaffoldResult:
     layout: Layout
@@ -411,6 +423,8 @@ def scaffold(
         "dynamics_parity": "\n#[cfg(test)]\nmod dynamics_parity;\n" if has_dynamics else "",
         "n_cases": n_cases,
         "script_path": _rel(layout.codegen_dir / "generate_test_data.py", repo_root),
+        "crate_ident": f"dexforge_{oem.replace('-', '_')}_core",
+        "perf_harness": _rel_any(dexhal_dir / "perf" / "arm_timing.rs", layout.crate_dir / "tests"),
     }
 
     def emit(key: str, path: Path, text_fn, always: bool = False) -> None:
@@ -444,6 +458,8 @@ def scaffold(
     emit("arm.rs", layout.driver_dir / "arm.rs", lambda: generate_arm_rs(info, layout.artifact, has_dynamics), always=True)
     emit("mod.rs", layout.driver_dir / "mod.rs", lambda: render_template("arm/mod.rs.tmpl", values))
     emit("driver.rs", layout.driver_dir / "driver.rs", lambda: render_template("arm/driver.rs.tmpl", values))
+    if "rust/tests/perf.rs" in wanted:
+        _write_perf_test(layout.crate_dir / "tests" / "perf.rs", values, written)
     emit("manifest.yaml", layout.manifest, lambda: render_template("arm/manifest.yaml.tmpl", values))
     emit(
         "generate_test_data.py",

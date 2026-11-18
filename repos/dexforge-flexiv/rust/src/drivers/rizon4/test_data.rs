@@ -1,7 +1,6 @@
 //! Auto-generated ssik IK reference dataset loader for `rizon4`.
 //!
-//! Reads the shared binary dataset `test_data.bin` (also consumed by the
-//! Python cross-validation suite in `ssik_shared_tests/`).
+//! Reads the binary dataset `test_data.bin`.
 //! Do not edit by hand; regenerate with `codegen/generate_test_data.py`.
 
 #![allow(dead_code, clippy::all)]

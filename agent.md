@@ -8,13 +8,11 @@ Unless the user explicitly asks otherwise, **work only in these paths**:
 
 - `dexhal/`
 - `repos/dexforge-ur/`
-- `ssik_shared_tests/`
 - `codegen/` (when regenerating dynamics / test data)
 
 **Ignore** the other OEM trees (`repos/dexforge-agilex/`, `repos/dexforge-flexiv/`,
-`repos/dexforge-franka/`, `repos/dexforge-ufactory/`). They deliberately share the
-same filenames (`ik_solver.rs`, `arm.rs`, `generated_kinematics.rs`,
-`test_shared_suite.py`, …), which confuses search and edits. `.cursorignore`
+`repos/dexforge-franka/`, `repos/dexforge-ufactory/`, `repos/dexforge-unitree/`). They deliberately share the
+same filenames (`ik_solver.rs`, `arm.rs`, `generated_kinematics.rs`, …), which confuses search and edits. `.cursorignore`
 excludes those folders for the same reason.
 
 ## Core Invariants
@@ -128,20 +126,16 @@ For detailed translation guidance, refer to `codegen/translate_ssik_artifact.md`
 
 ## Build & Test
 
-Python bindings are built per OEM package under `repos/dexforge-*/python`.
-
-For Python bindings (example: UR):
+Run Rust tests for `dexhal` and an OEM package (example: UR):
 ```bash
-cd repos/dexforge-ur/python
-maturin develop --release
-pytest tests/
+cargo test --manifest-path dexhal/Cargo.toml
+cargo test --manifest-path repos/dexforge-ur/Cargo.toml
 ```
 
 ## PR Checklist
 
 Before submitting a PR with new Rust IK code:
-- [ ] `cd repos/dexforge-<oem>/python && maturin develop --release` succeeds
-- [ ] `pytest repos/dexforge-<oem>/python/tests -v` passes
+- [ ] `cargo test --manifest-path repos/dexforge-<oem>/Cargo.toml` passes
 - [ ] No `unsafe`, no `Vec`/`Box`/`std` heap allocation outside `#[cfg(test)]`
 - [ ] All loops have hardcoded iteration ceilings
 - [ ] FK verification done for every solution candidate

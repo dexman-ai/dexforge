@@ -531,6 +531,10 @@ pub fn solve(
     let mut inner = [[0.0f64; 6]; INNER_MAX];
     let mut inner_res = [0.0f64; INNER_MAX];
 
+    // Seeded early exit: the first lock sample (nearest-first) whose candidates
+    // yield a seed-locked solution ends the sweep.
+    let mut early: Option<([[f64; 7]; CAND_CAP], usize)> = None;
+
     for &sample in sample_order.iter() {
         let n_raw = if consts::SOLVER_KIND[sample] == 0 {
             spherical_candidates(sample, &target_rev, &mut raw, policy)
@@ -551,6 +555,7 @@ pub fn solve(
         );
 
         let q_lock = consts::LOCK_SAMPLES[sample];
+        let cand_start = n_cand;
         for si in 0..n_inner {
             // map_reversed_q: reverse-order permutation.
             let s = inner[si];
@@ -563,6 +568,18 @@ pub fn solve(
                 cand_q[n_cand] = full;
                 cand_res[n_cand] = inner_res[si];
                 n_cand += 1;
+            }
+        }
+        if let Some(seed) = q_seed {
+            let m = n_cand - cand_start;
+            if m > 0 {
+                let mut sub = [[0.0f64; 7]; CAND_CAP];
+                sub[..m].copy_from_slice(&cand_q[cand_start..n_cand]);
+                let k = seed_locked(seed, &target, &mut sub, m, respect_limits, policy);
+                if k > 0 {
+                    early = Some((sub, k));
+                    break;
+                }
             }
         }
     }
@@ -599,16 +616,22 @@ pub fn solve(
     );
 
     // Seeded solve: keep the locked joint at the seed's value instead of the
-    // nearest lock sample, so tracking never moves it without TCP motion.
-    let seeded = match q_seed {
-        Some(seed) => {
+    // nearest lock sample, so tracking never moves it without TCP motion. An
+    // early hit from the sweep above is already seed-locked.
+    let seeded = match (q_seed, early) {
+        (_, Some((eq, en))) => {
+            f_q = eq;
+            n_final = en;
+            true
+        }
+        (Some(seed), None) => {
             let n = seed_locked(seed, &target, &mut f_q, n_final, respect_limits, policy);
             if n > 0 {
                 n_final = n;
             }
             n > 0
         }
-        None => false,
+        (None, None) => false,
     };
 
     let mut sol_count = 0usize;

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,6 +9,17 @@ description = "Agent-driven codegen tooling for dexhal OEM driver crates."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "BSD-3-Clause" }
+dependencies = [
+    "ssik==1.2.3",
+    "sympy",
+    "numpy",
+    "pin",
+    "pytest",
+]
 
 [tool.setuptools]
 packages = ["codegen"]
+
+[tool.setuptools.package-data]
+codegen = ["templates/**/*", "*.md"]
+

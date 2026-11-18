@@ -43,8 +43,15 @@ from pathlib import Path
 import sys
 
 import numpy as np
+from ssik.solvers.ikgeo import _raghavan_roth as RR
 
-_DRIVERS_ROOT = Path(__file__).resolve().parents[2]
+_CODEGEN_DIR = Path(__file__).resolve().parent
+if str(_CODEGEN_DIR) not in sys.path:
+    sys.path.insert(0, str(_CODEGEN_DIR))
+
+import _rizon_codegen as cg  # noqa: E402
+
+_DRIVERS_ROOT = _CODEGEN_DIR.parents[1]
 _REPO_ROOT = _DRIVERS_ROOT.parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -53,95 +60,93 @@ from codegen.ik_test_data import IKCase, write_ik_test_data  # noqa: E402
 
 N_POSES = 500
 SEED = 7
-# A pose is a "strict" case when the Rust solver reproduces every reference
-# solution (count + value) of the unrefined `allow_refinement=False` output to
-# within this tolerance.
-REPRO_TOL = 1e-6
-
 ARMS = ("rizon4", "rizon10")
 
 
-def _rust_solutions(arm, poses):
-    """Run every pose through dexforge_flexiv Python bindings for the specified arm.
+def _solve_composed_rr(mod, samples, nss, t):
+    """Run the 16 composed RR sub-chains in pure Python (`ssik`) on *t*.
 
-    Returns a list (one per input pose) of lists of 7-vectors.
+    Returns ``(deduped_solutions, is_singular)`` where ``is_singular`` is True
+    whenever any sub-chain candidate drifted above ``2e-7`` or was dropped at
+    the ``1e-5`` FK gate.
     """
-    try:
-        import dexforge_flexiv
-    except ImportError as e:
-        raise RuntimeError(
-            "dexforge_flexiv is not importable. Install the OEM bindings first, "
-            "for example: cd repos/dexforge-flexiv/python && maturin develop --release"
-        ) from e
-
-    arm_module = getattr(dexforge_flexiv, arm)
-    
-    out = []
-    for t in poses:
-        # dexforge_flexiv expects 4x4 matrix (numpy array or list of lists)
-        sols = arm_module.solve(t)
-        # Convert to list of numpy arrays
-        out.append([np.array(q, dtype=np.float64) for q in sols])
-    return out
-
-
-def _reproduces(ref, mine, tol=REPRO_TOL):
-    if len(mine) != len(ref):
-        return False
-    for r in ref:
-        err = min(
-            float(np.max(np.abs(((r - m + np.pi) % (2 * np.pi)) - np.pi))) for m in mine
+    cands = []
+    is_singular = False
+    for q_lock, ns in zip(samples, nss):
+        t_dh = ns["_T_PRE_INV"] @ t @ ns["_T_POST_INV"]
+        p_sin, p_cos, p_one, q_mat = ns["_build_pq_matrices"](
+            t_dh[0, 0], t_dh[0, 1], t_dh[0, 2], t_dh[0, 3],
+            t_dh[1, 0], t_dh[1, 1], t_dh[1, 2], t_dh[1, 3],
+            t_dh[2, 0], t_dh[2, 1], t_dh[2, 2], t_dh[2, 3],
         )
-        if err > tol:
-            return False
-    return True
+        e_sin, e_cos, e_one = RR.eliminate_q0_q1(p_sin, p_cos, p_one, q_mat)
+        e_quad, e_lin, e_const = RR.weierstrass_eliminate_trig(e_sin, e_cos, e_one)
+        m_quad, m_lin, m_const = RR.build_m_matrix(e_quad, e_lin, e_const)
+        roots, vecs = RR.solve_x2_roots_mobius(m_quad, m_lin, m_const)
+        q_pinv = np.linalg.pinv(q_mat).astype(np.float64)
+        dh_tuple = ns["_DH_TUPLE"]
+        meta = ns["_RR_META"]
+        theta_off = ns["_DH_THETA_OFFSET"]
+        for r, v in zip(roots, vecs):
+            bs = RR._back_substitute_inner(
+                r, v, p_sin, p_cos, p_one, q_pinv, dh_tuple, t_dh, meta
+            )
+            if bs is None:
+                continue
+            if bs[1] > 2e-7:
+                is_singular = True
+            sub_q = np.asarray(bs[0], dtype=np.float64) - theta_off
+            fq = np.empty(7, dtype=np.float64)
+            fq[:2] = sub_q[:2]
+            fq[2] = float(q_lock)
+            fq[3:] = sub_q[2:]
+            res = float(np.linalg.norm(mod._fk(fq) - t))
+            if res <= 1e-5:
+                cands.append((fq, res))
+            else:
+                is_singular = True
+
+    dedup = []
+    for fq, res in cands:
+        dup = None
+        for j, (eq, _eres) in enumerate(dedup):
+            if mod._q_close_wrap(fq, eq, 1e-3):
+                dup = j
+                break
+        if dup is None:
+            dedup.append((fq, res))
+        elif res < dedup[dup][1]:
+            dedup[dup] = (fq, res)
+
+    return [list(map(float, fq)) for fq, _ in dedup], is_singular
 
 
-def _generate(arm) -> None:
+def _generate(arm: str) -> None:
     mod = importlib.import_module(f"ssik.prebuilt.{arm}_ik")
     driver_dir = _DRIVERS_ROOT / arm
+    samples = cg.lock_samples(mod)
+    nss = [cg.composed_namespace(mod, s) for s in samples]
 
     rng = np.random.default_rng(SEED)
     lims = mod._JOINT_LIMITS
-    candidates = []
+    cases = []
+    singular = 0
     for _ in range(N_POSES):
         q = np.array([rng.uniform(lo, hi) for lo, hi in lims])
         t = mod._fk(q)
-        ref_false = [s.q for s in mod.solve(t, respect_limits=False)]
-        if len(ref_false) <= 1:
+        sols, is_sing = _solve_composed_rr(mod, samples, nss, t)
+        if len(sols) <= 1:
             continue
-        candidates.append((q, t, ref_false))
-
-    poses = [t for _, t, _ in candidates]
-    rust = _rust_solutions(arm, poses)
-
-    cases = []
-    singular = 0
-    for (q, t, ref_false), mine in zip(candidates, rust):
-        if _reproduces(ref_false, mine):
-            sols = [list(map(float, s)) for s in ref_false]
-            cases.append(
-                IKCase(
-                    q_fk=q.tolist(),
-                    tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
-                    solutions=sols,
-                    singular=False,
-                )
-            )
-        else:
-            ref_true = [
-                s.q for s in mod.solve(t, respect_limits=False, allow_refinement=True)
-            ]
-            sols = [list(map(float, s)) for s in ref_true]
-            cases.append(
-                IKCase(
-                    q_fk=q.tolist(),
-                    tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
-                    solutions=sols,
-                    singular=True,
-                )
-            )
+        if is_sing:
             singular += 1
+        cases.append(
+            IKCase(
+                q_fk=q.tolist(),
+                tf=np.asarray(t, dtype=np.float64).reshape(-1).tolist(),
+                solutions=sols,
+                singular=is_sing,
+            )
+        )
 
     bin_path, rs_path = write_ik_test_data(
         driver_dir=driver_dir,
@@ -153,7 +158,7 @@ def _generate(arm) -> None:
         refinement_max_iters=15,
     )
     print(
-        f"[{arm}] kept {len(cases)}/{len(candidates)} multi-solution poses "
+        f"[{arm}] kept {len(cases)} multi-solution poses "
         f"(of {N_POSES} sampled) to {bin_path} and {rs_path}; "
         f"{len(cases) - singular} strict, {singular} singular"
     )
