@@ -1,5 +1,9 @@
-import ast, inspect, re
-from ssik.prebuilt import piper_ik as P
+import ast, importlib.util, inspect, os, re
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("piper_ik", os.path.join(_HERE, "piper_ik.py"))
+P = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(P)
 
 src = inspect.getsource(P._build_pq_matrices)
 mod = ast.parse(src)
@@ -84,13 +88,11 @@ for stmt in fn.body:
 for k,v in arrays.items():
     print("//", k, len(v), "x", len(v[0]))
 
-import os
-
 dest = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "pq.rs"))
 with open(dest, "w") as f:
     f.write("//! Per-arm Raghavan-Roth `(P_sin, P_cos, P_one, Q)` matrix builder for the\n")
     f.write("//! AgileX Piper, translated verbatim from\n")
-    f.write("//! `ssik.prebuilt.piper_ik._build_pq_matrices`.\n")
+    f.write("//! `codegen/piper_ik.py::_build_pq_matrices`.\n")
     f.write("//!\n")
     f.write("//! The body is machine-generated (sympy `cse`) and is reproduced here without\n")
     f.write("//! manual edits so the floating-point accumulation order matches the Python\n")
@@ -118,3 +120,47 @@ with open(dest, "w") as f:
     f.write("    (p_sin, p_cos, p_one, q)\n")
     f.write("}\n")
 print("wrote src/drivers/piper/pq.rs")
+
+# ---- consts.rs: baked geometric constants from the artifact -----------------
+
+def _num(x):
+    r = repr(float(x))
+    return r if any(c in r for c in ".e") else r + ".0"
+
+def _vec(a):
+    return "[" + ", ".join(_num(x) for x in a) + "]"
+
+def _mat(a):
+    return "[\n" + "".join("    " + _vec(r) + ",\n" for r in a) + "]"
+
+_W_TRIG_TO_X = """[
+    [0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, -2.0, 0.0, 2.0, 0.0, 0.0, 0.0],
+    [0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0],
+    [1.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0],
+    [0.0, 0.0, 0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0],
+    [-1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+    [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0],
+    [-1.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0],
+    [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+]"""
+
+_limits = "[\n" + "".join(f"    ({_num(lo)}, {_num(hi)}),\n" for lo, hi in P._JOINT_LIMITS) + "]"
+
+consts_dest = os.path.normpath(os.path.join(_HERE, "..", "consts.rs"))
+with open(consts_dest, "w") as f:
+    f.write("//! Baked geometric constants for the AgileX Piper 6-DOF arm,\n")
+    f.write("//! extracted verbatim from `codegen/piper_ik.py`. Regenerate with\n")
+    f.write("//! `codegen/generate_code.py`.\n\n")
+    f.write("#![allow(clippy::unreadable_literal)]\n")
+    f.write("#![allow(clippy::approx_constant)]\n\n")
+    f.write(f"pub(crate) const DH_ALPHA: [f64; 6] = {_vec(P._DH_ALPHA)};\n\n")
+    f.write(f"pub(crate) const DH_A: [f64; 6] = {_vec(P._DH_A)};\n\n")
+    f.write(f"pub(crate) const DH_D: [f64; 6] = {_vec(P._DH_D)};\n\n")
+    f.write(f"pub(crate) const DH_THETA_OFFSET: [f64; 6] = {_vec(P._DH_THETA_OFFSET)};\n\n")
+    f.write(f"pub(crate) const T_PRE_INV: [[f64; 4]; 4] = {_mat(P._T_PRE_INV)};\n\n")
+    f.write(f"pub(crate) const T_POST_INV: [[f64; 4]; 4] = {_mat(P._T_POST_INV)};\n\n")
+    f.write(f"pub(crate) const JOINT_LIMITS: [(f64, f64); 6] = {_limits};\n\n")
+    f.write(f"pub(crate) const W_TRIG_TO_X: [[f64; 9]; 9] = {_W_TRIG_TO_X};\n\n")
+    f.write("#[cfg_attr(not(test), allow(dead_code))]\n")
+    f.write(f"pub(crate) const T_HOME: [[f64; 4]; 4] = {_mat(P.T_HOME)};\n")

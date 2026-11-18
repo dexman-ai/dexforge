@@ -6,7 +6,7 @@ Strategy (mirrors the issue's verification requirements):
 1. Sample 500 distinct, valid target SE(3) poses by running the reference
    forward kinematics on random in-limit joint vectors. **Every** sampled
    multi-solution pose is kept — the dataset is not filtered down.
-2. Run the reference solver ``ssik.prebuilt.piper_ik.solve(T,
+2. Run the reference solver ``codegen/piper_ik.py``'s ``solve(T,
    respect_limits=False)`` on each pose and the Rust driver
    (via the ``piper_solve`` example harness) on the same poses.
 3. Pick the golden solution set per pose:
@@ -43,13 +43,16 @@ Run from the repository root:
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 import sys
 
 import numpy as np
-from ssik.prebuilt import piper_ik as P
 
 _DRIVER_DIR = Path(__file__).resolve().parent.parent
+_spec = importlib.util.spec_from_file_location("piper_ik", _DRIVER_DIR / "codegen" / "piper_ik.py")
+P = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(P)
 _REPO_ROOT = _DRIVER_DIR.parents[5]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -81,7 +84,7 @@ def _rust_solutions(poses):
     out = []
     for t in poses:
         # dexforge_agilex.piper.solve expects 4x4 matrix (numpy array or list of lists)
-        sols = dexforge_agilex.piper.solve(t)
+        sols = dexforge_agilex.piper.solve(t, respect_limits=False)
         # Convert to list of numpy arrays
         out.append([np.array(q, dtype=np.float64) for q in sols])
     return out
