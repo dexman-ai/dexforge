@@ -554,4 +554,23 @@ Each item below originates from the gap analysis in `c:\code\dexzero\workitems.m
     with exact sizes (`ManifestErrorKind::InvalidAux` otherwise).
 
 ## P1 — missing capability (cont.)
-59. **[dexhal] FACTR 2 (NEXT) Virtual Torque Sensor Integration.** see specs\factr2.md 
+59. **[dexhal] FACTR 2 (NEXT) Virtual Torque Sensor Integration.** see specs\factr2.md
+60. Done: **[dexhal] [dexzero] Consolidate stateless SE(3), weighted DLS, and Khatib operational-space projectors in `dexhal::math`.**
+    Moved all stateless `#![no_std]` spatial, kinematic, and operational-space
+    linear algebra out of `dexzero` (`kernel/src/math.rs` and `sim/src/lib.rs`)
+    into `dexhal::math` (`chain.rs`, `spatial.rs`):
+    `rotation_exp`, antipodal-safe `rotation_error` / `pose_error`,
+    `se3_offset`, `se3_lerp`, `se3_distance`, `transform_point` /
+    `inverse_transform_point`, `transform_from_xyz_quat` /
+    `transform_to_xyz_quat`, `rotate_spatial` / `rotate_spatial_inv`,
+    `jacobian_twist`, `jacobian_transpose_wrench`, `mat6_vec`,
+    `pseudo_inverse_transpose_torque`, `diag_jt_gain_j`,
+    `damped_least_squares`, `weighted_damped_least_squares`,
+    `dynamically_consistent_pseudo_inverse`, `nullspace_project_torque`,
+    `solve_mass_matrix`, and `payload_wrench_at_tcp`. IK stays
+    `ArmMath::inverse_kinematics` (the driver's closed-form solve with its
+    bounded polish); there is no generic DLS IK fallback in `dexhal`, so a
+    caller needing one for a model without a closed-form solver (`MockArm`)
+    builds it from `damped_least_squares`. `dexzero` (`sim` and `kernel`) now imports zero
+    `nalgebra` items and owns strictly time, trajectories, PD control laws, and
+    safety state machines.

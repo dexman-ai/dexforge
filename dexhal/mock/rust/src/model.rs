@@ -19,8 +19,10 @@ fn chain() -> KinematicChain<6> {
 
 /// Default model of [`MockDriver::default_arm`](crate::MockDriver::default_arm).
 ///
-/// Kinematics come from the nominal DH table; there is no inverse kinematics,
-/// so `flange_solve` returns no solutions.
+/// Kinematics come from the nominal DH table. There is no closed-form inverse
+/// kinematics: `flange_solve` polishes the seed (zero without one) onto the
+/// target with the bounded damped-Newton [`KinematicChain::refine_ik`], so it
+/// returns at most the one solution on the seed's branch.
 pub struct MockArm;
 
 impl ArmModel<6, 1> for MockArm {
@@ -34,15 +36,21 @@ impl ArmModel<6, 1> for MockArm {
         chain().jacobian(q)
     }
 
+    // `JOINT_LIMITS` is unconstrained, so `respect_limits` has nothing to drop.
     fn flange_solve(
-        _target: &Pose,
-        _max_solutions: Option<usize>,
-        _q_seed: Option<&[f64; 6]>,
+        target: &Pose,
+        max_solutions: Option<usize>,
+        q_seed: Option<&[f64; 6]>,
         _respect_limits: bool,
         _allow_refinement: bool,
-        _policy: TolerancePolicy,
+        policy: TolerancePolicy,
         _refinement_max_iters: usize,
     ) -> [Option<[f64; 6]>; 1] {
-        [None]
+        if max_solutions == Some(0) {
+            return [None];
+        }
+        let mut q = q_seed.copied().unwrap_or([0.0; 6]);
+        let closes = chain().refine_ik(target, &mut q) <= policy.subproblem_numerical;
+        [closes.then_some(q)]
     }
 }
