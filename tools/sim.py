@@ -151,7 +151,16 @@ def repl(c: Client, home: np.ndarray, readline=input) -> None:
                 else:
                     pose = np.array([float(x) for x in a])
                 assert len(pose) == 7, "need x y z qx qy qz qw"
-                settle("target_pose", pose, lambda: np.abs(c.state("tcp_pose")[:3] - pose[:3]).max(), 1e-3)
+                def pose_error():
+                    actual = c.state("tcp_pose")[:7]
+                    qnorm = np.linalg.norm(pose[3:])
+                    if qnorm < 1e-9:
+                        return float("inf")
+                    dot = abs(float(np.dot(actual[3:], pose[3:] / qnorm)))
+                    angle = 2.0 * np.arccos(np.clip(dot, 0.0, 1.0))
+                    return max(float(np.max(np.abs(actual[:3] - pose[:3]))), float(angle))
+
+                settle("target_pose", pose, pose_error, 1e-3)
             elif cmd == "home":
                 settle("target_q", home, lambda: np.abs(c.state("q")[:n] - home).max(), 1e-3)
             elif cmd == "clear":
