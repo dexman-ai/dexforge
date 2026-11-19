@@ -371,3 +371,44 @@ def test_mjcf_mesh_names_do_not_collide_and_paths_are_escaped(tmp_path):
     from lxml import etree
 
     etree.fromstring(xml.encode())  # well-formed despite the '&' in the path
+
+
+def _hold_own_pose(q0, cycles=300):
+    """Start the arm at ``q0`` and command it its own current TCP pose (cartesian mode)."""
+    d = S.SimDriver("ur5", q0=q0)
+    d.connect()
+    _, f = state(d)
+    pose = f("tcp_pose")[:7].copy()
+    d.write_command(cmd_pose(d, pose))
+    d.step(cycles)
+    return d, state(d)[1]
+
+
+def test_cartesian_at_wrist_singularity_holds_and_faults_then_recovers():
+    """At q5 = 0 the solver only returns the far shoulder branch (see the Rust test
+    ``wrist_singularity_still_solves``), so commanding the arm its own pose exceeds the IK
+    step bound. The sim must hold the arm still, latch fault 2, and recover on clear_faults().
+    """
+    q0 = np.array([0.3, -1.0, 1.2, -0.5, 0.0, 0.2])
+    d, f = _hold_own_pose(q0)
+    try:
+        assert f("fault_code")[0] == S.FAULT_IK_STEP_TOO_LARGE
+        np.testing.assert_allclose(f("q")[:6], q0, atol=1e-3)  # held, did not swing to the other branch
+
+        d.clear_faults()
+        d.write_command(cmd_q(d, q0 + 0.05))  # joint motion still works after recovery
+        d.step(300)
+        assert state(d)[1]("fault_code")[0] == S.FAULT_NONE
+        np.testing.assert_allclose(state(d)[1]("q")[:6], q0 + 0.05, atol=2e-3)
+    finally:
+        d.disconnect()
+
+
+def test_cartesian_just_off_the_singularity_works():
+    q0 = np.array([0.3, -1.0, 1.2, -0.5, 1e-3, 0.2])
+    d, f = _hold_own_pose(q0)
+    try:
+        assert f("fault_code")[0] == S.FAULT_NONE
+        np.testing.assert_allclose(f("q")[:6], q0, atol=1e-3)
+    finally:
+        d.disconnect()

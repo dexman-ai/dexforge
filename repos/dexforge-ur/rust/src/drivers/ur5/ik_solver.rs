@@ -562,8 +562,8 @@ mod tests {
     }
 
     /// A generic (non-singular) configuration. q = 0 is a wrist singularity for
-    /// the UR5e (q5 = 0), where the solver legitimately returns a different
-    /// but equivalent branch, so round-trip tests use this instead.
+    /// the UR5e (q5 = 0), where the solver returns only one shoulder branch (see
+    /// `wrist_singularity_still_solves`), so round-trip tests use this instead.
     const REF_Q: [f64; 6] = [0.3, -1.0, 1.2, -0.5, 0.8, 0.2];
 
     #[test]
@@ -668,5 +668,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Wrist singularity (q5 = 0 or pi): joints 4 and 6 share an axis, so only their
+    /// combination is defined and the original q4/q6 cannot be recovered.
+    ///
+    /// At (and within ~1e-6 of) the singularity the solver returns 4 solutions on a single
+    /// shoulder branch instead of 8, and that branch need not be the one the arm is in. The
+    /// Python reference artifact behaves identically (checked), so this is solver behaviour,
+    /// not a porting error. What must hold: solutions exist, are finite, and reproduce the
+    /// pose. Just off the singularity (q5 = 1e-3) all 8 are back and the original q1..q3, q5
+    /// are among them.
+    #[test]
+    fn wrist_singularity_still_solves() {
+        use core::f64::consts::PI;
+        for q5 in [0.0, 1e-9, 1e-6, 1e-3, PI] {
+            let q = [0.3, -1.0, 1.2, -0.5, q5, 0.2];
+            let tf = fk(&q);
+            let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
+            let all: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
+            assert!(!all.is_empty(), "q5={q5}: no solution at/near the singularity");
+
+            for s in &all {
+                assert!(s.iter().all(|x| x.is_finite()), "q5={q5}: non-finite solution {s:?}");
+                let t2 = fk(s);
+                for i in 0..3 {
+                    for j in 0..4 {
+                        assert!(
+                            (t2[(i, j)] - tf[(i, j)]).abs() < 1e-8,
+                            "q5={q5}: solution {s:?} does not reproduce the pose at ({i},{j})"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Just off the singularity the full solution set (and the original arm joints) returns.
+        let q = [0.3, -1.0, 1.2, -0.5, 1e-3, 0.2];
+        let sols = solve(&fk(&q), None, None, false, false, TolerancePolicy::DEFAULT, 15);
+        let all: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
+        assert_eq!(all.len(), 8, "expected the full 8 solutions just off the singularity");
+        let ok = all.iter().any(|s| {
+            q_eq_mod(&[s[0], s[1], s[2], 0.0, s[4], 0.0], &[q[0], q[1], q[2], 0.0, q[4], 0.0], 1e-6)
+        });
+        assert!(ok, "original q1..q3, q5 not among {all:?}");
     }
 }
