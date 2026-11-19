@@ -56,6 +56,9 @@ pub enum ModelError {
     /// A calibrated chain disagrees with the nominal model by more than the
     /// accepted deviation; usually a base/flange frame convention mismatch.
     ExcessiveDeviation,
+    /// A learned torque observer (`.dexnext`) is malformed, was trained for
+    /// another arm, or does not fit the arm's model or mounting.
+    InvalidObserver,
 }
 
 /// Validate a homogeneous pose and convert it to a [`Transform`].

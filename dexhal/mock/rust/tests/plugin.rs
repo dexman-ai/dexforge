@@ -1,5 +1,8 @@
 //! The mock exported through `dexhal-plugin` behaves like the mock itself.
 
+mod common;
+
+use common::dexnext;
 use dexforge_mock_core::{dexhal_plugin_entry, MockArm, MockDriver};
 use dexhal::math::{
     ActiveMode, Applied, Arm, ArmDriver, ArmError, ArmMath, CoreCommand, CoreState, ModelError,
@@ -218,4 +221,121 @@ fn dynamic_library_loads() {
 fn missing_library_is_reported() {
     let err = unsafe { Plugin::load(std::path::Path::new("no-such-dexhal-plugin.bin")) };
     assert!(matches!(err, Err(PluginError::Open(_))));
+}
+
+// --- learned torque observer (FACTR 2) --------------------------------------
+
+fn observer_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "dexforge-mock-{}-{name}.dexnext",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+fn observer_config(path: &std::path::Path) -> Vec<u8> {
+    format!("observer={}", path.display()).into_bytes()
+}
+
+#[test]
+fn a_learned_observer_crosses_the_boundary() {
+    let bytes = dexnext(6, 0, [0.0, 0.0, -9.80665]);
+    let path = observer_file("valid", &bytes);
+    let mut d = plugin().create_driver(&observer_config(&path)).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let plain = plugin().create_driver(b"").unwrap();
+    assert!(!plain.manifest().has_torque_observer);
+    assert!(!plain.manifest().has_residual_dynamics());
+    assert!(d.manifest().has_torque_observer);
+    assert!(d.manifest().has_residual_dynamics());
+    assert!(!d.manifest().has_impedance_dynamics());
+
+    let mut direct = Arm::<MockArm, 6, 1>::new();
+    direct
+        .set_torque_observer(Box::leak(bytes.into_boxed_slice()))
+        .unwrap();
+    let state = read(&mut d);
+    let freq = d.manifest().control_freq_hz;
+    let stride = freq as usize / 100;
+    let mut outputs = Vec::new();
+    for k in 0..4 * stride {
+        let q = [0.1 * k as f64, -0.2, 0.3, 0.0, 0.1, -0.1];
+        let qd = [0.05 * k as f64; 6];
+        let tau = d.step_free_torque(&state, &padded(q), &padded(qd), &padded([0.0; 6]), None);
+        let expected = direct.step_free_torque(&q, &qd, &[0.0; 6], None, freq);
+        // Warming up until the last tick of the first 100 Hz period.
+        assert_eq!(tau.is_none(), k + 1 < stride, "tick {k}");
+        assert_eq!(tau.map(|t| t[..6].to_vec()), expected.map(|t| t.to_vec()), "tick {k}");
+        if let Some(tau) = tau {
+            assert_eq!(tau[6..], [0.0, 0.0]);
+            outputs.push(tau);
+        }
+    }
+    // The window slides, and reset restarts the warm-up.
+    assert_ne!(outputs[0], outputs[outputs.len() - 1]);
+    d.reset_torque_observer();
+    direct.reset_torque_observer();
+    let q = [0.3, 0.2, 0.1, 0.0, -0.1, -0.2];
+    for k in 0..stride {
+        let tau = d.step_free_torque(&state, &padded(q), &padded([0.0; 6]), &padded([0.0; 6]), None);
+        let expected = direct.step_free_torque(&q, &[0.0; 6], &[0.0; 6], None, freq);
+        assert_eq!(tau.is_none(), k + 1 < stride);
+        assert_eq!(tau.map(|t| t[..6].to_vec()), expected.map(|t| t.to_vec()));
+    }
+
+    // A FullDynamics observer pins the gravity vector.
+    assert_eq!(
+        d.set_gravity([0.0, 0.0, 9.80665]),
+        Err(ArmError::Model(ModelError::InvalidObserver))
+    );
+    // A runtime payload is added on top of the network.
+    assert_eq!(d.set_payload(1.0, [0.0, 0.0, 0.05], [0.0; 9]), Ok(Applied::Host));
+    let pq = padded([0.2; 6]);
+    let p = d.arm().payload_torque_padded(&pq, &pq, &pq).unwrap();
+    assert!(p[..6].iter().any(|v| v.abs() > 1e-3));
+}
+
+#[test]
+fn invalid_observers_are_rejected_at_create() {
+    let g = [0.0, 0.0, -9.80665];
+    let mut truncated = dexnext(6, 0, g);
+    truncated.pop();
+    let cases = [
+        ("truncated", truncated),
+        ("wrong-dof", dexnext(7, 0, g)),
+        // MockArm has no rigid-body dynamics to add a residual to.
+        ("friction-residual", dexnext(6, 1, g)),
+        // Trained ceiling-mounted; the mock is floor-mounted.
+        ("ceiling", dexnext(6, 0, [0.0, 0.0, 9.80665])),
+    ];
+    for (name, bytes) in cases {
+        let path = observer_file(name, &bytes);
+        let result = plugin().create_driver(&observer_config(&path));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            result.err(),
+            Some(ArmError::Model(ModelError::InvalidObserver)),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        plugin().create_driver(b"observer=/no/such/file.dexnext").err(),
+        Some(ArmError::Fault("cannot read observer"))
+    );
+}
+
+#[test]
+fn drivers_without_an_observer_fall_back_to_the_model() {
+    let mut d = plugin().create_driver(b"").unwrap();
+    let state = read(&mut d);
+    let q = padded([0.1; 6]);
+    // MockArm has no dynamics.
+    assert_eq!(d.step_free_torque(&state, &q, &q, &q, Some(&q)), None);
+    d.reset_torque_observer();
+    let mut math = plugin().create_math().unwrap();
+    assert_eq!(math.step_free_torque_padded(&q, &q, &q, None, 500), None);
+    assert_eq!(math.payload_torque_padded(&q, &q, &q), Some([0.0; MAX_DOF]));
+    math.reset_torque_observer_state();
 }

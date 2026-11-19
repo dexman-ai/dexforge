@@ -15,6 +15,10 @@
 //!
 //! The vendor command `"echo"` copies its payload into the response.
 //!
+//! A learned torque observer (FACTR 2) can be installed with
+//! [`MockDriver::with_torque_observer`], or through the plugin's `config` as
+//! `observer=<path to .dexnext>`.
+//!
 //! The crate also builds as a `cdylib` exporting [`MockArm`]'s driver as a
 //! `dexhal-plugin` (see [`dexhal_plugin_entry`]).
 
@@ -65,6 +69,14 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> MockDriver<A, DO
             queue,
             held_q: [0.0; MAX_DOF],
         })
+    }
+
+    /// Install a learned torque observer (`.dexnext` bytes; see
+    /// [`Arm::set_torque_observer`]) and advertise it in the manifest.
+    pub fn with_torque_observer(mut self, bytes: &'static [u8]) -> Result<Self, ArmError> {
+        self.arm.set_torque_observer(bytes)?;
+        self.manifest.has_torque_observer = true;
+        Ok(self)
     }
 }
 

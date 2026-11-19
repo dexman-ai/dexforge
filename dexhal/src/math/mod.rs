@@ -2,7 +2,7 @@
 //!
 //! * Common math, used by the drivers and by the contract layer:
 //!   [`ssik_core`], [`kinematics`], [`postprocess`], [`tolerances`],
-//!   [`spatial`], [`payload`], [`chain`], [`identify`].
+//!   [`spatial`], [`payload`], [`chain`], [`identify`], [`torque_observer`].
 //! * The contract: [`model`] (what a driver implements), [`arm`] (one
 //!   physical arm) and [`contract`] (what a kernel sees).
 
@@ -17,6 +17,7 @@ pub mod postprocess;
 pub mod spatial;
 pub mod ssik_core;
 pub mod tolerances;
+pub mod torque_observer;
 
 #[cfg(test)]
 pub(crate) mod testing;
@@ -31,3 +32,4 @@ pub use postprocess::*;
 pub use spatial::*;
 pub use ssik_core::*;
 pub use tolerances::*;
+pub use torque_observer::*;

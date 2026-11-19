@@ -201,7 +201,7 @@ excited every joint (`4·DOF + 6` for pose samples). See the module docs.
 
 | Role | dexhal item |
 | :-- | :-- |
-| Version & modes | `MAX_DOF` (8), `ContractVersion`, `CONTRACT_VERSION` (0.3.0), `ActiveMode` |
+| Version & modes | `MAX_DOF` (8), `ContractVersion`, `CONTRACT_VERSION` (0.4.0), `ActiveMode` |
 | Static capabilities, read once at boot | `ArmManifest` (from `manifest.yaml`) |
 | Driver → kernel buffer, every cycle | `CoreState` (56 × f64) + aux tail, `CoreStateView` / `CoreStateViewMut` |
 | Kernel → driver buffer, every cycle | `CoreCommand` (109 × f64, no tail), `CoreCommandView` / `CoreCommandViewMut` |
@@ -239,10 +239,47 @@ models), `has_residual_inertials` defaults to `has_static_inertials` (allowing
 Route 6 `HostAdmittanceTorque` torque-residual wrench estimation to stay
 enabled when `has_static_inertials: false`), and both are validated against
 `ArmModel::HAS_DYNAMICS` (setting either to `true` when `!HAS_DYNAMICS` is
-rejected). `dynamics_source` (`model` default, or `vendor` / `aux`) declares
-whether per-tick control routes use `ArmModel` SymPy dynamics or controller
+rejected). `dynamics_source` (`model` default, `vendor` / `aux`, or `learned`) declares
+whether per-tick control routes use `ArmModel` SymPy dynamics, controller
 dynamics (`gravity_torque`, `coriolis_torque`, `mass_matrix`) passed through in
-the `CoreState` `aux` tail (`ArmManifest::aux_dynamics`).
+the `CoreState` `aux` tail (`ArmManifest::aux_dynamics`), or a learned torque
+observer (below). `has_torque_observer` is not a manifest key: the driver sets
+it when it installs an observer, and it also enables `has_residual_dynamics()`.
+
+### Learned torque observer (FACTR 2)
+
+`math::torque_observer::LstmObserver` is a `no_std`, allocation-free LSTM
+(≤ 2 layers × 64, optional 64-wide MLP head, sliding window ≤ 50 or a carried
+stream) that predicts the free-space link torque from `[q, q̇, q_cmd − q]`,
+`[q, q̇, q̈_ref]` or `[q, q̇]`. Weights are a `.dexnext` file
+([`specs/factr2.md`](specs/factr2.md) §2.4) decoded in place from a
+`&'static [u8]`, so they never cross the plugin boundary:
+
+```rust
+static NEXT: &[u8] = include_bytes!("ur5.dexnext");
+arm.set_torque_observer(NEXT)?; // ModelError::InvalidObserver if malformed
+manifest.has_torque_observer = true;
+```
+
+`Arm::step_free_torque(q, q̇, q̈_ref, q_cmd, control_freq_hz)` returns
+$\hat{\tau}_{\text{free}} = \hat{\tau}_{\text{nn}} (+\,\tau_{\text{model}}$ in
+`FrictionResidual` mode$) + \tau_{\text{payload}}(P_{\text{runtime}}) -
+\tau_{\text{payload}}(P_{\text{train}})$. The network is fixed to FACTR 2's
+configuration (2 × 128 LSTM, 256 MLP head, stateless 50-sample window at
+100 Hz): a window is evaluated every `round(control_freq_hz / 100)` ticks,
+its work spread over the period, and held in between (`None` for the first
+`stride − 1` ticks after a reset);
+`ArmDriver::step_free_torque` falls back to the model or vendor `aux` dynamics
+when no observer is installed. Call `reset_torque_observer()` on connect,
+fault clear, freedrive toggles and reference snaps. `set_gravity` rejects a
+gravity that differs from the `FullDynamics` training gravity.
+
+Weights are trained with `codegen/next` (`pip install .[next]` for PyTorch)
+from a free-space log recorded by `dexzero` (spec §3.1; for `FrictionResidual`
+the log carries the driver's own `inverse_dynamics` as `tau_model`):
+`train_next.py` trains and exports with a PyTorch/NumPy parity check, and
+`make_fixtures.py` regenerates the Rust parity fixture
+`tests/fixtures/next/parity.expected`.
 
 ### Buffers
 
@@ -333,7 +370,7 @@ loops directly.
 | **Joint torque sensing (`sensing.torque`, `CoreState::torques`)** | Read motor phase current $i$ and write link-side effort $\tau = k_t \cdot n_{\text{gear}} \cdot i$ (a single constant multiply per joint, or declare `sensing.torque_constants` in `manifest.yaml` and pass raw motor current). Includes gravity and payload. | Report link-side torque sensor readings in the positive joint direction (including gravity and payload). | Runs the torque-residual observer (Route 6): $r = \tau_{\text{model}}(q_{\text{actual}}, \dot{q}_{\text{actual}}, \ddot{q}_{\text{ref}}) - \tau_{\text{measured}}$ and projects $F_{\text{ext}} = (J^T)^+ r$ onto the TCP. |
 | **Wrist F/T sensing (`sensing.wrench`, `CoreState::wrench`)** | Copy the 6 raw sensor floats `[Fx, Fy, Fz, Tx, Ty, Tz]` straight into `CoreState::wrench`; set `sensing.wrench_frame: flange` (or `tcp`) and `sensing.wrench_is_gravity_compensated: false` in `manifest.yaml`. No `fk(q)` in the driver. | Report wrench already transformed to the TCP origin in base axes (`sensing.wrench_frame: base`), or set `sensing.wrench_is_gravity_compensated: true` if the controller subtracts gravity internally. | Rotates the wrench into the compliance frame, shifts moments to the TCP, subtracts configured payload gravity and inertial load, applies low-pass filtering + deadband, and handles `tare_wrench()`. |
 | **Compliance & force control (`native.*_impedance`, `native.*_admittance`)** | Set all `native.*` compliance flags to `false`. | Set `native.cartesian_impedance`, `native.cartesian_admittance`, or `native.joint_impedance` (MIT 5-tuple `(q_ref, qd_ref, kp, kd, tau_ff)`) to `true` and forward `task_frame`, `task_stiffness_k`, `task_damping_b`, `task_mass_m`, `target_wrench`, or `joint_stiffness_k` / `joint_damping_b`. | Selects one of the 7 compliance routes (`compliance.md` §2–3). For minimal drivers, closes the loop on the host via `HostImpedance` (Route 3), `HostAdmittanceWrench` (Route 5), or `HostAdmittanceTorque` (Route 6). |
-| **Static link inertials & runtime dynamics (`has_static_inertials`, `has_residual_inertials`, `dynamics_source`)** | Leave at defaults (`has_static_inertials` and `has_residual_inertials` default to `ArmModel::HAS_DYNAMICS`; `dynamics_source: model`). Both flags must be `false` when `ArmModel::HAS_DYNAMICS` is `false`. | Set `has_static_inertials: false` when URDF inertials are obscured (e.g., Flexiv) or dominated by harmonic-drive friction (e.g., UR); optionally keep `has_residual_inertials: true` if static URDF dynamics are still usable for Route 6 torque-residual wrench estimation, or set `dynamics_source: vendor` and pass through `gravity_torque` (`DOF`), `coriolis_torque` (`DOF`), and `mass_matrix` (`DOF * DOF`) in `CoreState` `aux`. | Uses `has_impedance_dynamics()` to gate Route 3 (`HostImpedance`) and `has_residual_dynamics()` to gate Route 6 (`HostAdmittanceTorque`). When `dynamics_source: vendor`, per-tick control routes read $(M, C\dot{q}, G)$ from `aux` (`ArmManifest::aux_dynamics`, plus host payload when `native.payload == false`), while planning and simulation continue to query `ArmMath` at arbitrary poses. |
+| **Static link inertials & runtime dynamics (`has_static_inertials`, `has_residual_inertials`, `dynamics_source`)** | Leave at defaults (`has_static_inertials` and `has_residual_inertials` default to `ArmModel::HAS_DYNAMICS`; `dynamics_source: model`). Both flags must be `false` when `ArmModel::HAS_DYNAMICS` is `false`. | Set `has_static_inertials: false` when URDF inertials are obscured (e.g., Flexiv) or dominated by harmonic-drive friction (e.g., UR); optionally keep `has_residual_inertials: true` if static URDF dynamics are still usable for Route 6 torque-residual wrench estimation, or set `dynamics_source: vendor` and pass through `gravity_torque` (`DOF`), `coriolis_torque` (`DOF`), and `mass_matrix` (`DOF * DOF`) in `CoreState` `aux`, or set `dynamics_source: learned` and install a FACTR 2 `.dexnext` torque observer (`Arm::set_torque_observer`, `has_torque_observer`). | Uses `has_impedance_dynamics()` to gate Route 3 (`HostImpedance`) and `has_residual_dynamics()` to gate Route 6 (`HostAdmittanceTorque`). When `dynamics_source: vendor`, per-tick control routes read $(M, C\dot{q}, G)$ from `aux` (`ArmManifest::aux_dynamics`, plus host payload when `native.payload == false`), while planning and simulation continue to query `ArmMath` at arbitrary poses. |
 | **Gravity compensation in `JOINT_TORQUE` mode** | Set `native.gravity_compensation: false`. Driver forwards `target_torques` straight to the actuators. | Set `native.gravity_compensation: true` if the controller's torque mode already adds link gravity/friction internally (e.g., `libfranka`, Flexiv RDK). | Includes $\tau_{\text{model}}(q_{\text{actual}}, \dot{q}_{\text{actual}})$ in `target_torques` when `false`; sends only task/impedance torque (plus host payload gravity if `Applied::Host`) when `true`. |
 | **7-DOF null-space posture** | Leave `native.nullspace_posture: false`. | Set `native.nullspace_posture: true` and read `CoreCommand::target_q` alongside `target_pose` during `NativeCartesianImpedance` / `NativeCartesianAdmittance`. | On host routes (Routes 3–6), projects $\tau_{\text{null}}$ or commands all 7 joints directly. On native Cartesian routes, populates `target_q = reference.q` when `native.nullspace_posture` is `true`. |
 | **Protective reflexes (`native.contact_detection`, `native.reflexes`)** | Set both to `false`; leave `in_contact` and `native_reflex_fired` as `NAN`. | Report `in_contact` (`0.0`/`1.0`), accept `reflex_threshold` and `reflex_action_code` (`STOP`/`YIELD`/`RETRACT`), and set `CoreState::native_reflex_fired = 1.0` when a controller reflex or script triggers. | Monitors the conditioned host wrench (from sensor or motor-current residual) every cycle and triggers `STOP`, `YIELD`, or `RETRACT` on the host; coordinates with `native_reflex_fired` when delegated. |
@@ -486,7 +523,7 @@ works without any extra setup. Test it with `cargo test -p dexforge-mock-core`.
 so a host can load a driver it was not compiled with. A driver crate builds as
 a `cdylib`, implements `PluginDriver` (`create(config)` + `create_math()`) and calls
 `export_plugin!(MyDriver<…>)`, which exports `dexhal_plugin_entry`. The host
-loads it with `Plugin::load(path)` (ABI and contract major / minor are checked),
+loads it with `Plugin::load(path)` (ABI version 3 and contract major / minor are checked),
 then calls `create_driver(config)` and `create_math()` to get a
 `LoadedDriver: ArmDriver` and a `LoadedMath: ArmMath`. The mock driver is the
 reference export (`mock/rust/src/plugin.rs`); its tests in
