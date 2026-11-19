@@ -1,8 +1,9 @@
-//! Analytical inverse kinematics for the Universal Robots **UR5**.
+//! Analytical inverse kinematics for the Universal Robots **UR5e** (arm name `ur5`).
 //!
-//! This is a line-by-line translation of the Python `ssik` prebuilt artifact
-//! `ssik/prebuilt/ur5_ik.py` (solver `ikgeo.three_parallel`, tier 0) into a
-//! deterministic, `#![no_std]`, zero-allocation Rust implementation.
+//! This is a line-by-line translation of the Python `ssik` artifact
+//! `codegen/ur5_ik.py`, built from `ur5.urdf` (the UR5e imported from MuJoCo
+//! Menagerie; solver `ikgeo.three_parallel`, tier 0), into a deterministic,
+//! `#![no_std]`, zero-allocation Rust implementation.
 //!
 //! The closed form is: subproblem **SP6** for the coupled wrist/shoulder angle
 //! pair `(q1, q5)`, followed by the inlined `SP1 + SP3 + SP1` chain for the
@@ -50,12 +51,12 @@ const TWO_PI: f64 = 2.0 * PI;
 /// Joint angle limits (lo, hi) in radians — baked from `_JOINT_LIMITS` in
 /// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
 const JOINT_LIMITS: [(f64, f64); 6] = [
-    (-6.28318530717959, 6.28318530717959),
-    (-6.28318530717959, 6.28318530717959),
-    (-3.14159265358979, 3.14159265358979),
-    (-6.28318530717959, 6.28318530717959),
-    (-6.28318530717959, 6.28318530717959),
-    (-6.28318530717959, 6.28318530717959),
+    (-6.283185307179586, 6.283185307179586),
+    (-6.283185307179586, 6.283185307179586),
+    (-3.141592653589793, 3.141592653589793),
+    (-6.283185307179586, 6.283185307179586),
+    (-6.283185307179586, 6.283185307179586),
+    (-6.283185307179586, 6.283185307179586),
 ];
 
 // ---------------------------------------------------------------------------
@@ -282,7 +283,11 @@ fn refine6(
 // ---------------------------------------------------------------------------
 
 /// Fills `out` with the raw algebraic IK candidates and returns the count.
-fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8], policy: TolerancePolicy) -> usize {
+fn solve_algebraic(
+    t: &SMatrix<f64, 4, 4>,
+    out: &mut [[f64; 6]; 8],
+    policy: TolerancePolicy,
+) -> usize {
     let r_00 = t[(0, 0)];
     let r_01 = t[(0, 1)];
     let r_02 = t[(0, 2)];
@@ -299,139 +304,156 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8], policy: Tole
     let mut count = 0usize;
 
     // T_target-derived SP6 inputs.
-    let p_16_x = p_x - 1.64748849439063e-19 * r_01 - 0.0823 * r_02;
-    let p_16_y = p_y - 1.64748849439063e-19 * r_11 - 0.0823 * r_12;
-    let p_16_z = p_z - 1.64748849439063e-19 * r_21 - 0.0823 * r_22;
-    let r_06_axes5 = [1.0 * r_02, 1.0 * r_12, 1.0 * r_22];
+    let p_16_x = p_x - 1.22464679914735e-17 * r_00 - 6.12323399573677e-18 * r_01 - 0.1 * r_02;
+    let p_16_y = p_y - 1.22464679914735e-17 * r_10 - 6.12323399573677e-18 * r_11 - 0.1 * r_12;
+    let p_16_z =
+        p_z - 1.22464679914735e-17 * r_20 - 6.12323399573677e-18 * r_21 - 0.1 * r_22 - 0.163;
+    let r_06_axes5_x = 6.12323399573677e-17 * r_01 + 1.0 * r_02;
+    let r_06_axes5_y = 6.12323399573677e-17 * r_11 + 1.0 * r_12;
+    let r_06_axes5_z = 6.12323399573677e-17 * r_21 + 1.0 * r_22;
 
-    const H_SP_0: [f64; 3] = [0.0, -1.0, 6.123233995736766e-17];
+    const H_SP_0: [f64; 3] = [-1.2246467991473532e-16, -1.0, 0.0];
     const K_SP_0: [f64; 3] = [-0.0, -0.0, -1.0];
-    const K_SP_1: [f64; 3] = [0.0, -1.2246467991473532e-16, -1.0];
-    const NEG_P_5: [f64; 3] = [-0.0, 1.3877787807814457e-17, 0.09465];
-    const NEG_AXES_5: [f64; 3] = [-0.0, 1.0, -6.123233995736766e-17];
+    const K_SP_1: [f64; 3] = [-1.2246467991473532e-16, 1.4997597826618576e-32, -1.0];
+    const NEG_P_5: [f64; 3] = [-0.0, -0.0, 0.1];
+    const NEG_AXES_5: [f64; 3] = [1.2246467991473532e-16, 1.0, -0.0];
 
     let p_16 = [p_16_x, p_16_y, p_16_z];
+    let r_06_axes5 = [r_06_axes5_x, r_06_axes5_y, r_06_axes5_z];
     let h_sp = [H_SP_0, H_SP_0, H_SP_0, H_SP_0];
     let k_sp = [K_SP_0, K_SP_1, K_SP_0, K_SP_1];
     let p_sp = [p_16, NEG_P_5, r_06_axes5, NEG_AXES_5];
 
     let mut theta15 = [(0.0f64, 0.0f64); 4];
-    let n15 = sp6_solve(&h_sp, &k_sp, &p_sp, 0.10915, 0.0, policy.subproblem_numerical, policy.subproblem_degeneracy, &mut theta15);
+    let n15 = sp6_solve(
+        &h_sp,
+        &k_sp,
+        &p_sp,
+        0.134,
+        0.0,
+        policy.subproblem_numerical,
+        policy.subproblem_degeneracy,
+        &mut theta15,
+    );
 
     for si in 0..n15 {
         let (q1, q5) = theta15[si];
 
-        // NOTE: the literal constants in the theta14 / q6 / d_inner blocks
-        // below (e.g. `6.12323399573677e-17`, `7.49879891330929e-33`) are the
-        // machine-generated symbolic coefficients emitted by `ssik build` and
-        // are copied verbatim from `ur5_ik.py`. Most are rounding residue of
-        // exact zeros (cos(pi/2)) preserved here so the floating-point
-        // accumulation order matches the Python reference bit-for-bit.
-
-        // SP1 for theta14 = q1+q2+q3+q4.
-        let th14_x0 = libm::sin(q5);
-        let th14_x1 = 1.0 * r_22;
-        let th14_x2 = libm::sin(q1);
-        let th14_x3 = 6.12323399573677e-17 * r_01 - 1.0 * r_02;
-        let th14_x4 = th14_x2 * th14_x3;
-        let th14_x5 = 1.0 * r_01 + 6.12323399573677e-17 * r_02;
-        let th14_x6 = 6.12323399573677e-17 * th14_x2 * th14_x5;
-        let th14_x7 = libm::cos(q1);
-        let th14_x8 = 6.12323399573677e-17 * r_11 - 1.0 * r_12;
-        let th14_x9 = th14_x7 * th14_x8;
-        let th14_x10 = 1.0 * r_11 + 6.12323399573677e-17 * r_12;
-        let th14_x11 = 6.12323399573677e-17 * th14_x10 * th14_x7;
-        let th14_x12 = th14_x11 + th14_x4 - th14_x6 - th14_x9;
-        let th14_x13 = libm::cos(q5);
-        let th14_x14 = 6.12323399573677e-17 * th14_x10 * th14_x2 - th14_x2 * th14_x8
-            - th14_x3 * th14_x7
-            + 6.12323399573677e-17 * th14_x5 * th14_x7;
-        let th14_x15 = 1.0 * th14_x13;
+        // NOTE: the literal constants below are the machine-generated symbolic
+        // coefficients emitted by `ssik build`, copied verbatim from `ur5_ik.py`
+        // (mechanically translated; most are rounding residue of cos(pi/2)).
+        // SP1 for theta14 = q1+q2+q3+q4 (sum of parallel-axis rotations).
+        let th14_x0 = 6.12323399573677e-17 * r_21 + 1.0 * r_22;
+        let th14_x1 = libm::sin(q5);
+        let th14_x2 = 1.0 * th14_x1;
+        let th14_x3 = libm::sin(q1);
+        let th14_x4 = -1.22464679914735e-16 * r_00 - 6.12323399573677e-17 * r_01 - 1.0 * r_02;
+        let th14_x5 = 1.0 * th14_x4;
+        let th14_x6 = th14_x3 * th14_x5;
+        let th14_x7 = 1.0 * r_00 + 1.22464679914735e-16 * r_01 - 1.22464679914735e-16 * r_02;
+        let th14_x8 = 1.22464679914735e-16 * th14_x7;
+        let th14_x9 = th14_x3 * th14_x8;
+        let th14_x10 = libm::cos(q1);
+        let th14_x11 = -1.22464679914735e-16 * r_10 - 6.12323399573677e-17 * r_11 - 1.0 * r_12;
+        let th14_x12 = 1.0 * th14_x11;
+        let th14_x13 = th14_x10 * th14_x12;
+        let th14_x14 = 1.0 * r_10 + 1.22464679914735e-16 * r_11 - 1.22464679914735e-16 * r_12;
+        let th14_x15 = 1.22464679914735e-16 * th14_x14;
+        let th14_x16 = th14_x10 * th14_x15;
+        let th14_x17 = -th14_x13 - th14_x16 + th14_x6 + th14_x9;
+        let th14_x18 =
+            -th14_x10 * th14_x5 - th14_x10 * th14_x8 - th14_x12 * th14_x3 - th14_x15 * th14_x3;
+        let th14_x19 = 1.22464679914735e-16 * th14_x1;
+        let th14_x20 = libm::cos(q5);
+        let th14_x21 = 1.0 * th14_x20;
         let theta14 = libm::atan2(
-            -th14_x0 * th14_x1 - 6.12323399573677e-17 * th14_x0 * th14_x12
-                + th14_x14 * (6.12323399573677e-17 - 6.12323399573677e-17 * th14_x13),
-            -1.0 * th14_x0 * th14_x14
-                + th14_x1 * (1.22464679914735e-16 * th14_x13 - 6.12323399573677e-17)
-                + th14_x12 * (-th14_x15 - 7.49879891330929e-33)
-                - (th14_x15 + 3.74939945665464e-33)
-                    * (6.12323399573677e-17 * r_22 - th14_x11 - th14_x4 + th14_x6 + th14_x9),
+            -th14_x0 * th14_x2 + 1.49975978266186e-32 * th14_x1 * th14_x17 - th14_x18 * th14_x19,
+            th14_x0 * th14_x19
+                + th14_x17 * (th14_x19 - th14_x21)
+                + th14_x18 * (-th14_x2 - 1.22464679914735e-16 * th14_x20)
+                - th14_x21
+                    * (1.22464679914735e-16 * th14_x10 * th14_x4
+                        + 1.49975978266186e-32 * th14_x10 * th14_x7
+                        + 1.22464679914735e-16 * th14_x11 * th14_x3
+                        + th14_x13
+                        + 1.49975978266186e-32 * th14_x14 * th14_x3
+                        + th14_x16
+                        - th14_x6
+                        - th14_x9),
         );
-
-        // SP1 for q6 (wrist roll-2).
-        let q6_x0 = libm::cos(q5);
+        // SP1 for q6 (wrist roll-2): closed-form atan2.
+        let q6_x0 = libm::sin(q5);
         let q6_x1 = libm::sin(q1);
-        let q6_x2 = 1.0 * q6_x1;
-        let q6_x3 = libm::cos(q1);
-        let q6_x4 = 1.0 * q6_x3;
-        let q6_x5 = q6_x2 * r_00 - q6_x4 * r_10 + 6.12323399573677e-17 * r_20;
-        let q6_x6 = libm::sin(q5);
-        let q6_x7 = 6.12323399573677e-17 * r_22;
-        let q6_x8 = 6.12323399573677e-17 * r_01 - 1.0 * r_02;
-        let q6_x9 = q6_x4 * (6.12323399573677e-17 * r_11 - 1.0 * r_12);
-        let q6_x10 = q6_x2 * q6_x8 - q6_x7 - q6_x9 + 3.74939945665464e-33 * r_21;
-        let q6_x11 = 1.0 * r_01 + 6.12323399573677e-17 * r_02;
-        let q6_x12 = 1.0 * r_11 + 6.12323399573677e-17 * r_12;
-        let q6_x13 = q6_x11 * q6_x2 - q6_x12 * q6_x4
-            + 6.12323399573677e-17 * r_21
-            + 3.74939945665464e-33 * r_22;
-        let q6_x14 = 1.0 * q6_x6;
+        let q6_x2 = 1.22464679914735e-16 * r_00;
+        let q6_x3 = -q6_x2 - 6.12323399573677e-17 * r_01 - 1.0 * r_02;
+        let q6_x4 = libm::cos(q1);
+        let q6_x5 = 1.22464679914735e-16 * q6_x4;
+        let q6_x6 = 1.22464679914735e-16 * r_10;
+        let q6_x7 = -q6_x6 - 6.12323399573677e-17 * r_11 - 1.0 * r_12;
+        let q6_x8 = 1.22464679914735e-16 * q6_x1;
+        let q6_x9 = 1.0 * q6_x4;
+        let q6_x10 = -1.0 * q6_x1 * q6_x3 + q6_x3 * q6_x5 + q6_x7 * q6_x8 + q6_x7 * q6_x9;
+        let q6_x11 = -q6_x10;
+        let q6_x12 = -q6_x2 + 1.0 * r_01 - 6.12323399573677e-17 * r_02;
+        let q6_x13 = -q6_x6 + 1.0 * r_11 - 6.12323399573677e-17 * r_12;
+        let q6_x14 = 1.0 * q6_x1 * q6_x12 - q6_x12 * q6_x5 - q6_x13 * q6_x8 - q6_x13 * q6_x9;
         let q6_x15 = 1.0 * q6_x0;
+        let q6_x16 = 1.0 * r_00 + 1.22464679914735e-16 * r_01 - 1.22464679914735e-16 * r_02;
+        let q6_x17 = 1.0 * r_10 + 1.22464679914735e-16 * r_11 - 1.22464679914735e-16 * r_12;
+        let q6_x18 = 1.0 * q6_x1 * q6_x16 - q6_x16 * q6_x5 - q6_x17 * q6_x8 - q6_x17 * q6_x9;
+        let q6_x19 = 1.22464679914735e-16 * q6_x0;
+        let q6_x20 = libm::cos(q5);
+        let q6_x21 = 1.0 * q6_x20;
         let q6 = libm::atan2(
-            -6.12323399573677e-17 * q6_x10 * q6_x6 - q6_x13 * q6_x14
-                + q6_x5 * (6.12323399573677e-17 * q6_x0 - 6.12323399573677e-17),
-            q6_x10 * (-q6_x15 - 7.49879891330929e-33)
-                + q6_x13 * (1.22464679914735e-16 * q6_x0 - 6.12323399573677e-17)
-                + q6_x14 * q6_x5
-                - (-q6_x15 - 3.74939945665464e-33)
-                    * (-6.12323399573677e-17 * q6_x1 * q6_x11
-                        + 1.0 * q6_x1 * q6_x8
-                        + 6.12323399573677e-17 * q6_x12 * q6_x3
-                        - q6_x7
-                        - q6_x9),
+            1.49975978266186e-32 * q6_x0 * q6_x11 - q6_x14 * q6_x15 - q6_x18 * q6_x19,
+            q6_x11 * (-q6_x19 - q6_x21) - q6_x14 * q6_x19
+                + q6_x18 * (q6_x15 - 1.22464679914735e-16 * q6_x20)
+                + q6_x21
+                    * (1.22464679914735e-16 * q6_x1 * q6_x16
+                        - 1.49975978266186e-32 * q6_x1 * q6_x17
+                        - q6_x10
+                        - 1.49975978266186e-32 * q6_x16 * q6_x4
+                        - q6_x17 * q6_x5),
         );
-
-        // d_inner vector.
+        // d_inner = r_01.T @ p_16 - p[1] - r_14 @ r_45 @ p[5] - r_14 @ p[4]
         let dinr_x0 = libm::sin(theta14);
-        let dinr_x1 = libm::sin(q5);
-        let dinr_x2 = libm::cos(theta14);
-        let dinr_x3 = libm::cos(q5);
-        let dinr_x4 = 1.22464679914735e-16 - 1.22464679914735e-16 * dinr_x3;
-        let dinr_x5 = 1.0 * dinr_x3 + 1.49975978266186e-32;
-        let dinr_x6 = libm::sin(q1);
-        let dinr_x7 = p_y - 1.64748849439063e-19 * r_11 - 0.0823 * r_12;
-        let dinr_x8 = libm::cos(q1);
-        let dinr_x9 = p_x - 1.64748849439063e-19 * r_01 - 0.0823 * r_02;
-        let dinr_x10 = 6.12323399573677e-17 * dinr_x2 - 6.12323399573677e-17;
-        let dinr_x11 = 1.38777878078145e-17 * dinr_x4;
-        let d_inner_x = -1.96734287847793e-17 * dinr_x0 * dinr_x4
-            - 8.49769420904307e-34 * dinr_x0 * dinr_x5
-            - 0.09465 * dinr_x0
-            + 2.28650585388476e-18 * dinr_x1 * dinr_x2
-            + 1.0 * dinr_x6 * dinr_x7
-            + dinr_x8 * dinr_x9;
-        let d_inner_y = 1.40008103759583e-34 * dinr_x0 * dinr_x1
-            + dinr_x10 * dinr_x11
-            + 5.79564097696485e-18 * dinr_x2
-            + 2.28650585388476e-18 * dinr_x3
-            - 1.0 * dinr_x6 * dinr_x9
-            + dinr_x7 * dinr_x8
-            + 0.10915;
-        let d_inner_z = 2.28650585388476e-18 * dinr_x0 * dinr_x1
-            + 0.09465 * dinr_x10 * dinr_x4
-            + 1.38777878078145e-17 * dinr_x10 * dinr_x5
-            + dinr_x11 * (1.0 * dinr_x2 + 3.74939945665464e-33)
-            + 0.09465 * dinr_x2
+        let dinr_x1 = libm::cos(theta14);
+        let dinr_x2 = libm::cos(q1);
+        let dinr_x3 = p_x - 1.22464679914735e-17 * r_00 - 6.12323399573677e-18 * r_01 - 0.1 * r_02;
+        let dinr_x4 = p_y - 1.22464679914735e-17 * r_10 - 6.12323399573677e-18 * r_11 - 0.1 * r_12;
+        let dinr_x5 = 1.0 * libm::sin(q1);
+        let dinr_x6 = 1.22464679914735e-16 - 1.22464679914735e-16 * dinr_x1;
+        let dinr_x7 = libm::sin(q5);
+        let dinr_x8 = libm::cos(q5);
+        let dinr_x9 =
+            1.22464679914735e-16 * dinr_x7 + 1.49975978266186e-32 * dinr_x8 - 1.49975978266186e-32;
+        let dinr_x10 =
+            1.49975978266186e-32 * dinr_x7 - 1.22464679914735e-16 * dinr_x8 + 1.22464679914735e-16;
+        let dinr_x11 = 0.1 * dinr_x10;
+        let dinr_x12 = 1.22464679914735e-17 * dinr_x0;
+        let d_inner_x = -0.1 * dinr_x0 - 1.55530143491714e-17 * dinr_x1
+            + dinr_x11 * (1.0 * dinr_x1 + 1.49975978266186e-32)
+            + dinr_x2 * dinr_x3
+            + dinr_x4 * dinr_x5
+            + 0.1 * dinr_x6 * dinr_x9
+            + 3.24531401774049e-17;
+        let d_inner_y = dinr_x11 * dinr_x6 + dinr_x12 + dinr_x2 * dinr_x4 - dinr_x3 * dinr_x5
+            + 1.22464679914735e-17 * dinr_x7
+            + 1.49975978266186e-33 * dinr_x8
+            + 0.265;
+        let d_inner_z = 0.1 * dinr_x0 * dinr_x10 - 1.55530143491714e-17 * dinr_x0 + 0.1 * dinr_x1
+            - dinr_x12 * dinr_x9
             + 1.0 * p_z
-            - 1.64748849439063e-19 * r_21
-            - 0.0823 * r_22
-            - 0.089159;
+            - 1.22464679914735e-17 * r_20
+            - 6.12323399573677e-18 * r_21
+            - 0.1 * r_22
+            - 0.163;
         let d_elbow =
             libm::sqrt(d_inner_x * d_inner_x + d_inner_y * d_inner_y + d_inner_z * d_inner_z);
-
-        // SP3 for q3 (elbow).
-        let q3_r_sq = 0.0277909737890625_f64;
-        let q3_rhs = 0.16724253125 - 0.5 * d_elbow * d_elbow;
-        let q3_phi = PI;
+        // SP3 for q3 (elbow): reduces to SP4 with d_elbow target.
+        let q3_r_sq = 0.0277555600000000_f64;
+        let q3_rhs = 0.175725 - 0.5 * d_elbow * d_elbow;
+        let q3_phi = 5.49780309313178e-18 - PI;
         let theta_q3_plus;
         let theta_q3_minus;
         if q3_r_sq < policy.axis_parallel * policy.axis_parallel {
@@ -450,20 +472,27 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8], policy: Tole
                 theta_q3_minus = q3_phi - delta;
             }
         }
-
+        // LS fallback: theta = phi (or phi + pi if rhs < 0)
         for q3 in [theta_q3_plus, theta_q3_minus] {
+            // SP1 for q2 (shoulder pitch): closed-form atan2.
             let q2_x0 = libm::sin(q3);
-            let q2_x1 = 0.39225 * q2_x0;
-            let q2_x2 = libm::cos(q3);
-            let q2_x3 = -0.39225 * q2_x2 - 0.425;
+            let q2_x1 = libm::cos(q3);
+            let q2_x2 = -0.392 * q2_x0 + 2.77555756156289e-17 * q2_x1 + 2.77555756156289e-17;
+            let q2_x3 = -2.77555756156289e-17 * q2_x0 - 0.392 * q2_x1 - 0.425;
             let q2 = libm::atan2(
-                d_inner_x * q2_x1
-                    + d_inner_y * (-2.40183853482775e-17 * q2_x2 - 2.60237444818813e-17)
+                -d_inner_x * q2_x2
+                    + d_inner_y
+                        * (-4.80061545265762e-17 * q2_x0
+                            + 3.39907768361723e-33 * q2_x1
+                            + 3.39907768361723e-33)
                     + d_inner_z * q2_x3,
-                d_inner_x * q2_x3 - 2.40183853482775e-17 * d_inner_y * q2_x0 - d_inner_z * q2_x1,
+                d_inner_x * q2_x3 - 1.60428730688303e-17 * d_inner_x
+                    + d_inner_y
+                        * (3.39907768361723e-33 * q2_x0 + 4.80061545265762e-17 * q2_x1 + 0.131)
+                    - 0.131 * d_inner_y
+                    + d_inner_z * q2_x2,
             );
             let q4 = libm::remainder(theta14 - q2 - q3, TWO_PI);
-
             if count < 8 {
                 out[count] = [q1, q2, q3, q4, q5, q6];
                 count += 1;
@@ -473,7 +502,6 @@ fn solve_algebraic(t: &SMatrix<f64, 4, 4>, out: &mut [[f64; 6]; 8], policy: Tole
 
     count
 }
-
 
 // ---------------------------------------------------------------------------
 // Forward kinematics (for FK closure verification)
@@ -533,15 +561,20 @@ mod tests {
         true
     }
 
+    /// A generic (non-singular) configuration. q = 0 is a wrist singularity for
+    /// the UR5e (q5 = 0), where the solver legitimately returns a different
+    /// but equivalent branch, so round-trip tests use this instead.
+    const REF_Q: [f64; 6] = [0.3, -1.0, 1.2, -0.5, 0.8, 0.2];
+
     #[test]
     fn fk_home_pose() {
         let zero = [0.0f64; 6];
         let t = fk(&zero);
         // Python T_HOME at q = zeros(6)
         let t_home = [
-            1.0, 0.0, 0.0, -0.81725,
-            0.0, 6.123233995736766e-17, -1.0, -0.19145,
-            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
+            1.0, 0.0, 0.0, -0.817,
+            0.0, 0.0, -1.0, -0.234,
+            0.0, 1.0, 0.0, 0.063,
             0.0, 0.0, 0.0, 1.0,
         ];
         for i in 0..4 {
@@ -557,18 +590,11 @@ mod tests {
     }
 
     #[test]
-    fn home_pose_round_trips() {
-        let t_home = [
-            1.0, 0.0, 0.0, -0.81725,
-            0.0, 6.123233995736766e-17, -1.0, -0.19145,
-            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        let tf = tf_from_row_major(&t_home);
+    fn reference_pose_round_trips() {
+        let tf = fk(&REF_Q);
         let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
-        let zero = [0.0; 6];
-        let found = sols.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-6));
-        assert!(found, "home configuration q=0 not recovered");
+        let found = sols.iter().flatten().any(|s| q_eq_mod(s, &REF_Q, 1e-6));
+        assert!(found, "reference configuration not recovered");
     }
 
     #[test]
@@ -606,30 +632,17 @@ mod tests {
 
     #[test]
     fn respect_limits_drops_out_of_range() {
-        // q=0 is the home pose; all joints are at 0 which is within limits.
-        let t_home = [
-            1.0, 0.0, 0.0, -0.81725,
-            0.0, 6.123233995736766e-17, -1.0, -0.19145,
-            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        let tf = tf_from_row_major(&t_home);
-        // With limits on, q=0 should still survive (it's within all limits).
+        // REF_Q is within all joint limits.
+        let tf = fk(&REF_Q);
+        // With limits on, REF_Q should still survive (it's within all limits).
         let sols_lim = solve(&tf, None, None, true, false, TolerancePolicy::DEFAULT, 15);
-        let zero = [0.0; 6];
-        let found = sols_lim.iter().flatten().any(|s| q_eq_mod(s, &zero, 1e-6));
-        assert!(found, "q=0 should survive respect_limits=true");
+        let found = sols_lim.iter().flatten().any(|s| q_eq_mod(s, &REF_Q, 1e-6));
+        assert!(found, "REF_Q should survive respect_limits=true");
     }
 
     #[test]
     fn max_solutions_cap() {
-        let t_home = [
-            1.0, 0.0, 0.0, -0.81725,
-            0.0, 6.123233995736766e-17, -1.0, -0.19145,
-            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        let tf = tf_from_row_major(&t_home);
+        let tf = fk(&REF_Q);
         let all_sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
         let n_all: usize = all_sols.iter().flatten().count();
         if n_all > 1 {
@@ -641,13 +654,7 @@ mod tests {
 
     #[test]
     fn q_seed_sorts_nearest_first() {
-        let t_home = [
-            1.0, 0.0, 0.0, -0.81725,
-            0.0, 6.123233995736766e-17, -1.0, -0.19145,
-            0.0, 1.0, 6.123233995736766e-17, -0.005490999999999996,
-            0.0, 0.0, 0.0, 1.0,
-        ];
-        let tf = tf_from_row_major(&t_home);
+        let tf = fk(&REF_Q);
         let zero = [0.0f64; 6];
         let sols = solve(&tf, None, Some(&zero), false, false, TolerancePolicy::DEFAULT, 15);
         let solutions: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();

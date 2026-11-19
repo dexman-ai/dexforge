@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 dexforge-ur-core = { path = "../rust" }
+dexhal = { path = "../../../dexhal" }
 nalgebra = { version = "0.33", default-features = false, features = ["libm"] }
 
 # Standalone workspace root: keeps cargo from attaching this crate to the parent repo workspace.
