@@ -53,8 +53,13 @@ hard-coded in the simulator.
 
 Per control cycle (manifest `control_freq_hz`, 500 Hz for UR5):
 
-1. Take the latest command. Supported modes, first release: `joint_pos`,
-   `joint_vel`, `cartesian_pose`.
+1. Take the latest command. The mode is the explicit `control_mode` field (as in
+   the dexhal contract: NaN = idle/hold, 1 = `joint_pos`, 2 = `joint_vel`,
+   4 = `cartesian_pose`), never inferred from which targets are finite. Supported
+   in the first release: those three. `write_command` rejects an unknown code,
+   a mode the manifest does not offer, and a non-finite target for the selected
+   mode, like the mock driver (`ValueError` / `NotImplementedError` here). Other
+   command fields (gains, gripper, IO, feedforward) are ignored.
    - `cartesian_pose`: solve with the **generated IK**, nearest to the current
      joints, then run as `joint_pos`. On failure see *IK fault handling*.
 2. Slew a reference toward the target within `limits.velocity` and
@@ -84,8 +89,8 @@ Per control cycle (manifest `control_freq_hz`, 500 Hz for UR5):
 - **On failure** (no solution, or the best solution exceeds the bound): the
   command is rejected, the previous joint target is held, and
   `state.fault_code` is set to a non-zero code. Define the codes in one table
-  in the sim (1 = IK no solution, 2 = IK step exceeds bound, 3 = command
-  outside limits); `0.0` means healthy.
+  in the sim (1 = IK no solution, 2 = IK step exceeds bound, 3 = target outside
+  limits); `0.0` means healthy.
 - **Recovery:** `clear_faults()` resets `fault_code` to `0.0`. A fault is also
   cleared by the next valid command only if the driver contract says so;
   until that is confirmed, require an explicit `clear_faults()`.
@@ -160,18 +165,21 @@ remains the kinematics-only viewer.
 ## Status
 
 Done:
-1. Bindings expose the dynamics, manifest and buffer layout (`dexforge_ur`).
+1. Bindings expose the dynamics, manifest, control modes and buffer layouts
+   (`dexforge_ur`, built from `tools/sim_bindings`; sim-only, since the OEM crates
+   no longer ship Python bindings).
 2. MJCF generator: `tools/urdf_to_mjcf.py` builds the model from `ur5.urdf` with
    inertials, joint limits, gravity, direct-torque motors and a `tcp` site.
-   `test_mjcf_dynamics.py` checks generated gravity, mass matrix, Coriolis and FK
+   `tools/tests/test_mjcf_dynamics.py` checks generated gravity, mass matrix, Coriolis and FK
    against MuJoCo, and that gravity compensation holds the arm still.
 
 3. `SimDriver` (`tools/sim_driver.py`): control loop, command/state buffers, the
-   three control modes, IK fault handling, latency queues, optional control
-   thread. `test_sim_driver.py` covers gravity hold, joint-position round trip,
-   velocity mode, cartesian command vs achieved pose, IK faults (no solution,
-   step too large, out of limits, unsupported field), latching until
-   `clear_faults()`, and the latency shift.
+   three control modes selected by `control_mode`, IK fault handling, latency queues, optional control
+   thread. `tools/tests/test_sim_driver.py` covers gravity hold, joint-position
+   round trip, velocity mode, explicit mode selection, idle hold, cartesian command
+   vs achieved pose, command rejection (unknown / unsupported mode, non-finite
+   target), IK faults (no solution, step too large, out of limits), latching until
+   `clear_faults()`, streamed trajectories, and the latency shift.
 4. Bindings `fk_pose` and `ik_nearest` (the contract's IK with its continuity
    bound, default pi/2).
 

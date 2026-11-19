@@ -1,8 +1,10 @@
 //! The driver contract: what the DexZero kernel sees of an arm.
 //!
 //! * [`ArmManifest`] — static capabilities, limits (including optional
-//!   [`jerk_limits`](ArmManifest::jerk_limits) and
-//!   [`has_static_inertials`](ArmManifest::has_static_inertials)), and latency
+//!   [`jerk_limits`](ArmManifest::jerk_limits),
+//!   [`has_static_inertials`](ArmManifest::has_static_inertials),
+//!   [`has_residual_inertials`](ArmManifest::has_residual_inertials) and
+//!   [`dynamics_source`](ArmManifest::dynamics_source)), and latency
 //!   cycles, read once at boot.
 //! * [`CoreState`] / [`CoreCommand`] and their zero-copy views — the two
 //!   buffers exchanged every control cycle.
@@ -22,7 +24,7 @@ pub mod wire;
 pub use manifest::*;
 pub use wire::*;
 
-use crate::math::arm::{Arm, PoseResidual};
+use crate::math::arm::{Arm, IK_NEAREST_REFINEMENT_ITERS, PoseResidual};
 use crate::math::chain::{
     pose_from_xyz_quat, pose_to_xyz_quat, ChainJoint, KinematicChain, ModelError,
 };
@@ -46,7 +48,7 @@ pub struct ContractVersion {
 /// Contract version implemented by this crate.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     major: 0,
-    minor: 2,
+    minor: 3,
     patch: 0,
 };
 
@@ -95,7 +97,8 @@ pub enum Applied {
 }
 
 /// [`Dynamics`](crate::math::arm::Dynamics) padded to [`MAX_DOF`]; rows and
-/// columns beyond the active DOF are zero.
+/// columns beyond the active DOF are zero. `#[repr(C)]`, all `f64`.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DynamicsState {
     pub m_matrix: [[f64; MAX_DOF]; MAX_DOF],
@@ -241,6 +244,12 @@ pub trait ArmMath: Send {
         q_seed: &[f64; MAX_DOF],
     ) -> Option<[f64; MAX_DOF]>;
 
+    /// Up to `out.len()` joint solutions reaching `target_pose`, with no seed
+    /// ranking: the caller selects among them (for example by end-effector
+    /// orientation). Writes them to the front of `out` and returns how many
+    /// were written (0 if unreachable). Order is the driver's.
+    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [[f64; MAX_DOF]]) -> usize;
+
     /// `M`, `C qd`, `G` including the payload.
     fn dynamics_padded(&self, q: &[f64; MAX_DOF], qd: &[f64; MAX_DOF]) -> Option<DynamicsState>;
 
@@ -255,6 +264,16 @@ pub trait ArmMath: Send {
     /// Distance between the model's TCP pose at `q` and a pose reported by
     /// the hardware.
     fn pose_residual(&self, q: &[f64; MAX_DOF], reported_tcp: &[f64; 7]) -> Option<PoseResidual>;
+
+    /// External wrench at the TCP origin in base axes from a reported
+    /// [`CoreState::wrench`] ([`Arm::external_wrench`]).
+    fn external_wrench_padded(
+        &self,
+        q: &[f64; MAX_DOF],
+        reported: &[f64; 6],
+        frame: WrenchFrame,
+        gravity_compensated: bool,
+    ) -> Option<[f64; 6]>;
 
     /// Set the payload (`inertia` row-major about the centre of mass).
     fn apply_payload(
@@ -335,6 +354,27 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmMath for Arm<
         Some(pad(&q))
     }
 
+    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [[f64; MAX_DOF]]) -> usize {
+        let Ok(target) = pose_from_xyz_quat(target_pose) else {
+            return 0;
+        };
+        let solutions = self.ik(
+            &target,
+            Some(out.len().min(MAX)),
+            None,
+            true,
+            true,
+            TolerancePolicy::DEFAULT,
+            IK_NEAREST_REFINEMENT_ITERS,
+        );
+        let mut n = 0;
+        for q in solutions.iter().flatten().take(out.len()) {
+            out[n] = pad(q);
+            n += 1;
+        }
+        n
+    }
+
     fn dynamics_padded(&self, q: &[f64; MAX_DOF], qd: &[f64; MAX_DOF]) -> Option<DynamicsState> {
         let d = self.dynamics(&unpad(q)?, &unpad(qd)?)?;
         let mut out = DynamicsState {
@@ -361,6 +401,19 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmMath for Arm<
     fn pose_residual(&self, q: &[f64; MAX_DOF], reported_tcp: &[f64; 7]) -> Option<PoseResidual> {
         let reported = pose_from_xyz_quat(reported_tcp).ok()?;
         self.fk_residual(&unpad(q)?, &reported).ok()
+    }
+
+    fn external_wrench_padded(
+        &self,
+        q: &[f64; MAX_DOF],
+        reported: &[f64; 6],
+        frame: WrenchFrame,
+        gravity_compensated: bool,
+    ) -> Option<[f64; 6]> {
+        if !reported.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        Some(self.external_wrench(&unpad(q)?, reported, frame, gravity_compensated))
     }
 
     fn apply_payload(
@@ -416,7 +469,15 @@ pub trait ArmDriver: Send {
     /// Static capabilities, read once at boot.
     fn manifest(&self) -> &ArmManifest;
 
+    /// Bring the arm to a commandable state: open the transport, power on,
+    /// release the brakes, arm the hardware command-stream watchdog
+    /// ([`ArmManifest::hardware_watchdog_ms`]) and enable. On success the arm
+    /// is enabled and holding position, ready for
+    /// [`write_command`](Self::write_command). There are no separate enable /
+    /// brake hooks.
     fn connect(&mut self) -> Result<(), ArmError>;
+
+    /// Stop motion, disable (brakes engaged) and close the transport.
     fn disconnect(&mut self) -> Result<(), ArmError>;
 
     /// Fill `state_buffer` ([`ArmManifest::state_len`] slots): a [`CoreState`]
@@ -425,6 +486,13 @@ pub trait ArmDriver: Send {
 
     /// Execute the [`CoreCommand`] at the front of `cmd_buffer`. See
     /// [`CoreCommandView`].
+    ///
+    /// The driver dispatches on [`CoreCommandView::active_mode`] and never
+    /// infers a mode from which fields are finite. [`ActiveMode::Idle`] means
+    /// hold: forward the controller's native hold / stop. A mode the manifest
+    /// does not [support](ArmManifest::supports_mode) is
+    /// [`ArmError::NotSupported`]. The driver runs no software watchdog; if
+    /// calls stop, the hardware watchdog armed in `connect` acts.
     fn write_command(&mut self, cmd_buffer: &[f64]) -> Result<(), ArmError>;
 
     /// The host-side model of this arm.
@@ -501,12 +569,24 @@ pub trait ArmDriver: Send {
         Ok(self.arm_mut().apply_ik_max_joint_step(step)?)
     }
 
+    /// Re-enable after a protective stop or fault (the arm ends enabled, as
+    /// after [`connect`](Self::connect)).
     fn clear_faults(&mut self) -> Result<(), ArmError> {
         Err(ArmError::NotSupported)
     }
 
-    /// Escape hatch for vendor features outside the contract.
-    fn handle_vendor_command(&mut self, _cmd_name: &str, _payload: &[u8]) -> Result<(), ArmError> {
+    /// Escape hatch for vendor features outside the contract (e.g. manual
+    /// brake release during commissioning).
+    ///
+    /// Any reply is written to the front of `response`; the result is its
+    /// length in bytes (`0` for none). [`ArmError::BufferTooSmall`] if the
+    /// reply does not fit.
+    fn handle_vendor_command(
+        &mut self,
+        _cmd_name: &str,
+        _payload: &[u8],
+        _response: &mut [u8],
+    ) -> Result<usize, ArmError> {
         Err(ArmError::NotSupported)
     }
 
@@ -559,6 +639,25 @@ pub trait ArmDriver: Send {
     fn calibration_residual(&self, state_buffer: &[f64]) -> Option<PoseResidual> {
         let state = CoreStateView::new(state_buffer).ok()?;
         self.arm().pose_residual(state.q(), state.tcp_pose())
+    }
+
+    /// The external wrench on the tool (TCP origin, base axes, payload weight
+    /// removed) from the state buffer, conditioned per the manifest's
+    /// `sensing.wrench_frame` / `wrench_is_gravity_compensated`.
+    ///
+    /// `None` if the buffer is too short or the arm has no wrench sensing.
+    fn external_wrench(&self, state_buffer: &[f64]) -> Option<[f64; 6]> {
+        let manifest = self.manifest();
+        if !manifest.has_wrench_sensing {
+            return None;
+        }
+        let state = CoreStateView::new(state_buffer).ok()?;
+        self.arm().external_wrench_padded(
+            state.q(),
+            state.wrench(),
+            manifest.wrench_frame,
+            manifest.wrench_is_gravity_compensated,
+        )
     }
 }
 

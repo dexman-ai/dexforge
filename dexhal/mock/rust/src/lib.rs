@@ -6,20 +6,31 @@
 //! command becomes visible after `command_dispatch_cycles +
 //! state_staleness_cycles` further writes.
 //!
-//! The state echoes the commanded values: joint velocity and torque, TCP
-//! twist, wrench, digital outputs (looped back to the inputs) and gripper
-//! width. Fields the command leaves unset read as NaN.
+//! In a motion [`ActiveMode`] the state echoes the commanded values: joint
+//! position, velocity and torque, TCP twist and wrench. [`ActiveMode::Idle`]
+//! holds the last position with zero velocity and leaves the rest unset.
+//! Digital and analog outputs (looped back to the inputs) and the gripper
+//! width are echoed in every mode. Fields the command leaves unset read as
+//! NaN.
+//!
+//! The vendor command `"echo"` copies its payload into the response.
+//!
+//! The crate also builds as a `cdylib` exporting [`MockArm`]'s driver as a
+//! `dexhal-plugin` (see [`dexhal_plugin_entry`]).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::collections::VecDeque;
 
 use dexhal::math::{
-    pose_to_xyz_quat, Arm, ArmDriver, ArmError, ArmManifest, ArmMath, ArmModel, CoreCommand,
-    CoreState, ManifestError, MAX_DOF,
+    pose_to_xyz_quat, ActiveMode, Arm, ArmDriver, ArmError, ArmManifest, ArmMath, ArmModel,
+    CoreCommand, CoreState, ManifestError, MAX_DOF,
 };
 
 mod model;
+mod plugin;
+
+pub use plugin::dexhal_plugin_entry;
 
 pub use model::MockArm;
 
@@ -81,10 +92,13 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmDriver
             .queue
             .front()
             .ok_or(ArmError::Fault("empty command queue"))?;
+        let moving = cmd.active_mode() != Some(ActiveMode::Idle);
 
-        for i in 0..DOF {
-            if cmd.target_q[i].is_finite() {
-                self.held_q[i] = cmd.target_q[i];
+        if moving {
+            for i in 0..DOF {
+                if cmd.target_q[i].is_finite() {
+                    self.held_q[i] = cmd.target_q[i];
+                }
             }
         }
 
@@ -93,22 +107,18 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmDriver
 
         let mut state = CoreState::UNKNOWN;
         state.q = self.held_q;
+        let or_zero = |v: f64| if moving && v.is_finite() { v } else { 0.0 };
         for i in 0..DOF {
-            state.qd[i] = if cmd.target_qd[i].is_finite() {
-                cmd.target_qd[i]
-            } else {
-                0.0
-            };
-            state.torques[i] = if cmd.target_torques[i].is_finite() {
-                cmd.target_torques[i]
-            } else {
-                0.0
-            };
+            state.qd[i] = or_zero(cmd.target_qd[i]);
+            state.torques[i] = or_zero(cmd.target_torques[i]);
         }
         state.tcp_pose = pose_to_xyz_quat(&self.arm.fk(&q));
-        state.tcp_twist = cmd.target_twist;
-        state.wrench = cmd.target_wrench;
+        if moving {
+            state.tcp_twist = cmd.target_twist;
+            state.wrench = cmd.target_wrench;
+        }
         state.io_digital_in = cmd.io_digital_out_state;
+        state.io_analog_in = cmd.io_analog_out;
         state.gripper_width = cmd.gripper_target_width;
 
         state.write_to(state_buffer)?;
@@ -121,9 +131,31 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmDriver
             return Err(ArmError::BufferTooSmall);
         }
         let cmd = CoreCommand::read_from(cmd_buffer)?;
+        let mode = cmd
+            .active_mode()
+            .ok_or(ArmError::Fault("unknown control_mode"))?;
+        if !self.manifest.supports_mode(mode) {
+            return Err(ArmError::NotSupported);
+        }
         self.queue.pop_front();
         self.queue.push_back(cmd);
         Ok(())
+    }
+
+    fn handle_vendor_command(
+        &mut self,
+        cmd_name: &str,
+        payload: &[u8],
+        response: &mut [u8],
+    ) -> Result<usize, ArmError> {
+        if cmd_name != "echo" {
+            return Err(ArmError::NotSupported);
+        }
+        let out = response
+            .get_mut(..payload.len())
+            .ok_or(ArmError::BufferTooSmall)?;
+        out.copy_from_slice(payload);
+        Ok(payload.len())
     }
 
     fn arm(&self) -> &dyn ArmMath {

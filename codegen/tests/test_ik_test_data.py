@@ -66,7 +66,9 @@ class IkTestDataTests(unittest.TestCase):
             root = Path(tmp)
             (root / "codegen").mkdir()
             (root / "repos" / "dexhal" / "src" / "math").mkdir(parents=True)
-            (root / "SSIK_VERSION.txt").write_text("ssik==9.9.9\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                '[project]\ndependencies = ["ssik==9.9.9"]\n', encoding="utf-8"
+            )
             driver_dir = root / "repos" / "dexforge-ur" / "rust" / "src" / "drivers" / "ur5"
             ik_test_data.write_ik_test_data(
                 driver_dir=driver_dir,

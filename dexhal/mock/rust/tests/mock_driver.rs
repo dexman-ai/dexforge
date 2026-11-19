@@ -1,5 +1,8 @@
 use dexforge_mock_core::{MockArm, MockDriver, MANIFEST};
-use dexhal::math::{pose_to_xyz_quat, ArmDriver, ArmError, ArmModel, CoreCommand, CoreState};
+use dexhal::math::{
+    pose_to_xyz_quat, ActiveMode, Arm, ArmDriver, ArmError, ArmModel, CoreCommand, CoreState,
+    TolerancePolicy,
+};
 
 fn zero_latency() -> &'static str {
     let text = MANIFEST
@@ -18,6 +21,7 @@ fn zero_latency_driver() -> MockDriver<MockArm, 6, 1> {
 
 fn command(q: [f64; 6]) -> CoreCommand {
     let mut cmd = CoreCommand::IDLE;
+    cmd.control_mode = ActiveMode::JointPos.code();
     cmd.target_q[..6].copy_from_slice(&q);
     cmd
 }
@@ -108,6 +112,53 @@ fn nan_target_holds_last_joint_position() {
 }
 
 #[test]
+fn idle_holds_even_when_targets_are_set() {
+    let mut d = zero_latency_driver();
+    write(&mut d, &command([0.5; 6]));
+    assert_eq!(read(&mut d).q[0], 0.5);
+    let mut idle = command([1.0; 6]);
+    idle.control_mode = ActiveMode::Idle.code();
+    idle.target_qd[..6].copy_from_slice(&[0.3; 6]);
+    idle.target_wrench = [1.0; 6];
+    write(&mut d, &idle);
+
+    let s = read(&mut d);
+    assert_eq!(s.q[..6], [0.5; 6]);
+    assert_eq!(s.qd[..6], [0.0; 6]);
+    assert!(s.wrench.iter().all(|v| v.is_nan()));
+}
+
+#[test]
+fn unsupported_or_unknown_modes_are_rejected() {
+    let mut d = zero_latency_driver();
+    let mut buf = vec![f64::NAN; d.manifest().command_len()];
+    let mut cmd = command([0.0; 6]);
+    cmd.control_mode = ActiveMode::JointImpedance.code();
+    cmd.write_to(&mut buf).unwrap();
+    assert_eq!(d.write_command(&buf), Err(ArmError::NotSupported));
+
+    cmd.control_mode = 42.0;
+    cmd.write_to(&mut buf).unwrap();
+    assert!(matches!(d.write_command(&buf), Err(ArmError::Fault(_))));
+}
+
+#[test]
+fn vendor_echo_fills_the_response() {
+    let mut d = driver();
+    let mut response = [0u8; 8];
+    assert_eq!(d.handle_vendor_command("echo", b"abc", &mut response), Ok(3));
+    assert_eq!(&response[..3], b"abc");
+    assert_eq!(
+        d.handle_vendor_command("echo", &[0; 9], &mut response),
+        Err(ArmError::BufferTooSmall)
+    );
+    assert_eq!(
+        d.handle_vendor_command("reboot", &[], &mut response),
+        Err(ArmError::NotSupported)
+    );
+}
+
+#[test]
 fn qd_and_torques_pass_through_when_commanded() {
     let mut d = zero_latency_driver();
     let mut cmd = command([0.0; 6]);
@@ -131,12 +182,39 @@ fn tcp_pose_is_forward_kinematics_of_state_q() {
 }
 
 #[test]
+fn ik_polishes_the_seed_onto_the_target() {
+    let goal = [0.3, -0.7, 1.1, 0.2, -0.4, 0.9];
+    let seed = [0.35, -0.65, 1.05, 0.25, -0.45, 0.85];
+    let target = MockArm::flange_fk(&goal);
+    let policy = TolerancePolicy::DEFAULT;
+    let [Some(q)] = MockArm::flange_solve(&target, None, Some(&seed), true, true, policy, 0) else {
+        panic!("a nearby seed reaches the target");
+    };
+    assert!((MockArm::flange_fk(&q) - target).norm() < 1e-9);
+    for i in 0..6 {
+        assert!((q[i] - goal[i]).abs() < 1e-6, "joint {i}: {}", q[i]);
+    }
+    assert_eq!(
+        MockArm::flange_solve(&target, Some(0), Some(&seed), true, true, policy, 0),
+        [None]
+    );
+
+    // `Arm::ik_nearest` keeps its continuity bound on top of the polish.
+    let arm = Arm::<MockArm, 6, 1>::new();
+    assert!(arm.ik_nearest(&target, &seed, policy).is_some());
+    let mut unreachable = target;
+    unreachable[(0, 3)] = 10.0;
+    assert!(arm.ik_nearest(&unreachable, &seed, policy).is_none());
+}
+
+#[test]
 fn commanded_twist_wrench_io_and_gripper_are_reflected() {
     let mut d = zero_latency_driver();
     let mut cmd = command([0.0; 6]);
     cmd.target_twist = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
     cmd.target_wrench = [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0];
     cmd.io_digital_out_state = 5.0;
+    cmd.io_analog_out = [0.5, 1.0, 1.5, 2.0];
     cmd.gripper_target_width = 0.04;
     write(&mut d, &cmd);
 
@@ -144,6 +222,7 @@ fn commanded_twist_wrench_io_and_gripper_are_reflected() {
     assert_eq!(s.tcp_twist, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
     assert_eq!(s.wrench, [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0]);
     assert_eq!(s.io_digital_in, 5.0);
+    assert_eq!(s.io_analog_in, [0.5, 1.0, 1.5, 2.0]);
     assert_eq!(s.gripper_width, 0.04);
 }
 

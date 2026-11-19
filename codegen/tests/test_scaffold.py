@@ -18,7 +18,7 @@ sys.path.insert(0, str(_CODEGEN))
 import scaffold as S  # noqa: E402
 
 UR5_URDF = _REPO / "repos" / "dexforge-ur" / "rust" / "src" / "drivers" / "ur5" / "ur5.urdf"
-UR5_ARTIFACT = Path(ssik.__file__).resolve().parent / "prebuilt" / "ur5_ik.py"
+UR5_ARTIFACT = Path(ssik.__file__).resolve().parent / "prebuilt" / "universal_robots" / "ur5_ik.py"
 
 
 def test_render_requires_every_placeholder():
@@ -103,7 +103,7 @@ def test_scaffold_registers_the_arm(ur5_scaffold):
 def test_scaffold_manifest_draft(ur5_scaffold):
     text = ur5_scaffold.layout.manifest.read_text(encoding="utf-8")
     assert re.search(r"^driver: ur5\b", text, re.M)
-    assert 'version: "0.2"' in text
+    assert 'version: "0.3"' in text
     assert "velocity: [" + ", ".join(["3.141592653589793"] * 6) + "]" in text  # UR5e: pi rad/s
     assert "effort: [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]" in text
     assert "has_static_inertials: true" in text
@@ -125,6 +125,33 @@ def test_scaffold_keeps_existing_files_unless_forced(ur5_scaffold, tmp_path):
     lib = (lay.crate_dir / "src" / "lib.rs").read_text(encoding="utf-8")
     assert lib.count("pub use drivers::ur5::") == 1
     assert (lay.drivers_dir / "mod.rs").read_text(encoding="utf-8").count("pub mod ur5;") == 1
+
+
+def test_scaffold_writes_perf_test(ur5_scaffold):
+    lay = ur5_scaffold.layout
+    text = (lay.crate_dir / "tests" / "perf.rs").read_text(encoding="utf-8")
+    target = re.search(r'#\[path = "([^"]+)"\]', text).group(1)
+    assert (lay.crate_dir / "tests" / target).resolve() == (_REPO / "dexhal" / "perf" / "arm_timing.rs").resolve()
+    assert "use dexforge_ur_core::Ur5;" in text
+    assert "fn ur5_arm_timing()" in text
+    assert 'measure::<Ur5, 6, 16>("ur5");' in text
+    assert "--manifest-path repos/dexforge-ur/Cargo.toml" in text
+
+
+def test_perf_test_appends_each_arm_once(tmp_path):
+    values = {
+        "oem": "flexiv", "crate_ident": "dexforge_flexiv_core", "perf_harness": "../dexhal/perf/arm_timing.rs",
+        "arm": "rizon4", "struct_name": "Rizon4", "dof": 7, "max_solutions": 8,
+    }
+    path = tmp_path / "tests" / "perf.rs"
+    S._write_perf_test(path, values, [])
+    S._write_perf_test(path, {**values, "arm": "rizon10", "struct_name": "Rizon10"}, [])
+    S._write_perf_test(path, values, [])  # already present: no duplicate
+    text = path.read_text(encoding="utf-8")
+    assert text.count("#[path =") == 1
+    assert text.count("fn rizon4_arm_timing()") == 1
+    assert text.count("fn rizon10_arm_timing()") == 1
+    assert "measure::<Rizon10, 7, 8>(\"rizon10\");" in text
 
 
 def test_scaffold_rejects_mismatched_links(tmp_path):

@@ -41,7 +41,7 @@ Ask for any missing input rather than inventing hardware facts. Never edit
 ## Step 1 — ssik artifact and family
 
 ```sh
-python codegen/ik_test_data.py --check          # installed ssik == SSIK_VERSION.txt
+python codegen/ik_test_data.py --check          # installed ssik == pyproject.toml
 python codegen/ssik_artifact.py build --urdf <urdf> --base <base> --ee <ee> --out /tmp/<arm>_ik.py
 python codegen/ssik_artifact.py inspect /tmp/<arm>_ik.py --arm <arm>
 ```
@@ -70,8 +70,10 @@ python codegen/scaffold.py --oem <oem> --arm <arm> --urdf <urdf> --base <base> -
 Creates the vendor crate if missing, copies `<arm>.urdf` and
 `codegen/<arm>_ik.py` into `drivers/<arm>/` (building the artifact when
 `--artifact` is omitted), registers the arm in `drivers/mod.rs` / `lib.rs`, and
-writes `mod.rs`, `driver.rs` (stub), `manifest.yaml` (draft) and
-`codegen/generate_test_data.py`. It always regenerates `arm.rs`: the
+writes `mod.rs`, `driver.rs` (stub), `manifest.yaml` (draft),
+`codegen/generate_test_data.py` and `rust/tests/perf.rs`. The perf file is
+created once with the shared `dexhal/perf/arm_timing.rs` harness; each scaffolded
+arm appends its own `<arm>_arm_timing` test, skipped if already present. It always regenerates `arm.rs`: the
 `ArmModel` impl (`NAME`, `JOINT_LIMITS`, `HAS_DYNAMICS`, every `flange_*` hook)
 and `nominal_chain()`. Existing files are kept unless `--force`; use
 `--only arm.rs` after changing the URDF or artifact. Follow the printed
@@ -98,6 +100,12 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    Respect joint limits when asked, order nearest-first when `q_seed` is given,
    guard every `acos`/`asin`/`sqrt` domain edge, and include the reference arm's
    IK tests against `test_data.rs` (`#[cfg(test)] #[path = "test_data.rs"] mod test_data;`).
+   Joint-lock 7-DOF arms (categories 3–4) must hold the locked joint at the
+   seed's value on a seeded solve. Copy the reference arm's seeded early exit:
+   visit lock samples nearest-first to `q_seed[LOCKED_JOINT]`, polish each
+   sample's candidates with `seed_locked` as they are collected, and stop at the
+   first sample that closes. Fall back to the full sweep only if none does. Copy
+   the reference arm's `seeded_solve_keeps_the_seed_locked_joint` test too.
 2. **`codegen/generate_code.py`** (categories 2–4): adapt the reference arm's
    script so it reads `codegen/<arm>_ik.py` and writes `../consts.rs` / `../pq.rs`;
    add `pub mod consts;` / `pub mod pq;` to `mod.rs` if the scaffold did not.

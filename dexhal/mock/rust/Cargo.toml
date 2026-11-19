@@ -10,6 +10,8 @@ publish = false
 [lib]
 name = "dexforge_mock_core"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 dexhal = { path = "../.." }
+dexhal-plugin = { path = "../../plugin" }

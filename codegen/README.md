@@ -49,32 +49,31 @@ Each OEM lives in its own repository under `repos/dexforge-<oem>/` (with [`repos
 repos/dexforge-<oem>/
 ├── Cargo.toml
 ├── README.md
-├── rust/
-│   ├── Cargo.toml                              # Depends on dexhal, libm, nalgebra (no_std)
-│   ├── manifest.yaml                           # Validated by ArmManifest::from_text
-│   └── src/
-│       ├── lib.rs                              # Re-exports driver(s) and ArmModel(s)
-│       └── drivers/
-│           ├── mod.rs
-│           └── <arm>/
-│               ├── mod.rs                      # Declares arm, ik_solver, generated_*, driver, parity tests
-│               ├── arm.rs                      # impl dexhal::math::ArmModel<DOF, MAX> for <Arm>
-│               ├── driver.rs                   # impl dexhal::math::ArmDriver for <Arm>Driver
-│               ├── ik_solver.rs                # Agent-translated #![no_std] analytical IK + unit tests
-│               ├── consts.rs / pq.rs           # (Optional) Baked sub-chain / polynomial constants
-│               ├── generated_kinematics.rs     # SymPy-generated symbolic FK & geometric Jacobian
-│               ├── generated_dynamics.rs       # SymPy-generated gravity, mass_matrix, coriolis, inverse_dynamics
-│               ├── test_data.rs                # #![no_std] loader for IK reference test cases
-│               ├── test_data.bin               # Binary ssik IK ground-truth dataset (500 poses)
-│               ├── dynamics_parity.rs          # Pinocchio vs. SymPy dynamics parity test suite
-│               ├── dynamics_test_data.rs       # #![no_std] loader for Pinocchio golden dataset
-│               ├── dynamics_test_data.bin      # Binary Pinocchio RNEA/CRBA ground-truth dataset (1,000 states)
-│               ├── <arm>.urdf                  # Source URDF (provenance)
-│               └── codegen/
-│                   ├── <arm>_ik.py             # Source ssik Python artifact (provenance)
-│                   ├── generate_code.py        # (Optional) Emits ../consts.rs or ../pq.rs
-│                   └── generate_test_data.py   # Emits ../test_data.bin and ../test_data.rs
-└── python/                                     # (Optional) PyO3 bindings & shared ssik parity test suite
+└── rust/
+    ├── Cargo.toml                              # Depends on dexhal, libm, nalgebra (no_std)
+    ├── manifest.yaml                           # Validated by ArmManifest::from_text
+    └── src/
+        ├── lib.rs                              # Re-exports driver(s) and ArmModel(s)
+        └── drivers/
+            ├── mod.rs
+            └── <arm>/
+                ├── mod.rs                      # Declares arm, ik_solver, generated_*, driver, parity tests
+                ├── arm.rs                      # impl dexhal::math::ArmModel<DOF, MAX> for <Arm>
+                ├── driver.rs                   # impl dexhal::math::ArmDriver for <Arm>Driver
+                ├── ik_solver.rs                # Agent-translated #![no_std] analytical IK + unit tests
+                ├── consts.rs / pq.rs           # (Optional) Baked sub-chain / polynomial constants
+                ├── generated_kinematics.rs     # SymPy-generated symbolic FK & geometric Jacobian
+                ├── generated_dynamics.rs       # SymPy-generated gravity, mass_matrix, coriolis, inverse_dynamics
+                ├── test_data.rs                # #![no_std] loader for IK reference test cases
+                ├── test_data.bin               # Binary ssik IK ground-truth dataset (500 poses)
+                ├── dynamics_parity.rs          # Pinocchio vs. SymPy dynamics parity test suite
+                ├── dynamics_test_data.rs       # #![no_std] loader for Pinocchio golden dataset
+                ├── dynamics_test_data.bin      # Binary Pinocchio RNEA/CRBA ground-truth dataset (1,000 states)
+                ├── <arm>.urdf                  # Source URDF (provenance)
+                └── codegen/
+                    ├── <arm>_ik.py             # Source ssik Python artifact (provenance)
+                    ├── generate_code.py        # (Optional) Emits ../consts.rs or ../pq.rs
+                    └── generate_test_data.py   # Emits ../test_data.bin and ../test_data.rs
 ```
 
 All generated Rust in `drivers/<arm>/` (except host I/O in `driver.rs` when using OS sockets/SDKs) must be `#![no_std]`, `#![forbid(unsafe_code)]`, heap-free, and bounded-iteration.
@@ -86,7 +85,7 @@ All generated Rust in `drivers/<arm>/` (except host I/O in `driver.rs` when usin
 The master agent prompt guides the coding agent through four sequential phases to build and verify a new driver crate:
 
 ### Step 1: Generate and Inspect the `ssik` Artifact
-1. Verify the Python environment matches the locked `ssik` version in [`SSIK_VERSION.txt`](../SSIK_VERSION.txt).
+1. Verify the Python environment matches the locked `ssik` version in [`pyproject.toml`](../pyproject.toml).
 2. Run the `ssik` artifact builder against `<arm>.urdf` with `--base <base_link>` and `--ee <ee_link>` to produce `src/drivers/<arm>/codegen/<arm>_ik.py`:
    ```sh
    python codegen/ssik_artifact.py build --urdf <arm>.urdf --base <base_link> --ee <ee_link> --out <arm>_ik.py
@@ -104,13 +103,13 @@ The master agent prompt guides the coding agent through four sequential phases t
 1. **Analytical IK (`ik_solver.rs`):**
    - Following [`translate_ssik_artifact.md`](translate_ssik_artifact.md) and the selected reference arm's `ik_solver.rs`, translate the Python solver's constants and straight-line algebraic blocks into `#![no_std]` Rust.
    - Import and call shared numerical kernels directly from `dexhal::math` (`ssik_core`, `kinematics`, `postprocess`, `tolerances`). Never reimplement subproblem solvers, root finders, LM refinement, joint wrapping, or seed sorting.
-   - Ensure `solve()` respects joint limits when `respect_limits == true`, orders solutions nearest-first when `q_seed` is provided, and guards all `acos`/`asin`/`sqrt` domain boundaries without panicking.
+   - Ensure `solve()` respects joint limits when `respect_limits == true`, orders solutions nearest-first when `q_seed` is provided, and guards all `acos`/`asin`/`sqrt` domain boundaries without panicking. Joint-lock 7-DOF solvers hold the locked joint at the seed's value when `q_seed` is provided (`seed_locked` in the reference arms).
 2. **Hardware Driver (`driver.rs` & `manifest.yaml`):**
    - Place and validate `manifest.yaml` so `ArmManifest::from_text::<Model, DOF, MAX>(MANIFEST)` succeeds.
    - Implement `dexhal::math::ArmDriver` (`manifest`, `connect`, `disconnect`, `read_state`, `write_command`, `arm`, `arm_mut`) against the OEM hardware API documentation using zero-copy `CoreStateViewMut` and `CoreCommandView` buffer views.
 
 ### Step 3: Instantiate Per-Arm Codegen Scripts from Templates
-`codegen/scaffold.py` renders the templates in `codegen/templates/` (vendor crate skeleton, `mod.rs`, `driver.rs` stub, `manifest.yaml` draft with URDF velocity / effort limits, `codegen/generate_test_data.py`, and `arm.rs`). Then, using the selected reference arm's `codegen/` directory:
+`codegen/scaffold.py` renders the templates in `codegen/templates/` (vendor crate skeleton, `mod.rs`, `driver.rs` stub, `manifest.yaml` draft with URDF velocity / effort limits, `codegen/generate_test_data.py`, `rust/tests/perf.rs` IK/dynamics timing test, and `arm.rs`). Then, using the selected reference arm's `codegen/` directory:
 1. **`generate_code.py`** *(when required by the solver family)*:
    - For 7-DOF joint-lock arms (`franka_panda`, `xarm7`, `rizon4`, `rizon10`) or Raghavan-Roth / polynomial arms (`piper`), instantiate `src/drivers/<arm>/codegen/generate_code.py` to precompute and bake locked/reversed 6R sub-chain geometry or polynomial coefficient matrices into `../consts.rs` or `../pq.rs`.
 2. **`generate_test_data.py`** *(required for all arms)*:
@@ -204,12 +203,12 @@ In Python `ssik`, general 6R solvers (`ikgeo.general_6r`) fall back to a randomi
 
 ### `ssik` Version Locking
 
-All generated IK artifacts and `test_data.bin` files are locked to the `ssik` version in [`SSIK_VERSION.txt`](../SSIK_VERSION.txt):
+All generated IK artifacts and `test_data.bin` files are locked to the `ssik` version in [`pyproject.toml`](../pyproject.toml):
 ```sh
-pip install $(grep ssik SSIK_VERSION.txt)
+pip install .
 python codegen/ik_test_data.py --check
 ```
-See [`upgrade_ssik_version.md`](upgrade_ssik_version.md) when upgrading `SSIK_VERSION.txt`.
+See [`upgrade_ssik_version.md`](upgrade_ssik_version.md) when upgrading the `ssik` dependency in `pyproject.toml`.
 
 ---
 
@@ -221,11 +220,10 @@ See [`upgrade_ssik_version.md`](upgrade_ssik_version.md) when upgrading `SSIK_VE
 | `new_driver.md` | Master agent prompt: inputs, hard rules, and the four-step workflow with exact commands. |
 | `translate_ssik_artifact.md` | Prompt instructions for translating a `ssik` Python IK solver into `#![no_std]` Rust against `dexhal::math`. |
 | `ur5_dynamics_template.md` | Reference checklist and conventions for wiring symbolic dynamics and Pinocchio parity tests. |
-| `upgrade_ssik_version.md` | Runbook for upgrading the locked `ssik` version in `SSIK_VERSION.txt` and regenerating arm test data. |
+| `upgrade_ssik_version.md` | Runbook for upgrading the locked `ssik` version in `pyproject.toml` and regenerating arm test data. |
 | `ssik_artifact.py` | Deterministic `ssik` artifact builder / inspector: `build` (URDF $\rightarrow$ `<arm>_ik.py`), `inspect` (DOF, `MAX_SOLUTIONS`, joints, limits, solver family + reference arm), and the artifact $\rightarrow$ `KinematicChain` mapping. |
 | `scaffold.py` | Deterministic scaffolder: vendor crate skeleton, arm `mod.rs` / `driver.rs` / `manifest.yaml` / `codegen/generate_test_data.py` from `templates/`, and the always-regenerated `arm.rs` (`ArmModel`). |
 | `templates/` | Crate and script templates rendered by `scaffold.py` (`vendor/`, `arm/`). |
 | `generate_dynamics.py` | Deterministic SymPy compiler: `ssik` artifact + URDF `<inertial>` $\rightarrow$ `#![no_std]` Rust (`fk`, `jacobian`, `gravity`, `mass_matrix`, `coriolis`, `inverse_dynamics`) in `generated_dynamics.rs`, plus the `generated_kinematics.rs` re-export. |
 | `generate_dynamics_test_data.py` | Deterministic Pinocchio ground-truth generator: URDF $\rightarrow$ `dynamics_test_data.bin`, `dynamics_test_data.rs`, `dynamics_parity.rs`. |
 | `ik_test_data.py` | Shared binary packer/unpacker, `#![no_std]` Rust loader emitter, and monorepo arm-discovery helpers for `ssik` IK reference datasets (`test_data.bin`, `test_data.rs`). |
-| `_shared.py` | Pure-Python pose/joint/tolerance conversion helpers for optional Python bindings. |

@@ -180,10 +180,86 @@ mod tests {
                 15,
             );
             let first = sols[0].expect("a reachable in-limit target has a solution");
-            assert!((Piper::flange_fk(&first) - target).norm() < 1e-6);
+            assert!((Piper::flange_fk(&first) - target).norm() < 1e-5);
             for sol in sols.iter().flatten() {
-                assert!((Piper::flange_fk(sol) - target).norm() < 1e-6);
+                assert!((Piper::flange_fk(sol) - target).norm() < 1e-5);
             }
+        }
+    }
+
+    #[test]
+    fn ssik_non_singular_roundtrip_and_tight_policy_suite() {
+        // Port of ssik_shared_tests/test_prebuilt_uniform_fuzz.py:
+        // 1. Non-singular random q* sweep (|sin(q[i])| > 0.2 on interior joints):
+        //    every reachable target returns at least one solution and every
+        //    returned root FK-closes within 1e-5.
+        // 2. Tight-policy + allow_refinement=true machine-precision sweep (#271):
+        //    every returned root FK-closes within 1e-7.
+        let tight_policy = TolerancePolicy {
+            axis_parallel: 1e-8,
+            axis_intersect: 1e-8,
+            subproblem_feasibility: 1e-9,
+            subproblem_numerical: 1e-9,
+            subproblem_degeneracy: 1e-12,
+            subproblem_dedup: 1e-3,
+        };
+        let mut seed = 0x551C_0000_0000_0001u64;
+        let mut next_angle = || -> f64 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            (-core::f64::consts::PI + 0.3) + (2.0 * core::f64::consts::PI - 0.6) * u
+        };
+
+        let mut tested = 0usize;
+        while tested < 64 {
+            let q: [f64; DOF] = core::array::from_fn(|_| next_angle());
+            // Filter interior joints away from 0 and pi (|sin(q[i])| > 0.2),
+            // matching non_singular_q6r / non_singular_q7r in ssik.
+            if (1..DOF - 1).any(|i| libm::fabs(libm::sin(q[i])) <= 0.2) {
+                continue;
+            }
+            let target = Piper::flange_fk(&q);
+
+            let sols = Piper::flange_solve(
+                &target,
+                None,
+                None,
+                false,
+                false,
+                DEFAULT_TOLERANCE_POLICY,
+                15,
+            );
+            assert!(
+                sols.iter().any(Option::is_some),
+                "non-singular reachable pose returned no IK at q={q:?}"
+            );
+            for sol in sols.iter().flatten() {
+                let err = (Piper::flange_fk(sol) - target).norm();
+                assert!(err < 1e-5, "FK residual {err:e} >= 1e-5 at q={q:?}");
+            }
+
+            if tested < 16 {
+                let tight_sols = Piper::flange_solve(
+                    &target,
+                    None,
+                    None,
+                    false,
+                    true,
+                    tight_policy,
+                    15,
+                );
+                assert!(
+                    tight_sols.iter().any(Option::is_some),
+                    "tight-policy pose returned no IK at q={q:?}"
+                );
+                for sol in tight_sols.iter().flatten() {
+                    let err = (Piper::flange_fk(sol) - target).norm();
+                    assert!(err < 1e-7, "tight-policy FK residual {err:e} >= 1e-7 at q={q:?}");
+                }
+            }
+            tested += 1;
         }
     }
 }

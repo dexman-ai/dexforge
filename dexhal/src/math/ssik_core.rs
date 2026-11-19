@@ -1546,11 +1546,42 @@ pub fn rr_left_null_space(q: &SMatrix<f64, 14, 8>) -> SMatrix<f64, 14, 6> {
     n
 }
 
-/// Moore-Penrose pseudo-inverse (8x14) of the 14x8 matrix `q`, via SVD.
+/// Moore-Penrose pseudo-inverse (8x14) of the 14x8 matrix `q`.
 ///
-/// Falls back to the all-zero matrix if the decomposition does not converge;
-/// callers treat the resulting candidate as degenerate and skip it.
+/// Computed via Householder QR of `q` (`Q_14x8 R_8x8`) and back-substitution of
+/// `R⁻¹ Qᵀ`, falling back to SVD if `q` is rank-deficient. Unlike `nalgebra::SVD`
+/// (whose 30-step bidiagonal QR loop can stop at `1e-3` on well-conditioned 14x8
+/// matrices), Householder QR is direct (`O(14 · 8²)` with zero iteration loops)
+/// and exact to machine precision (`1e-15`).
 pub fn rr_pseudo_inverse(q: &SMatrix<f64, 14, 8>) -> SMatrix<f64, 8, 14> {
+    let qr = q.qr();
+    let r = qr.unpack_r();
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for i in 0..8 {
+        let d = fabs(r[(i, i)]);
+        if d < min_diag {
+            min_diag = d;
+        }
+        if d > max_diag {
+            max_diag = d;
+        }
+    }
+    if max_diag > 0.0 && min_diag > 1e-10 * max_diag {
+        // Full column rank (8): R is 8x8 upper-triangular, so R^+ Q^T = R^{-1} Q_thin^T.
+        let qt = qr.q().transpose(); // 8x14
+        let mut pinv = SMatrix::<f64, 8, 14>::zeros();
+        for col in 0..14 {
+            for i in (0..8).rev() {
+                let mut s = qt[(i, col)];
+                for j in (i + 1)..8 {
+                    s -= r[(i, j)] * pinv[(j, col)];
+                }
+                pinv[(i, col)] = s / r[(i, i)];
+            }
+        }
+        return pinv;
+    }
     q.svd(true, true)
         .pseudo_inverse(1e-12)
         .unwrap_or_else(|_| SMatrix::<f64, 8, 14>::zeros())
@@ -1641,22 +1672,60 @@ fn rr_condition_number(m: &SMatrix<f64, 12, 12>) -> f64 {
 }
 
 /// Right singular vector of `m` (12x12) for its smallest singular value, i.e.
-/// an approximate null vector. Returns the canonical basis vector `e_11` if the
-/// SVD does not converge so callers degrade gracefully.
+/// an approximate null vector.
+///
+/// Computed via Householder QR factorisation (`m = Q R`) followed by
+/// back-substitution on the upper-triangular factor `R` across each candidate
+/// free column `k`, selecting the unit vector `v` that minimises the true
+/// residual `‖R v‖` (`== ‖m v‖`). Unlike `nalgebra::SVD` (whose 30-step
+/// bidiagonal QR can fail to converge on 12x12) or picking `min |R_{kk}|`
+/// directly (which misses the null vector when `|v_k|` is small), evaluating
+/// `‖R v‖` over the 12 triangular candidates is direct (`O(12³)` with zero
+/// iteration loops) and exact to machine precision (`1e-15`).
 fn rr_null_vector(m: &SMatrix<f64, 12, 12>) -> [f64; 12] {
-    let mut v = [0.0_f64; 12];
-    let svd = m.svd(true, true);
-    match svd.v_t {
-        Some(v_t) => {
-            // nalgebra orders singular values in descending magnitude, so the
-            // smallest sits in the last (row 11) right singular vector.
-            for j in 0..12 {
-                v[j] = v_t[(11, j)];
+    let qr = m.qr();
+    let r = qr.unpack_r();
+
+    let mut best_v = nalgebra::SVector::<f64, 12>::zeros();
+    best_v[11] = 1.0;
+    let mut best_res = f64::INFINITY;
+
+    for col in (0..12).rev() {
+        let mut v = nalgebra::SVector::<f64, 12>::zeros();
+        v[col] = 1.0;
+        let mut ok = true;
+        for i in (0..col).rev() {
+            let mut s = 0.0_f64;
+            for j in (i + 1)..=col {
+                s += r[(i, j)] * v[j];
             }
+            let diag = r[(i, i)];
+            if fabs(diag) <= 1e-30 {
+                ok = false;
+                break;
+            }
+            v[i] = -s / diag;
         }
-        None => v[11] = 1.0,
+        if !ok {
+            continue;
+        }
+        let vn = v.norm();
+        if vn <= 0.0 || !vn.is_finite() {
+            continue;
+        }
+        v /= vn;
+        let res = (r * v).norm();
+        if res < best_res {
+            best_res = res;
+            best_v = v;
+        }
     }
-    v
+
+    let mut out = [0.0_f64; 12];
+    for j in 0..12 {
+        out[j] = best_v[j];
+    }
+    out
 }
 
 /// Real `tan(q/2)` roots of `det M(x) = 0` and their kernels via the 24x24

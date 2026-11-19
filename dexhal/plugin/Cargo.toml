@@ -1,0 +1,14 @@
+[package]
+name = "dexhal-plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Stable C-ABI boundary for loading dexhal drivers as dynamic libraries."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexhal_plugin"
+path = "src/lib.rs"
+
+[dependencies]
+dexhal = { path = ".." }

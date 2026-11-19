@@ -1,0 +1,7 @@
+
+#[test]
+#[ignore = "perf: run with --release --ignored --nocapture"]
+fn {{arm}}_arm_timing() {
+    use {{crate_ident}}::{{struct_name}};
+    arm_timing::measure::<{{struct_name}}, {{dof}}, {{max_solutions}}>("{{arm}}");
+}

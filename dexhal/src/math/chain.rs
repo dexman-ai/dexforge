@@ -115,8 +115,25 @@ pub(crate) fn rotation_about(axis: &[f64; 3], angle: f64) -> Transform {
     }
 }
 
-/// Rotation vector of `a · bᵀ` (the base-frame rotation taking `b` to `a`).
-pub(crate) fn rotation_error(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [f64; 3] {
+/// Exponential map `exp([w]×)` of a 3-D rotation vector `w` (axis × angle, rad).
+pub fn rotation_exp(w: &[f64; 3]) -> [[f64; 3]; 3] {
+    let angle = libm::sqrt(dot3(w, w));
+    if angle < ROT_LOG_SMALL {
+        let (wx, wy, wz) = (w[0], w[1], w[2]);
+        let (xx, yy, zz) = (wx * wx, wy * wy, wz * wz);
+        let (xy, xz, yz) = (wx * wy, wx * wz, wy * wz);
+        return [
+            [1.0 - 0.5 * (yy + zz), -wz + 0.5 * xy, wy + 0.5 * xz],
+            [wz + 0.5 * xy, 1.0 - 0.5 * (xx + zz), -wx + 0.5 * yz],
+            [-wy + 0.5 * xz, wx + 0.5 * yz, 1.0 - 0.5 * (xx + yy)],
+        ];
+    }
+    let inv = 1.0 / angle;
+    rotation_matrix(&[w[0] * inv, w[1] * inv, w[2] * inv], angle)
+}
+
+/// Rotation vector `log(a · bᵀ)` (the base-frame rotation taking `b` to `a`).
+pub fn rotation_error(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [f64; 3] {
     let e = mat3_mul(a, &mat3_transpose(b));
     let w = [
         0.5 * (e[2][1] - e[1][2]),
@@ -124,16 +141,47 @@ pub(crate) fn rotation_error(a: &[[f64; 3]; 3], b: &[[f64; 3]; 3]) -> [f64; 3] {
         0.5 * (e[1][0] - e[0][1]),
     ];
     let sin_t = libm::sqrt(dot3(&w, &w));
+    let cos_t = (0.5 * (e[0][0] + e[1][1] + e[2][2] - 1.0)).clamp(-1.0, 1.0);
+    if cos_t < 0.0 {
+        // Angle above π/2: `w / sin θ` loses precision towards π, so take the
+        // axis from the symmetric part (e + eᵀ)/2 = cos θ I + (1 − cos θ) u uᵀ
+        // and its sign from `w`.
+        let denom = 1.0 - cos_t;
+        let d0 = ((e[0][0] - cos_t) / denom).max(0.0);
+        let d1 = ((e[1][1] - cos_t) / denom).max(0.0);
+        let d2 = ((e[2][2] - cos_t) / denom).max(0.0);
+        let mut u = if d0 >= d1 && d0 >= d2 {
+            let ux = libm::sqrt(d0).max(ROT_LOG_SMALL);
+            let s = 2.0 * denom * ux;
+            [ux, (e[0][1] + e[1][0]) / s, (e[0][2] + e[2][0]) / s]
+        } else if d1 >= d2 {
+            let uy = libm::sqrt(d1).max(ROT_LOG_SMALL);
+            let s = 2.0 * denom * uy;
+            [(e[0][1] + e[1][0]) / s, uy, (e[1][2] + e[2][1]) / s]
+        } else {
+            let uz = libm::sqrt(d2).max(ROT_LOG_SMALL);
+            let s = 2.0 * denom * uz;
+            [(e[0][2] + e[2][0]) / s, (e[1][2] + e[2][1]) / s, uz]
+        };
+        let un = libm::sqrt(dot3(&u, &u));
+        if un > ROT_LOG_SMALL {
+            u = [u[0] / un, u[1] / un, u[2] / un];
+        }
+        if dot3(&u, &w) < 0.0 {
+            u = [-u[0], -u[1], -u[2]];
+        }
+        let theta = libm::atan2(sin_t, cos_t);
+        return [u[0] * theta, u[1] * theta, u[2] * theta];
+    }
     if sin_t < ROT_LOG_SMALL {
         return w;
     }
-    let cos_t = 0.5 * (e[0][0] + e[1][1] + e[2][2] - 1.0);
     let k = libm::atan2(sin_t, cos_t) / sin_t;
     [w[0] * k, w[1] * k, w[2] * k]
 }
 
 /// Pose error twist `[Δp; Δθ]` taking `current` to `target`, in the base frame.
-pub(crate) fn pose_error(target: &Transform, current: &Transform) -> [f64; 6] {
+pub fn pose_error(target: &Transform, current: &Transform) -> [f64; 6] {
     let w = rotation_error(&target.r, &current.r);
     [
         target.t[0] - current.t[0],
@@ -143,6 +191,74 @@ pub(crate) fn pose_error(target: &Transform, current: &Transform) -> [f64; 6] {
         w[1],
         w[2],
     ]
+}
+
+/// Apply a base-axes twist offset `[Δp; Δθ]` to `pose`: translate by `Δp`,
+/// and left-multiply rotation by `exp([Δθ]×)`.
+pub fn se3_offset(pose: &Transform, offset: &[f64; 6]) -> Transform {
+    let dr = rotation_exp(&[offset[3], offset[4], offset[5]]);
+    Transform {
+        r: mat3_mul(&dr, &pose.r),
+        t: [
+            pose.t[0] + offset[0],
+            pose.t[1] + offset[1],
+            pose.t[2] + offset[2],
+        ],
+    }
+}
+
+/// Straight-line translation and shortest-arc geodesic rotation between `a` and `b`.
+pub fn se3_lerp(a: &Transform, b: &Transform, u: f64) -> Transform {
+    let w = rotation_error(&b.r, &a.r);
+    let dr = rotation_exp(&[w[0] * u, w[1] * u, w[2] * u]);
+    Transform {
+        r: mat3_mul(&dr, &a.r),
+        t: [
+            a.t[0] + u * (b.t[0] - a.t[0]),
+            a.t[1] + u * (b.t[1] - a.t[1]),
+            a.t[2] + u * (b.t[2] - a.t[2]),
+        ],
+    }
+}
+
+/// Euclidean translation distance (m) and geodesic rotation angle (rad) between `a` and `b`.
+pub fn se3_distance(a: &Transform, b: &Transform) -> (f64, f64) {
+    let dp = [b.t[0] - a.t[0], b.t[1] - a.t[1], b.t[2] - a.t[2]];
+    let w = rotation_error(&b.r, &a.r);
+    (libm::sqrt(dot3(&dp, &dp)), libm::sqrt(dot3(&w, &w)))
+}
+
+/// Transform a 3-D point by `t`: `R · p + t`.
+#[inline]
+pub fn transform_point(t: &Transform, p: &[f64; 3]) -> [f64; 3] {
+    let rp = mat3_vec(&t.r, p);
+    [rp[0] + t.t[0], rp[1] + t.t[1], rp[2] + t.t[2]]
+}
+
+/// Inverse-transform a 3-D point by `t`: `Rᵀ · (p − t)`.
+#[inline]
+pub fn inverse_transform_point(t: &Transform, p: &[f64; 3]) -> [f64; 3] {
+    let d = [p[0] - t.t[0], p[1] - t.t[1], p[2] - t.t[2]];
+    mat3_mul_transpose_vec(&t.r, &d)
+}
+
+#[inline]
+fn mat3_mul_transpose_vec(r: &[[f64; 3]; 3], v: &[f64; 3]) -> [f64; 3] {
+    [
+        r[0][0] * v[0] + r[1][0] * v[1] + r[2][0] * v[2],
+        r[0][1] * v[0] + r[1][1] * v[1] + r[2][1] * v[2],
+        r[0][2] * v[0] + r[1][2] * v[1] + r[2][2] * v[2],
+    ]
+}
+
+/// Build a [`Transform`] directly from wire pose `[x, y, z, qx, qy, qz, qw]`.
+pub fn transform_from_xyz_quat(p: &[f64; 7]) -> Result<Transform, ModelError> {
+    pose_from_xyz_quat(p).map(|m| transform_of(&m))
+}
+
+/// Convert a [`Transform`] to wire pose `[x, y, z, qx, qy, qz, qw]` (`qw ≥ 0`).
+pub fn transform_to_xyz_quat(t: &Transform) -> [f64; 7] {
+    pose_to_xyz_quat(&transform_to_pose(t))
 }
 
 /// Build a pose from `[x, y, z, qx, qy, qz, qw]` (the quaternion is normalised).

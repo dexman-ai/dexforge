@@ -9,8 +9,10 @@ is replaced by MuJoCo. See ``tools/SIM_SPEC.md``.
 Each control cycle (``1 / control_freq_hz``):
 
 1. the latest command is pushed through a ``command_dispatch_cycles`` delay queue;
-2. the applied command picks a mode: cartesian pose (generated IK, nearest to the
-   current branch), joint position, or joint velocity;
+2. the applied command's ``control_mode`` selects the mode: cartesian pose
+   (generated IK, nearest to the current branch), joint position, joint velocity,
+   or idle (hold). Modes the manifest does not offer, unknown codes and
+   non-finite targets are rejected at ``write_command``, like the mock driver;
 3. a reference is slewed toward the target within the manifest velocity and
    acceleration limits (accelerate, cruise, brake to arrive);
 4. torque = generated gravity compensation + PD tracking, clamped to the effort
@@ -45,7 +47,6 @@ FAULT_NONE = 0.0
 FAULT_IK_NO_SOLUTION = 1.0
 FAULT_IK_STEP_TOO_LARGE = 2.0
 FAULT_OUT_OF_LIMITS = 3.0
-FAULT_UNSUPPORTED = 4.0
 
 ROBOT_MODE_RUNNING = 7.0  # UR convention
 
@@ -54,7 +55,8 @@ _ARMS = {
     "ur5": ("dexforge_ur", "ur5", [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]),
 }
 
-_UNSUPPORTED_COMMAND_FIELDS = ("target_torques", "target_twist", "target_wrench")
+# command mode -> the target field it needs (finite), for the modes this sim executes
+_MODE_TARGET = {"joint_pos": "target_q", "joint_vel": "target_qd", "cartesian_pose": "target_pose"}
 
 
 class SimDriver:
@@ -85,6 +87,8 @@ class SimDriver:
         self.dt = 1.0 / float(m["control_freq_hz"])
         self._state_layout = self._mod.state_layout()
         self._cmd_layout = self._mod.command_layout()
+        self._modes = {code: name for name, code in self._math.control_modes().items()}  # code -> name
+        self._mode_code = self._math.control_modes()
         self._qmin = np.array(m["joint_limits_min"])
         self._qmax = np.array(m["joint_limits_max"])
         self._vmax = np.array(m["velocity_limits"])
@@ -156,12 +160,37 @@ class SimDriver:
         self._connected = False
 
     def write_command(self, buf) -> None:
-        """Latch a command buffer (``CoreCommand`` layout). Never steps physics."""
+        """Latch a command buffer (``CoreCommand`` layout). Never steps physics.
+
+        Raises ``ValueError`` for an unknown ``control_mode`` or a non-finite target of the
+        selected mode, and ``NotImplementedError`` for a mode the manifest does not offer
+        (the contract's ``Fault`` / ``NotSupported``).
+        """
         buf = np.asarray(buf, dtype=float)
-        if buf.size < self._manifest["command_len"]:
-            raise ValueError(f"command buffer too small: {buf.size} < {self._manifest['command_len']}")
+        n = self._manifest["command_len"]
+        if buf.size < n:
+            raise ValueError(f"command buffer too small: {buf.size} < {n}")
+        buf = buf[:n].copy()
+        self._mode_name(buf)  # validates
         with self._lock:
-            self._latest_cmd = buf[: self._manifest["command_len"]].copy()
+            self._latest_cmd = buf
+
+    def _mode_name(self, cmd: np.ndarray) -> str:
+        """Decode and validate ``control_mode``; return its name (``idle`` for NaN)."""
+        code = float(self._field(cmd, "control_mode")[0])
+        if math.isnan(code):
+            return "idle"
+        name = self._modes.get(code)
+        if name is None:
+            raise ValueError(f"unknown control_mode {code!r}")
+        if not self._math.supports_mode(code):
+            raise NotImplementedError(f"control mode {name!r} is not supported by the manifest")
+        if name not in _MODE_TARGET:
+            raise NotImplementedError(f"control mode {name!r} is not implemented by the simulator")
+        target = self._field(cmd, _MODE_TARGET[name])
+        if not np.isfinite(target[: 7 if name == "cartesian_pose" else self.dof]).all():
+            raise ValueError(f"{_MODE_TARGET[name]} must be finite in control mode {name!r}")
+        return name
 
     def read_state(self, buf) -> None:
         """Fill ``buf`` (``CoreState`` layout) with the most recent completed cycle's state."""
@@ -255,28 +284,23 @@ class SimDriver:
 
     def _update_reference(self, cmd: np.ndarray) -> float:
         """Advance ``q_ref`` / ``qd_ref`` for the applied command; return the fault code."""
-        if any(np.isfinite(self._field(cmd, f)).any() for f in _UNSUPPORTED_COMMAND_FIELDS):
-            return FAULT_UNSUPPORTED
-
-        pose = self._field(cmd, "target_pose")[:7]
-        tq = self._field(cmd, "target_q")[: self.dof]
-        tqd = self._field(cmd, "target_qd")[: self.dof]
+        mode = self._mode_name(cmd)
+        n = self.dof
         target: Optional[np.ndarray] = None
 
-        if np.isfinite(pose).all():  # cartesian_pose: generated IK on the current branch
-            target_or_fault = self._solve_pose(pose)
+        if mode == "cartesian_pose":  # generated IK on the current branch
+            target_or_fault = self._solve_pose(self._field(cmd, "target_pose")[:7])
             if isinstance(target_or_fault, float):
                 return target_or_fault
             target = target_or_fault
-        elif np.isfinite(tq).all():  # joint_pos
-            target = np.array(tq)
-        elif np.isfinite(tqd).all():  # joint_vel: accelerate the reference toward the velocity
-            n = self.dof
-            v_des = np.clip(tqd, -self._vmax[:n], self._vmax[:n])
+        elif mode == "joint_pos":
+            target = np.array(self._field(cmd, "target_q")[:n])
+        elif mode == "joint_vel":  # accelerate the reference toward the velocity
+            v_des = np.clip(self._field(cmd, "target_qd")[:n], -self._vmax[:n], self._vmax[:n])
             self._advance(v_des)
             return FAULT_NONE
-        else:  # nothing commanded: hold
-            self._advance(np.zeros(self.dof))
+        else:  # idle: hold
+            self._advance(np.zeros(n))
             return FAULT_NONE
 
         if (target < self._qmin[: self.dof] - 1e-9).any() or (target > self._qmax[: self.dof] + 1e-9).any():

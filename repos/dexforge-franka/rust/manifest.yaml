@@ -8,7 +8,7 @@
 # specification (the manifest does not parse until they are).
 
 driver: franka_panda               # must equal FrankaPanda::NAME
-version: "0.2"
+version: "0.3"
 control_freq_hz: 1000         # rate at which the controller expects commands
 control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose, cartesian_twist]
 realtime: true
@@ -34,8 +34,10 @@ native:
   cartesian_impedance: true
   cartesian_admittance: false
   joint_impedance: true
-  joint_admittance: false
   contact_detection: true
   reflexes: true
   payload: true
   tcp_offset: true
+  gravity_compensation: false
+  realtime_mode_switch: false
+  nullspace_posture: false

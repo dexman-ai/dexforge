@@ -37,6 +37,7 @@ class Client:
         self.drv, self._wait = drv, wait
         mod = importlib.import_module(S._ARMS[drv.arm][0])
         self._cmd, self._st = mod.command_layout(), mod.state_layout()
+        self._codes = getattr(mod, drv.arm).control_modes()
         self._fk_pose = getattr(mod, drv.arm).fk_pose
         self._buf = np.full(drv.manifest()["state_len"], np.nan)
 
@@ -46,7 +47,9 @@ class Client:
         return self._buf[off : off + n]
 
     def send(self, field: str, values) -> None:
+        mode = {"target_q": "joint_pos", "target_qd": "joint_vel", "target_pose": "cartesian_pose"}[field]
         c = self.drv.idle_command()
+        c[self._cmd["control_mode"][0]] = self._codes[mode]
         off, _ = self._cmd[field]
         c[off : off + len(values)] = values
         self.drv.write_command(c)

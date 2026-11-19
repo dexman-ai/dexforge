@@ -8,7 +8,7 @@
 # unit tests, so it always matches the parser.
 
 driver: six-r                 # required; must equal the model's ArmModel::NAME
-version: "0.2"                # required; contract version the driver targets
+version: "0.3"                # required; contract version the driver targets
 control_freq_hz: 500          # required; rate at which the hardware expects commands
 control_modes: [joint_pos, joint_vel, cartesian_pose]   # required; natively executed targets:
                               #   joint_pos, joint_vel, joint_torque,
@@ -18,6 +18,9 @@ realtime: true                # optional (false); the driver needs a real-time t
 latency:                      # required; delays measured in control cycles
   state_staleness_cycles: 1   #   hardware sampling its state -> read_state returning
   command_dispatch_cycles: 2  #   write_command returning -> hardware acting
+  hardware_watchdog_ms: 20    #   optional; timeout of the hardware command-stream
+                              #   watchdog armed in connect(). Omit when there is
+                              #   none (the driver never runs a software watchdog)
 
 limits:
   # Required, one value per joint, finite and > 0. Take them from the URDF
@@ -32,24 +35,58 @@ limits:
   # continuous joint.
   position_min: [-3.0, -6.2, -6.2, -6.2, -6.2, -.inf] # rad
   position_max: [3.0, 6.2, 6.2, 6.2, 6.2, .inf]
+  # Optional; TCP bounds [linear, angular], finite and > 0.
+  cartesian_velocity: [1.0, 3.0]        # m/s, rad/s
+  cartesian_acceleration: [5.0, 15.0]   # m/s^2, rad/s^2
 
-has_static_inertials: true    # optional (ArmModel::HAS_DYNAMICS); false when static URDF
-                              # inertials are unavailable or unsuitable for HostImpedance
+has_static_inertials: true    # optional (ArmModel::HAS_DYNAMICS; must be false when !HAS_DYNAMICS);
+                              # false when static URDF inertials are unsuitable for HostImpedance (Route 3)
+has_residual_inertials: true  # optional (defaults to has_static_inertials; must be false when !HAS_DYNAMICS);
+                              # true allows torque-residual admittance (Route 6) even when has_static_inertials is false
+dynamics_source: model        # optional (model); vendor (or aux) uses gravity_torque (DOF),
+                              # coriolis_torque (DOF) and mass_matrix (DOF*DOF) passed through in aux
 
 sensing:                      # optional section; every key defaults to false
   torque: true                #   joint torques (native or from motor currents)
   wrench: false               #   6-axis force/torque sensor at the wrist
   gripper: false              #   integrated gripper on the same bus
+  # Optional, per joint, finite and non-zero: CoreState.torques carries raw
+  # motor current / effort and link torque = value * factor (k_t * gear ratio).
+  # Omit when the driver reports link-side N*m.
+  torque_constants: [12.0, 12.0, 12.0, 3.1, 3.1, 3.1]
+  # Optional; frame of CoreState.wrench: base (TCP origin, base axes; default),
+  # flange (flange origin and axes: a wrist sensor as mounted) or tcp
+  # (TCP origin and axes).
+  wrench_frame: flange
+  wrench_is_gravity_compensated: false  # optional; the sensor already removes tool weight
 
 native:                       # optional section; every key defaults to false
   cartesian_impedance: false  #   features the robot controller executes itself;
   cartesian_admittance: true  #   the kernel computes whatever is false here
   joint_impedance: false
-  joint_admittance: false
   contact_detection: false
   reflexes: false
   payload: true               #   controller accepts set_payload
   tcp_offset: true            #   controller accepts set_tcp_offset
+  gravity_compensation: true  #   in joint_torque the controller adds its own gravity
+                              #   (and friction) compensation; the kernel sends only
+                              #   task torque. false: the kernel sends total torque
+  realtime_mode_switch: false #   ActiveMode may change between cycles while moving;
+                              #   false: the kernel switches only at rest
+  nullspace_posture: false    #   native Cartesian compliance takes target_q (+ joint
+                              #   gains) as the null-space posture of a redundant arm
+
+compliance:                   # optional; stability bounds of the native compliance,
+                              #   [X, Y, Z, RX, RY, RZ], finite and > 0. Each key
+                              #   omitted falls back to the kernel's latency defaults
+  max_stiffness_k: [3000.0, 3000.0, 3000.0, 300.0, 300.0, 300.0]  # N/m, N*m/rad
+  min_damping_b: [10.0, 10.0, 10.0, 1.0, 1.0, 1.0]                # N*s/m, N*m*s/rad
+  min_mass_m: [0.5, 0.5, 0.5, 0.05, 0.05, 0.05]                    # kg, kg*m^2
+  max_wrench: [80.0, 80.0, 80.0, 10.0, 10.0, 10.0]                # N, N*m
+
+gripper:                      # optional; integrated gripper range
+  max_width: 0.085            #   m
+  max_force: 140.0            #   N
 
 aux:                          # optional; fields following CoreState in the state buffer
   - name: motor_temp

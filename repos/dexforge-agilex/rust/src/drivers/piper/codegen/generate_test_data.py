@@ -6,7 +6,7 @@ Strategy (mirrors the issue's verification requirements):
 1. Sample 500 distinct, valid target SE(3) poses by running the reference
    forward kinematics on random in-limit joint vectors. **Every** sampled
    multi-solution pose is kept — the dataset is not filtered down.
-2. Run the reference solver ``codegen/piper_ik.py``'s ``solve(T,
+2. Run the reference solver ``ssik.prebuilt.piper_ik.solve(T,
    respect_limits=False)`` on each pose and the Rust driver
    (via the ``piper_solve`` example harness) on the same poses.
 3. Pick the golden solution set per pose:
@@ -43,16 +43,13 @@ Run from the repository root:
 
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
 import sys
 
 import numpy as np
+from ssik.prebuilt import piper_ik as P
 
 _DRIVER_DIR = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location("piper_ik", _DRIVER_DIR / "codegen" / "piper_ik.py")
-P = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(P)
 _REPO_ROOT = _DRIVER_DIR.parents[5]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -68,38 +65,32 @@ SEED = 7
 REPRO_TOL = 1e-6
 
 
-def _rust_solutions(poses):
-    """Run every pose through dexforge_agilex Python bindings.
+def _is_singular(t, ref_false, ref_true) -> bool:
+    """Classify *t* as singular/near-singular using only ``ssik``.
 
-    Returns a list (one per input pose) of lists of 6-vectors.
+    A pose is marked singular when:
+    - ``allow_refinement=True`` recovers additional branches beyond the
+      unrefined ``allow_refinement=False`` pass, or shifts any root by more
+      than ``REPRO_TOL``, or
+    - the raw algebraic pass produced candidates that failed the ``fk_atol``
+      gate or landed near the closure threshold (``> 2e-7``), where bounded
+      Francis-QR and LAPACK can resolve near-double eigenvalues differently.
     """
-    try:
-        import dexforge_agilex
-    except ImportError as e:
-        raise RuntimeError(
-            "dexforge_agilex is not importable. Install the OEM bindings first, "
-            "for example: cd repos/dexforge-agilex/python && maturin develop --release"
-        ) from e
-
-    out = []
-    for t in poses:
-        # dexforge_agilex.piper.solve expects 4x4 matrix (numpy array or list of lists)
-        sols = dexforge_agilex.piper.solve(t, respect_limits=False)
-        # Convert to list of numpy arrays
-        out.append([np.array(q, dtype=np.float64) for q in sols])
-    return out
-
-
-def _reproduces(ref, mine, tol=REPRO_TOL):
-    if len(mine) != len(ref):
-        return False
-    for r in ref:
+    if len(ref_false) != len(ref_true):
+        return True
+    cands = P._solve_algebraic(t)
+    if len(cands) > len(ref_false):
+        return True
+    if any(s.fk_residual > 2e-7 for s in ref_false):
+        return True
+    for r in ref_false:
         err = min(
-            float(np.max(np.abs(((r - m + np.pi) % (2 * np.pi)) - np.pi))) for m in mine
+            float(np.max(np.abs(((r.q - m.q + np.pi) % (2 * np.pi)) - np.pi)))
+            for m in ref_true
         )
-        if err > tol:
-            return False
-    return True
+        if err > REPRO_TOL:
+            return True
+    return False
 
 
 def main() -> None:
@@ -109,19 +100,17 @@ def main() -> None:
     for _ in range(N_POSES):
         q = np.array([rng.uniform(lo, hi) for lo, hi in lims])
         t = P._fk(q)
-        ref_false = [s.q for s in P.solve(t, respect_limits=False)]
+        ref_false = P.solve(t, respect_limits=False, allow_refinement=False)
         if len(ref_false) <= 1:
             continue
         candidates.append((q, t, ref_false))
 
-    poses = [t for _, t, _ in candidates]
-    rust = _rust_solutions(poses)
-
     cases = []
     singular = 0
-    for (q, t, ref_false), mine in zip(candidates, rust):
-        if _reproduces(ref_false, mine):
-            sols = [list(map(float, s)) for s in ref_false]
+    for q, t, ref_false in candidates:
+        ref_true = P.solve(t, respect_limits=False, allow_refinement=True)
+        if not _is_singular(t, ref_false, ref_true):
+            sols = [list(map(float, s.q)) for s in ref_false]
             cases.append(
                 IKCase(
                     q_fk=q.tolist(),
@@ -133,8 +122,7 @@ def main() -> None:
         else:
             # Singular pose: compare against the complete `allow_refinement=True`
             # set in FK-residual space with a relaxed joint tolerance.
-            ref_true = [s.q for s in P.solve(t, respect_limits=False, allow_refinement=True)]
-            sols = [list(map(float, s)) for s in ref_true]
+            sols = [list(map(float, s.q)) for s in ref_true]
             cases.append(
                 IKCase(
                     q_fk=q.tolist(),

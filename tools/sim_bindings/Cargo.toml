@@ -1,0 +1,21 @@
+[package]
+name = "dexforge-sim-bindings"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings of the generated arm math for the MuJoCo simulator (tools/sim_driver.py). Not part of the product crates."
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+# The Python module is still named `dexforge_ur` (UR5e only for now); other arms get their own modules.
+name = "dexforge_ur"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+dexforge-ur-core = { path = "../../repos/dexforge-ur/rust" }
+dexhal = { path = "../../dexhal" }
+nalgebra = { version = "0.33", default-features = false, features = ["libm"] }
+
+# Standalone workspace root: keeps cargo from attaching this crate to any repo workspace.
+[workspace]
