@@ -94,6 +94,8 @@ class SimDriver:
         self._qmax = np.array(m["joint_limits_max"])
         self._vmax = np.array(m["velocity_limits"])
         self._amax = np.array(m["acceleration_limits"])
+        if not (np.isfinite(self._amax[: self.dof]).all() and (self._amax[: self.dof] > 0).all()):
+            raise ValueError(f"manifest acceleration_limits must be finite and positive, got {self._amax[: self.dof]}")
         self._effort = np.array(m["effort_limits"])
         self._ik_step = (
             self._math.ik_default_max_joint_step() if ik_max_joint_step is None else float(ik_max_joint_step)

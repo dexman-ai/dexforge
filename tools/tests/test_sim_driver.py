@@ -438,3 +438,16 @@ def test_reference_acceleration_stays_bounded_through_arrival(step):
         assert np.abs(d._qd_ref).max() == 0.0
     finally:
         d.disconnect()
+
+
+def test_non_positive_acceleration_limit_is_rejected_at_construction(monkeypatch):
+    real = dexforge_ur.ur5.manifest
+
+    def bad():
+        m = dict(real())
+        m["acceleration_limits"] = [0.0] * len(m["acceleration_limits"])
+        return m
+
+    monkeypatch.setattr(dexforge_ur.ur5, "manifest", bad, raising=False)
+    with pytest.raises(ValueError, match="acceleration_limits"):
+        S.SimDriver("ur5")
