@@ -47,6 +47,7 @@ FAULT_NONE = 0.0
 FAULT_IK_NO_SOLUTION = 1.0
 FAULT_IK_STEP_TOO_LARGE = 2.0
 FAULT_OUT_OF_LIMITS = 3.0
+FAULT_SIM_ERROR = 4.0  # the control loop raised (for example physics diverged); the loop has stopped
 
 ROBOT_MODE_RUNNING = 7.0  # UR convention
 
@@ -88,7 +89,7 @@ class SimDriver:
         self._state_layout = self._mod.state_layout()
         self._cmd_layout = self._mod.command_layout()
         self._modes = {code: name for name, code in self._math.control_modes().items()}  # code -> name
-        self._mode_code = self._math.control_modes()
+        self._supported = {c for c in self._modes if self._math.supports_mode(c)}  # fixed by the manifest
         self._qmin = np.array(m["joint_limits_min"])
         self._qmax = np.array(m["joint_limits_max"])
         self._vmax = np.array(m["velocity_limits"])
@@ -105,6 +106,7 @@ class SimDriver:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._connected = False
+        self._sim_error = False
 
     @property
     def model(self) -> "mujoco.MjModel":
@@ -142,11 +144,11 @@ class SimDriver:
         self._fault = FAULT_NONE
         self._fault_epoch = 0  # bumped by clear_faults() so an in-flight cycle cannot re-latch a cleared fault
         self._time = 0.0
-        self._cycles = 0
         first = self._make_state()
         depth_s = int(self._manifest["state_staleness_cycles"]) + 1
         self._state_queue = deque([first] * depth_s, maxlen=depth_s)
         self._connected = True
+        self._sim_error = False
         if threaded:
             self._stop.clear()
             self._thread = threading.Thread(target=self._run, name="sim-driver", daemon=True)
@@ -183,7 +185,7 @@ class SimDriver:
         name = self._modes.get(code)
         if name is None:
             raise ValueError(f"unknown control_mode {code!r}")
-        if not self._math.supports_mode(code):
+        if code not in self._supported:
             raise NotImplementedError(f"control mode {name!r} is not supported by the manifest")
         if name not in _MODE_TARGET:
             raise NotImplementedError(f"control mode {name!r} is not implemented by the simulator")
@@ -197,9 +199,14 @@ class SimDriver:
         n = self._manifest["state_len"]
         if len(buf) < n:
             raise ValueError(f"state buffer too small: {len(buf)} < {n}")
+        if not self._connected:
+            raise RuntimeError("SimDriver is not connected; call connect() first")
         with self._lock:
             state = self._state_queue[0]
         buf[:n] = state
+        if self._sim_error:  # the loop died: report it instead of a healthy, frozen state
+            off, _ = self._state_layout["fault_code"]
+            buf[off] = FAULT_SIM_ERROR
 
     def clear_faults(self) -> None:
         """Clear the latched fault and drop the command that caused it (latched and in flight).
@@ -223,6 +230,8 @@ class SimDriver:
 
     def step(self, n: int = 1) -> None:
         """Run ``n`` control cycles synchronously (only when not threaded)."""
+        if not self._connected:
+            raise RuntimeError("SimDriver is not connected; call connect() first")
         if self._thread is not None:
             raise RuntimeError("step() is for unthreaded use; the control thread is running")
         for _ in range(n):
@@ -231,7 +240,14 @@ class SimDriver:
     def _run(self) -> None:
         next_t = time.perf_counter()
         while not self._stop.is_set():
-            self._cycle()
+            try:
+                self._cycle()
+            except Exception:  # a dead thread must not look like a healthy, frozen arm
+                import traceback
+
+                traceback.print_exc()
+                self._sim_error = True
+                return
             if self.realtime:
                 next_t += self.dt
                 delay = next_t - time.perf_counter()
@@ -276,7 +292,6 @@ class SimDriver:
 
         self._tau = tau
         self._time += self.dt
-        self._cycles += 1
         with self._lock:
             if self._fault_epoch == epoch:  # a clear_faults() during this cycle wins over its stale result
                 self._fault = fault

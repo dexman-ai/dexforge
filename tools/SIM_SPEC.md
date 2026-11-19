@@ -123,7 +123,7 @@ Per control cycle (manifest `control_freq_hz`, 500 Hz for UR5):
   commanded directly. Set `armature=0` when cross-checking `mass_matrix` against
   MuJoCo (the generated dynamics have no rotor inertia).
 - Needs link masses and inertias (the URDF has them, from Menagerie), joint limits, and
-  position actuators. Gravity on.
+  one direct-torque motor per joint (ctrlrange = effort limit). Gravity on.
 - The model's FK is checked against the generated `fk` for random joints
   (existing check in `tools/visualize_ik.py`); a mismatch is a hard error.
 - Frame: the solver's base is the UR *base* frame (Menagerie's world frame, x
@@ -185,9 +185,11 @@ Done:
 
 5. `tools/sim.py`: viewer, headless and render modes, and the demo client.
 
-To do: replay the Rust IK reference cases through `SimDriver`, a streamed
-trajectory test, and a client that drives it through the real dexhal `ArmDriver`
-path.
+Streamed-trajectory tests are done (in `test_sim_driver.py`).
+
+To do: a client that drives `SimDriver` through the real dexhal `ArmDriver` path.
+Replaying the Rust IK reference cases was dropped on purpose: they are single
+poses, not what a robot client sends.
 
 ## Decisions
 

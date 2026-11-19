@@ -145,8 +145,9 @@ def repl(c: Client, home: np.ndarray, readline=input) -> None:
                 settle("target_q", q, lambda: np.abs(c.state("q")[:n] - q).max(), 1e-3)
             elif cmd in ("pose", "move"):
                 if cmd == "move":
+                    assert len(a) == 3, "need dx dy dz"
                     pose = c.state("tcp_pose")[:7].copy()
-                    pose[:3] += np.array([float(x) for x in a[:3]])
+                    pose[:3] += np.array([float(x) for x in a])
                 else:
                     pose = np.array([float(x) for x in a])
                 assert len(pose) == 7, "need x y z qx qy qz qw"
@@ -168,7 +169,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--headless", action="store_true", help="no viewer; run the demo as fast as possible")
     ap.add_argument("--demo", action=argparse.BooleanOptionalAction, default=True, help="run the demo client")
     ap.add_argument("--interactive", action="store_true", help="type commands in the terminal (no demo)")
-    ap.add_argument("--seconds", type=float, default=None, help="with the viewer: close after this long")
+    ap.add_argument("--seconds", type=float, default=None, help="with the viewer (not --interactive): close after this long")
     ap.add_argument("--render", type=Path, help="write a PNG of the final pose and exit (implies --headless)")
     args = ap.parse_args(argv)
     headless = args.headless or args.render is not None

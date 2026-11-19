@@ -138,7 +138,8 @@ def load_arm(name: str) -> Arm:
     except ImportError:
         raise SystemExit(
             f"cannot import {oem_pkg}.{name}; build it first: "
-            f"cd repos/{oem_dir}/python && maturin develop --release"
+            f"the per-OEM Python bindings were removed; the UR bindings are built from "
+            f"tools/sim_bindings (see its README)"
         )
     return Arm(name, chain, limits, mod.fk, mod.solve, chain[0].parent, _link_meshes(urdf, name))
 

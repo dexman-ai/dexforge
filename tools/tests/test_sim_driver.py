@@ -327,3 +327,47 @@ def test_clear_faults_drops_the_rejected_command(drv):
     drv.step(1500)
     _, f = state(drv)
     assert np.abs(f("q")[:6] - GOAL).max() < 1e-3
+
+
+def test_control_thread_crash_is_reported_as_a_fault():
+    d = S.SimDriver("ur5")
+    d.connect(threaded=True)
+    try:
+        def boom():
+            raise RuntimeError("physics diverged")
+
+        d._cycle = boom  # the loop's next iteration raises
+        deadline = time.time() + 2.0
+        while not d._sim_error and time.time() < deadline:
+            time.sleep(0.01)
+        _, f = state(d)
+        assert f("fault_code")[0] == S.FAULT_SIM_ERROR
+    finally:
+        d.disconnect()
+
+
+def test_use_before_connect_is_a_clear_error():
+    d = S.SimDriver("ur5")
+    with pytest.raises(RuntimeError, match="not connected"):
+        d.step()
+    with pytest.raises(RuntimeError, match="not connected"):
+        d.read_state(np.zeros(d.manifest()["state_len"]))
+
+
+def test_mjcf_mesh_names_do_not_collide_and_paths_are_escaped(tmp_path):
+    import urdf_to_mjcf as G
+
+    urdf = tmp_path / "a.urdf"
+    inertial = '<inertial><origin xyz="0 0 0"/><mass value="1"/><inertia ixx="1" iyy="1" izz="1" ixy="0" ixz="0" iyz="0"/></inertial>'
+    link = lambda n, mesh: f'<link name="{n}">{inertial}<visual><geometry><mesh filename="{mesh}"/></geometry></visual></link>'  # noqa: E731
+    urdf.write_text(
+        '<robot name="r">' + link("l0", "/x&amp;y/base.stl") + link("l1", "/z/base.stl")
+        + '<joint name="j" type="revolute"><parent link="l0"/><child link="l1"/><axis xyz="0 0 1"/>'
+        '<limit lower="-1" upper="1" effort="1" velocity="1"/></joint></robot>'
+    )
+    xml = G.build_mjcf(urdf, "l1")
+    assert 'name="base"' in xml and 'name="base_2"' in xml
+    assert "&amp;" in xml
+    from lxml import etree
+
+    etree.fromstring(xml.encode())  # well-formed despite the '&' in the path

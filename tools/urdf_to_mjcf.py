@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional
+from xml.sax.saxutils import quoteattr
 
 import numpy as np
 from lxml import etree
@@ -95,9 +96,14 @@ def build_mjcf(urdf: Path, ee_link: str, armature: float = 0.0, timestep: float 
     hinge_order: List[str] = []
 
     def mesh_name(path: str) -> str:
-        stem = Path(path).stem
         p = Path(path)
-        meshes[stem] = str(p if p.is_absolute() else REPO / p)
+        full = str(p if p.is_absolute() else REPO / p)
+        # name by stem, but never let two different files share a name
+        stem, k = p.stem, 1
+        while meshes.get(stem, full) != full:
+            k += 1
+            stem = f"{p.stem}_{k}"
+        meshes[stem] = full
         return stem
 
     def body_xml(link: _Link, joint: Optional[_Joint], depth: int) -> str:
@@ -141,7 +147,7 @@ def build_mjcf(urdf: Path, ee_link: str, armature: float = 0.0, timestep: float 
         return "\n".join(out)
 
     body = body_xml(links[start], None, 2)
-    asset = "\n".join(f'    <mesh name="{n}" file="{p}"/>' for n, p in meshes.items())
+    asset = "\n".join(f'    <mesh name="{n}" file={quoteattr(p)}/>' for n, p in meshes.items())
     return f"""<mujoco model="{root.get("name")}">
   <compiler angle="radian" inertiafromgeom="false" autolimits="true"/>
   <option timestep="{timestep}" gravity="{_fmt(GRAVITY)}" integrator="implicitfast"/>
