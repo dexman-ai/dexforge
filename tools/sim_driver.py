@@ -322,12 +322,18 @@ class SimDriver:
             return FAULT_OUT_OF_LIMITS
         n = self.dof
         err = target - self._q_ref
-        # speed that still lets the joint brake to a stop at the target
-        v_des = np.sign(err) * np.minimum(self._vmax[:n], np.sqrt(2.0 * self._amax[:n] * np.abs(err)))
+        # Fastest speed from which the joint can still stop at the target when its speed may
+        # fall by at most amax*dt per cycle (discrete-time braking), capped at vmax.
+        a_dt = self._amax[:n] * self.dt
+        k = 0.5 * (1.0 + np.sqrt(1.0 + 8.0 * np.abs(err) / (a_dt * self.dt)))
+        v_des = np.sign(err) * np.minimum(self._vmax[:n], a_dt * (k - 1.0))
+        # Arrive: within one cycle's worth of motion and slow enough to stop in one step. Decided
+        # before advancing and used instead of the advance, so the speed change this cycle is
+        # the stop itself, at most amax*dt.
+        arrived = (np.abs(err) <= a_dt * self.dt) & (np.abs(self._qd_ref) <= a_dt)
         self._advance(v_des)
-        crossed = (target - self._q_ref) * err < 0.0  # would pass the target this cycle
-        self._q_ref[crossed] = target[crossed]
-        self._qd_ref[crossed] = 0.0
+        self._q_ref[arrived] = target[arrived]
+        self._qd_ref[arrived] = 0.0
         return FAULT_NONE
 
     def _advance(self, v_des: np.ndarray) -> None:

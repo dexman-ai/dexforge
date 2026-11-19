@@ -412,3 +412,29 @@ def test_cartesian_just_off_the_singularity_works():
         np.testing.assert_allclose(f("q")[:6], q0, atol=1e-3)
     finally:
         d.disconnect()
+
+
+@pytest.mark.parametrize("step", [0.4, 0.02, 1e-4])
+def test_reference_acceleration_stays_bounded_through_arrival(step):
+    """The reference may never change speed faster than the manifest acceleration limit,
+    including when it brakes into the target (no snap to zero on arrival)."""
+    d = S.SimDriver("ur5")
+    d.connect()
+    try:
+        tgt = Q0.copy()
+        tgt[0] += step
+        d.write_command(cmd_q(d, tgt))
+        limit = d._amax[0] * d.dt
+        prev, worst, overshoot = d._qd_ref.copy(), 0.0, 0.0
+        for _ in range(1500):
+            d.step()
+            worst = max(worst, np.abs(d._qd_ref - prev).max())
+            overshoot = max(overshoot, float((d._q_ref[0] - tgt[0])))
+            prev = d._qd_ref.copy()
+        assert worst <= limit * (1 + 1e-9), f"speed changed by {worst} in one cycle (limit {limit})"
+        quantum = limit * d.dt  # amax*dt^2: the smallest motion one cycle of braking resolves
+        assert overshoot <= quantum, f"reference overshot the target by {overshoot} (> {quantum})"
+        np.testing.assert_allclose(d._q_ref, tgt, atol=1e-9)
+        assert np.abs(d._qd_ref).max() == 0.0
+    finally:
+        d.disconnect()
