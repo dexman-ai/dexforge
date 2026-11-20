@@ -1,2 +1,0 @@
-WARNING Thu Nov 19 12:42:19 2026: Nan, Inf or huge value in CTRL at ACTUATOR 0. The simulation is unstable. Time = 0.0040.
-
