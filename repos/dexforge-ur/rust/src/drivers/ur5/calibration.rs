@@ -13,8 +13,9 @@
 //!
 //! They are added to [`NOMINAL_DH`] (standard DH). On the nearly parallel
 //! axes 2–4 the `d` deltas can be tens of metres and cancel; dexhal's chain
-//! keeps that precise. The URDF `base_link` → `ee_link` chain of this driver
-//! *is* the DH chain, so no frame adapters are needed.
+//! keeps that precise. The DH chain uses the same base and flange frames as the
+//! URDF `base_link` → `ee_link` chain of this driver (which is UR's own description,
+//! see `tools/import_ur_description.py`), so no frame adapters are needed.
 //!
 //! ```ignore
 //! let calibration = ur5::calibration::calibration_data(&text)?;
@@ -30,14 +31,18 @@ use dexhal::math::{
 
 use super::arm::DOF;
 
-/// Nominal UR5 (CB3) standard DH table, `a`, `alpha`, `d`, `theta`.
+/// UR's nominal UR5e standard DH table (`a`, `alpha`, `d`, `theta`).
+///
+/// The controller's `calibration.conf` deltas are defined against exactly these values.
+/// They are the datasheet dimensions, the same ones as in the driver's own chain
+/// (`ur5.urdf`, imported from UR's `ur_description`), so zero deltas reproduce that chain.
 pub const NOMINAL_DH: [DhRow; DOF] = [
-    DhRow::new(0.0, FRAC_PI_2, 0.089159, 0.0),
+    DhRow::new(0.0, FRAC_PI_2, 0.1625, 0.0),
     DhRow::new(-0.425, 0.0, 0.0, 0.0),
-    DhRow::new(-0.39225, 0.0, 0.0, 0.0),
-    DhRow::new(0.0, FRAC_PI_2, 0.10915, 0.0),
-    DhRow::new(0.0, -FRAC_PI_2, 0.09465, 0.0),
-    DhRow::new(0.0, 0.0, 0.0823, 0.0),
+    DhRow::new(-0.3922, 0.0, 0.0, 0.0),
+    DhRow::new(0.0, FRAC_PI_2, 0.1333, 0.0),
+    DhRow::new(0.0, -FRAC_PI_2, 0.0997, 0.0),
+    DhRow::new(0.0, 0.0, 0.0996, 0.0),
 ];
 
 /// The four `[mounting]` keys, in [`DhRow`] field order.
@@ -249,8 +254,9 @@ delta_d = [ 1, 1, 1, 1, 1, 1]
         let nominal = nominal_chain();
         for k in 0..16 {
             let q = sample(k);
-            assert!((chain.fk(&q) - nominal.fk(&q)).norm() < 1e-12);
-            assert!((chain.fk(&q) - Ur5::flange_fk(&q)).norm() < 1e-12);
+            assert!((chain.fk(&q) - dh_fk(&NOMINAL_DH, &q)).norm() < 1e-12);
+            assert!((chain.fk(&q) - nominal.fk(&q)).norm() < 1e-9);
+            assert!((chain.fk(&q) - Ur5::flange_fk(&q)).norm() < 1e-9);
         }
     }
 
