@@ -5,6 +5,10 @@ Status: draft for review. UR5 first; other arms follow the same pattern.
 Note on naming: the arm is the **UR5e**, kept under the name `ur5` (the arm name
 in the code, manifest and bindings is unchanged).
 
+The **UR3e** (`--arm ur3e`, `dexforge_ur.ur3e`) follows the same pattern. Both arms are imported from
+Universal Robots' own description by `tools/import_ur_description.py` (`--arm ur5|ur3e`), and their IK
+solve blocks are ported from the ssik artifacts by `tools/port_ur_ik_solver.py`.
+
 ## Goal
 
 Run an arm in simulation through the same driver contract a real arm uses.

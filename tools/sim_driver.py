@@ -54,6 +54,7 @@ ROBOT_MODE_RUNNING = 7.0  # UR convention
 # arm -> (bindings module, MJCF-builder arm key, initial joints)
 _ARMS = {
     "ur5": ("dexforge_ur", "ur5", [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]),
+    "ur3e": ("dexforge_ur", "ur3e", [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]),
 }
 
 # command mode -> the target field it needs (finite), for the modes this sim executes

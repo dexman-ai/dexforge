@@ -1,0 +1,42 @@
+# Manifest of the Ur3e (`Ur3e`, vendor "ur").
+#
+# Loaded by `Ur3eDriver::new()` through
+# `ArmManifest::from_text::<Ur3e, 6, 16>`; see
+# dexhal/examples/manifest.yaml for every key. Scaffolded by
+# codegen/scaffold.py: `limits.velocity` / `limits.effort` come from the URDF
+# <limit> tags. Every `TODO` must be replaced from the OEM data sheet / protocol
+# specification (the manifest does not parse until they are).
+
+driver: ur3e               # must equal Ur3e::NAME
+version: "0.3"
+control_freq_hz: 500          # rate at which the controller expects commands
+control_modes: [joint_pos, joint_vel, cartesian_pose]
+realtime: true
+
+latency:
+  state_staleness_cycles: 1
+  command_dispatch_cycles: 2
+
+limits:
+  velocity: [3.141592653589793, 3.141592653589793, 3.141592653589793, 6.283185307179586, 6.283185307179586, 6.283185307179586]   # rad/s  (URDF <limit velocity>)
+  acceleration: [15.0, 15.0, 15.0, 15.0, 15.0, 15.0]   # rad/s^2  (placeholder, as for ur5: UR publishes no acceleration limits)
+  effort: [54.0, 54.0, 28.0, 9.0, 9.0, 9.0]   # N*m  (URDF <limit effort>)
+
+has_static_inertials: true
+
+sensing:
+  torque: true
+  wrench: false
+  gripper: false
+
+native:
+  cartesian_impedance: false
+  cartesian_admittance: true
+  joint_impedance: false
+  contact_detection: false
+  reflexes: false
+  payload: true
+  tcp_offset: true
+  gravity_compensation: false
+  realtime_mode_switch: false
+  nullspace_posture: false
