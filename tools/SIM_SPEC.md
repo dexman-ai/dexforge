@@ -112,24 +112,24 @@ Per control cycle (manifest `control_freq_hz`, 500 Hz for UR5):
 
 ## Model
 
-- Built from our own URDF (`ur5.urdf`), which is the **UR5e imported from MuJoCo
-  Menagerie** (`tools/import_menagerie_ur5e.py`), with Menagerie's meshes. The
-  generated FK matches Menagerie's own MuJoCo model to ~1e-16 (position and
-  orientation), so sim and solver agree by construction. Menagerie rounds some
-  dimensions (0.163 vs 0.1625 m shoulder, 0.1 vs 0.0997 / 0.0996 m wrist, 0.392 vs
-  0.3922 m forearm): the model follows Menagerie, not the datasheet, and a real arm
-  carries its own calibration anyway.
-- Menagerie's actuators and 0.1 joint armature are **not** used: torques are
-  commanded directly. Set `armature=0` when cross-checking `mass_matrix` against
-  MuJoCo (the generated dynamics have no rotor inertia).
-- Needs link masses and inertias (the URDF has them, from Menagerie), joint limits, and
+- Built from our own URDF (`ur5.urdf`), which is **Universal Robots' own UR5e description**
+  (`ur_description`), imported by `tools/import_ur_description.py` at a pinned commit and
+  with UR's meshes. Kinematics (0.1625, 0.425, 0.3922, 0.1333, 0.0997, 0.0996 m), link masses,
+  centres of mass, inertia tensors and joint limits are all UR's. The script's float-noise snap
+  (largest change ~2e-10) and the base-frame choice are documented in its docstring.
+- UR does not publish joint acceleration limits, an actuator model, rotor inertia, or joint
+  damping and friction, so none of those are in the model: the sim's 15 rad/s2 acceleration
+  limit is a placeholder, motors are our own direct-torque ones, and armature is 0. Set
+  `armature=0` when cross-checking `mass_matrix` against MuJoCo (the generated dynamics have
+  no rotor inertia).
+- Needs link masses and inertias (the URDF has them, from UR), joint limits, and
   one direct-torque motor per joint (ctrlrange = effort limit). Gravity on.
 - The model's FK is checked against the generated `fk` for random joints
   (existing check in `tools/visualize_ik.py`); a mismatch is a hard error.
-- Frame: the solver's base is the UR *base* frame (Menagerie's world frame, x
-  pointing away from the cable). The MuJoCo model hangs the arm off
-  `base_link_inertia`, a fixed 180° yaw of `base_link`, as `ur_description` does.
-  Any remaining fitted offset is printed, not hidden.
+- Frame: the solver's base is the UR controller *base* frame (UR's `base`, which is `base_link`
+  turned 180 deg about Z; q = 0 puts the TCP at x = -0.8172 m). Our `base_link` is that frame, so
+  poses match what the controller reports. The MuJoCo model hangs the arm off
+  `base_link_inertia`, which has the same orientation.
 
 ## Usage
 

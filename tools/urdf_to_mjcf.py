@@ -117,6 +117,11 @@ def build_mjcf(urdf: Path, ee_link: str, armature: float = 0.0, timestep: float 
             m = float(link.inertial.find("mass").get("value"))
             if m > 0:
                 o = link.inertial.find("origin")
+                if o is not None and np.abs(_vec(o.get("rpy"))).max() > 1e-12:
+                    raise SystemExit(
+                        f"link {link.name!r}: a rotated <inertial> origin is not supported; "
+                        "rotate the tensor into the link frame (tools/import_ur_description.py does)"
+                    )
                 i = link.inertial.find("inertia")
                 full = [float(i.get(k)) for k in ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")]
                 out.append(

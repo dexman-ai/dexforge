@@ -14,9 +14,8 @@
 //! They are added to [`NOMINAL_DH`] (standard DH). On the nearly parallel
 //! axes 2–4 the `d` deltas can be tens of metres and cancel; dexhal's chain
 //! keeps that precise. The DH chain uses the same base and flange frames as the
-//! URDF `base_link` → `ee_link` chain of this driver, so no frame adapters are needed.
-//! The driver's own chain carries Menagerie's rounded dimensions, so it differs from
-//! [`NOMINAL_DH`] by a fraction of a millimetre until a calibration is loaded.
+//! URDF `base_link` → `ee_link` chain of this driver (which is UR's own description,
+//! see `tools/import_ur_description.py`), so no frame adapters are needed.
 //!
 //! ```ignore
 //! let calibration = ur5::calibration::calibration_data(&text)?;
@@ -32,13 +31,11 @@ use dexhal::math::{
 
 use super::arm::DOF;
 
-/// UR's nominal UR5e standard DH table (`a`, `alpha`, `d`, `theta`), from the datasheet.
+/// UR's nominal UR5e standard DH table (`a`, `alpha`, `d`, `theta`).
 ///
-/// The controller's `calibration.conf` deltas are defined against exactly these values,
-/// so they are applied to this table and not to the driver's own chain. The driver's
-/// chain (`ur5.urdf`, imported from MuJoCo Menagerie) rounds some dimensions
-/// (`d1 = 0.163`, `a3 = -0.392`, `d4 = 0.134`, `d5 = d6 = 0.1`), up to about 0.7 mm off
-/// this table; a calibrated arm drops that chain for the calibrated one built here.
+/// The controller's `calibration.conf` deltas are defined against exactly these values.
+/// They are the datasheet dimensions, the same ones as in the driver's own chain
+/// (`ur5.urdf`, imported from UR's `ur_description`), so zero deltas reproduce that chain.
 pub const NOMINAL_DH: [DhRow; DOF] = [
     DhRow::new(0.0, FRAC_PI_2, 0.1625, 0.0),
     DhRow::new(-0.425, 0.0, 0.0, 0.0),
@@ -176,7 +173,7 @@ mod tests {
     use std::string::String;
 
     use super::*;
-    use crate::drivers::ur5::arm::Ur5;
+    use crate::drivers::ur5::arm::{nominal_chain, Ur5};
     use crate::drivers::ur5::driver::Ur5Driver;
     use dexhal::math::{ArmDriver, ArmModel, Pose, MAX_DOF};
 
@@ -252,14 +249,14 @@ delta_d = [ 1, 1, 1, 1, 1, 1]
     }
 
     #[test]
-    fn zero_deltas_reproduce_the_vendor_nominal_chain() {
+    fn zero_deltas_reproduce_the_driver_chain() {
         let chain = calibrated_chain(&zero()).unwrap();
+        let nominal = nominal_chain();
         for k in 0..16 {
             let q = sample(k);
             assert!((chain.fk(&q) - dh_fk(&NOMINAL_DH, &q)).norm() < 1e-12);
-            // The driver's chain uses Menagerie's rounded dimensions: close, but not equal.
-            let shift = (chain.fk(&q) - Ur5::flange_fk(&q)).norm();
-            assert!(shift < 3e-3, "vendor nominal vs driver chain differ by {shift}");
+            assert!((chain.fk(&q) - nominal.fk(&q)).norm() < 1e-9);
+            assert!((chain.fk(&q) - Ur5::flange_fk(&q)).norm() < 1e-9);
         }
     }
 
