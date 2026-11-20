@@ -610,15 +610,15 @@ mod tests {
     /// Wrist singularity (q5 = 0 or pi): joints 4 and 6 share an axis, so only their
     /// combination is defined and the original q4/q6 cannot be recovered.
     ///
-    /// Right at the singularity (q5 below about 5e-7, or pi) the solver returns 4 solutions on
-    /// a single shoulder branch instead of 8, and that branch need not be the one the arm is
-    /// in. Between roughly 1e-6 and 1e-5 the problem is ill-conditioned: the solution count
-    /// flips between 4 and 8 from one q5 to the next and the pose error reaches a few 1e-6.
-    /// The Python reference artifact behaves the same way in this window (the exact q5 values
-    /// where it flips differ slightly), so this is solver behaviour, not a porting error.
-    /// Outside the window the pose error is tight. What must always hold: solutions exist, are
-    /// finite, and reproduce the pose to the stated tolerance. Just off the singularity
-    /// (q5 = 1e-3) all 8 are back and the original q1..q3, q5 are among them.
+    /// - At the singularity (q5 below about 5e-7, or pi) the solver returns 4 solutions on one
+    ///   shoulder branch instead of 8, and that branch need not be the one the arm is in.
+    /// - For q5 between about 1e-6 and 1e-5 the problem is ill-conditioned: the solution count
+    ///   flips between 4 and 8 and the pose error reaches a few 1e-6. The Python reference
+    ///   artifact does the same (the exact q5 values where it flips differ slightly).
+    /// - Elsewhere the pose error is tight, and at q5 = 1e-3 all 8 solutions are back and the
+    ///   original q1..q3, q5 are among them.
+    ///
+    /// Always required: solutions exist, are finite, and reproduce the pose to the tolerance below.
     #[test]
     fn wrist_singularity_still_solves() {
         use core::f64::consts::PI;

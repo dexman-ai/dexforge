@@ -28,10 +28,13 @@ Deliberate changes from UR's file (each one is checked, not silent):
   display and collision. They carry a per-link placement in the URDF; it is baked into the
   vertices so the URDF mesh elements have no origin. The visual ``.dae`` files are not used:
   MuJoCo cannot load them and they are about 9 MB.
-* **Float noise.** UR's yaml rounds some angles (1.570796327, ~3e-10 rad off pi/2) and has
-  ~2e-11 m offsets from deriving the model from DH. Angles within 1e-9 of a multiple of
-  pi/2 and lengths below 1e-9 are snapped to the exact value. The largest snap is printed
-  and capped. Without it the IK artifact sees 1e-10 noise in axis alignment.
+* **Float noise.** UR derives its model from DH parameters, which leaves a few rounded or
+  residual values (for example a roll of 1.570796327, which is pi/2 truncated to 10 digits, and
+  offsets of 2e-11 m). Rotation angles within 1e-9 of a multiple of pi/2 are set to that
+  multiple, and lengths below 1e-9 m to 0. Nothing else is modified (not dimensions, masses,
+  inertias or limits). Every change is printed, and none may exceed 1e-9. The IK artifact
+  classifies axes as parallel or intersecting with tolerances, so this noise would otherwise
+  leak into it.
 
 UR does *not* provide: joint acceleration limits (their yaml says "not publicly available"),
 an actuator or motor model, rotor inertia, joint damping or friction. Those are not in the URDF.
@@ -80,6 +83,7 @@ JOINTS = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
           "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
 
 _max_snap = 0.0
+_snaps: dict[tuple[str, float, float], None] = {}  # (kind, before, after), insertion-ordered
 
 
 def _snap(v: float, step: float = math.pi / 2) -> float:
@@ -89,6 +93,8 @@ def _snap(v: float, step: float = math.pi / 2) -> float:
     d = abs(v - k * step)
     if d <= SNAP_TOL:
         _max_snap = max(_max_snap, d)
+        if v != k * step:
+            _snaps[("angle", float(v), float(k * step))] = None
         return k * step
     return v
 
@@ -97,6 +103,8 @@ def _snap_len(v: float) -> float:
     global _max_snap
     if abs(v) <= SNAP_TOL:
         _max_snap = max(_max_snap, abs(v))
+        if v != 0.0:
+            _snaps[("length", float(v), 0.0)] = None
         return 0.0
     return v
 
@@ -271,7 +279,10 @@ def main() -> None:
     URDF_OUT.write_text(build_urdf(root, commit))
     print(f"wrote {URDF_OUT.relative_to(REPO)}  (ur_description@{commit[:10]})")
     write_meshes(root, ur)
-    print(f"largest float-noise snap applied: {_max_snap:.3e} (limit {SNAP_TOL:.0e})")
+    print("float-noise snaps applied (the only values changed from UR's file):")
+    for kind, before, after in _snaps:
+        print(f"  {kind:6s} {before!r:>26} -> {after!r}")
+    print(f"largest change: {_max_snap:.3e} (limit {SNAP_TOL:.0e})")
 
 
 if __name__ == "__main__":
