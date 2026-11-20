@@ -48,7 +48,7 @@ pub struct ContractVersion {
 /// Contract version implemented by this crate.
 pub const CONTRACT_VERSION: ContractVersion = ContractVersion {
     major: 0,
-    minor: 3,
+    minor: 4,
     patch: 0,
 };
 
@@ -297,6 +297,30 @@ pub trait ArmMath: Send {
 
     /// Set the continuity bound (rad) of [`inverse_kinematics`](Self::inverse_kinematics).
     fn apply_ik_max_joint_step(&mut self, step: f64) -> Result<(), ModelError>;
+
+    /// Free-space joint torque for this control tick, advancing the learned
+    /// torque observer if one is installed ([`Arm::step_free_torque`]);
+    /// `q_cmd` feeds its command-error feature.
+    fn step_free_torque_padded(
+        &mut self,
+        q: &[f64; MAX_DOF],
+        qd: &[f64; MAX_DOF],
+        qdd: &[f64; MAX_DOF],
+        q_cmd: Option<&[f64; MAX_DOF]>,
+        control_freq_hz: u32,
+    ) -> Option<[f64; MAX_DOF]>;
+
+    /// Clear the learned torque observer's history ([`Arm::reset_torque_observer`]);
+    /// no-op without one.
+    fn reset_torque_observer_state(&mut self);
+
+    /// Inverse dynamics of the configured payload alone ([`Arm::payload_torque`]).
+    fn payload_torque_padded(
+        &self,
+        q: &[f64; MAX_DOF],
+        qd: &[f64; MAX_DOF],
+        qdd: &[f64; MAX_DOF],
+    ) -> Option<[f64; MAX_DOF]>;
 }
 
 fn unpad<const DOF: usize>(q: &[f64; MAX_DOF]) -> Option<[f64; DOF]> {
@@ -443,6 +467,41 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmMath for Arm<
 
     fn apply_ik_max_joint_step(&mut self, step: f64) -> Result<(), ModelError> {
         self.set_ik_max_joint_step(step)
+    }
+
+    fn step_free_torque_padded(
+        &mut self,
+        q: &[f64; MAX_DOF],
+        qd: &[f64; MAX_DOF],
+        qdd: &[f64; MAX_DOF],
+        q_cmd: Option<&[f64; MAX_DOF]>,
+        control_freq_hz: u32,
+    ) -> Option<[f64; MAX_DOF]> {
+        let cmd = match q_cmd {
+            Some(c) => Some(unpad::<DOF>(c)?),
+            None => None,
+        };
+        let tau = self.step_free_torque(
+            &unpad(q)?,
+            &unpad(qd)?,
+            &unpad(qdd)?,
+            cmd.as_ref(),
+            control_freq_hz,
+        )?;
+        Some(pad(&tau))
+    }
+
+    fn reset_torque_observer_state(&mut self) {
+        self.reset_torque_observer();
+    }
+
+    fn payload_torque_padded(
+        &self,
+        q: &[f64; MAX_DOF],
+        qd: &[f64; MAX_DOF],
+        qdd: &[f64; MAX_DOF],
+    ) -> Option<[f64; MAX_DOF]> {
+        Some(pad(&self.payload_torque(&unpad(q)?, &unpad(qd)?, &unpad(qdd)?)))
     }
 }
 
@@ -628,6 +687,58 @@ pub trait ArmDriver: Send {
         qdd: &[f64; MAX_DOF],
     ) -> Option<[f64; MAX_DOF]> {
         self.arm().inverse_dynamics_padded(q, qd, qdd)
+    }
+
+    /// Free-space joint torque `τ_free` for this control tick, for
+    /// torque-residual wrench estimation (Route 6): call every cycle so a
+    /// learned observer's window stays warm. `qdd_ref` is the reference
+    /// acceleration and `q_cmd` the commanded position (the observer's
+    /// command-error feature; zero if `None`).
+    ///
+    /// With [`DynamicsSource::Vendor`] and no learned observer
+    /// ([`ArmManifest::has_torque_observer`]) it is `M qdd + C qd + G` from
+    /// the `aux` tail of `state_buffer`, plus the host payload's inverse
+    /// dynamics unless the controller compensates it
+    /// ([`ArmManifest::native_payload`]). Otherwise it is
+    /// [`ArmMath::step_free_torque_padded`] at the manifest's control rate.
+    fn step_free_torque(
+        &mut self,
+        state_buffer: &[f64],
+        q: &[f64; MAX_DOF],
+        qd: &[f64; MAX_DOF],
+        qdd_ref: &[f64; MAX_DOF],
+        q_cmd: Option<&[f64; MAX_DOF]>,
+    ) -> Option<[f64; MAX_DOF]> {
+        let manifest = self.manifest();
+        let control_freq_hz = manifest.control_freq_hz;
+        if manifest.dynamics_source == DynamicsSource::Vendor && !manifest.has_torque_observer {
+            let n = usize::from(manifest.active_dof_count).min(MAX_DOF);
+            let native_payload = manifest.native_payload;
+            let d = manifest.aux_dynamics(state_buffer)?;
+            if !qdd_ref[..n].iter().all(|v| v.is_finite()) {
+                return None;
+            }
+            let mut tau = [0.0; MAX_DOF];
+            for i in 0..n {
+                let inertial: f64 = (0..n).map(|j| d.m_matrix[i][j] * qdd_ref[j]).sum();
+                tau[i] = inertial + d.c_vector[i] + d.g_vector[i];
+            }
+            if !native_payload {
+                let p = self.arm().payload_torque_padded(q, qd, qdd_ref)?;
+                for i in 0..n {
+                    tau[i] += p[i];
+                }
+            }
+            return Some(tau);
+        }
+        self.arm_mut()
+            .step_free_torque_padded(q, qd, qdd_ref, q_cmd, control_freq_hz)
+    }
+
+    /// Clear the learned torque observer's history: call on connect, fault
+    /// clear, freedrive toggles and reference snaps. No-op without one.
+    fn reset_torque_observer(&mut self) {
+        self.arm_mut().reset_torque_observer_state();
     }
 
     /// Calibration self-check: the distance between the host model's TCP pose
@@ -948,5 +1059,81 @@ mod tests {
         assert!(driver.inverse_dynamics(&q, &q, &q).is_some());
         assert!(driver.dynamics(&q, &q).is_some());
         assert!(driver.jacobian(&q).is_some());
+    }
+
+    #[test]
+    fn step_free_torque_follows_the_dynamics_source() {
+        use crate::math::torque_observer::test_support::spec;
+
+        let q6 = sample_q::<6>(4, 1.5);
+        let qd6 = sample_q::<6>(5, 0.7);
+        let qdd6 = sample_q::<6>(6, 2.0);
+        let (q, qd, qdd) = (padded(&q6), padded(&qd6), padded(&qdd6));
+
+        // Model source, no observer: the rigid-body inverse dynamics.
+        let mut driver = fake_driver();
+        driver.arm.set_payload(Payload::new(1.0, [0.0, 0.0, 0.05])).unwrap();
+        let tau = driver.step_free_torque(&[], &q, &qd, &qdd, None).unwrap();
+        assert_eq!(tau, driver.inverse_dynamics(&q, &qd, &qdd).unwrap());
+        driver.reset_torque_observer();
+
+        // Vendor source: M qdd + C qd + G from aux, plus the host payload.
+        let mut vendor = fake_driver();
+        vendor.arm.set_payload(Payload::new(1.0, [0.0, 0.0, 0.05])).unwrap();
+        vendor.manifest.dynamics_source = DynamicsSource::Vendor;
+        vendor.manifest.aux = AuxSchema::from_slice(&[
+            AuxField { label: aux_dynamics::GRAVITY_TORQUE, size: 6 },
+            AuxField { label: aux_dynamics::CORIOLIS_TORQUE, size: 6 },
+            AuxField { label: aux_dynamics::MASS_MATRIX, size: 36 },
+        ])
+        .unwrap();
+        let mut state = [0.0; CoreState::LEN + 48];
+        {
+            let tail = &mut state[CoreState::LEN..];
+            for i in 0..6 {
+                tail[i] = 1.0 + i as f64;
+                tail[6 + i] = 0.5;
+                tail[12 + 7 * i] = 3.0;
+            }
+        }
+        let p = vendor.arm.payload_torque(&q6, &qd6, &qdd6);
+        let tau = vendor.step_free_torque(&state, &q, &qd, &qdd, None).unwrap();
+        for i in 0..6 {
+            let expected = 3.0 * qdd6[i] + 0.5 + 1.0 + i as f64 + p[i];
+            assert!((tau[i] - expected).abs() < 1e-12, "joint {i}");
+        }
+        assert_eq!(tau[6..], [0.0, 0.0]);
+        vendor.manifest.native_payload = true;
+        let native = vendor.step_free_torque(&state, &q, &qd, &qdd, None).unwrap();
+        assert!((native[0] - (3.0 * qdd6[0] + 1.5)).abs() < 1e-12);
+        assert!(vendor.step_free_torque(&state[..10], &q, &qd, &qdd, None).is_none());
+
+        // A learned observer overrides the vendor terms.
+        let bytes = spec().leak(11);
+        vendor.arm.set_payload(Payload::NONE).unwrap();
+        vendor.arm.set_torque_observer(bytes).unwrap();
+        vendor.manifest.has_torque_observer = true;
+        let mut reference = Arm::<SixR, 6, 1>::new();
+        reference.set_torque_observer(bytes).unwrap();
+        let cmd = padded(&q6.map(|v| v + 0.02));
+        let first6 = |t: [f64; MAX_DOF]| -> [f64; 6] { t[..6].try_into().unwrap() };
+        // 500 Hz: the observer warms up for four ticks.
+        for k in 0..12 {
+            let tau = vendor.step_free_torque(&state, &q, &qd, &qdd, Some(&cmd)).map(first6);
+            let expected =
+                reference.step_free_torque(&q6, &qd6, &qdd6, Some(&q6.map(|v| v + 0.02)), 500);
+            assert_eq!(tau.is_none(), k < 4, "tick {k}");
+            assert_eq!(tau, expected, "tick {k}");
+        }
+        vendor.reset_torque_observer();
+        reference.reset_torque_observer();
+        assert_eq!(vendor.step_free_torque(&state, &q, &qd, &qdd, None), None);
+        assert_eq!(reference.step_free_torque(&q6, &qd6, &qdd6, None, 500), None);
+        for _ in 0..4 {
+            assert_eq!(
+                vendor.step_free_torque(&state, &q, &qd, &qdd, None).map(first6),
+                reference.step_free_torque(&q6, &qd6, &qdd6, None, 500)
+            );
+        }
     }
 }

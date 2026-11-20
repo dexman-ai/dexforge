@@ -554,7 +554,52 @@ Each item below originates from the gap analysis in `c:\code\dexzero\workitems.m
     with exact sizes (`ManifestErrorKind::InvalidAux` otherwise).
 
 ## P1 — missing capability (cont.)
-59. **[dexhal] FACTR 2 (NEXT) Virtual Torque Sensor Integration.** see specs\factr2.md
+59. Done: **[dexhal] [codegen] FACTR 2 (NEXT) Virtual Torque Sensor Integration** (see [`specs/factr2.md`](specs/factr2.md)).
+    `math::torque_observer::LstmObserver<DOF>` (`no_std`, no allocation,
+    `forbid(unsafe_code)`) decodes a validated `.dexnext` file in place and
+    runs the fixed FACTR 2 network (Table 3 / A.2: inputs `[q, q̇, q_cmd − q]`,
+    2 × 128 LSTM, 256-wide MLP head, stateless 50-sample window at 100 Hz,
+    left-padded with the first sample after a reset), holding its output
+    between samples. The 49 prefix frames of the next window are spread over
+    the ticks of the 100 Hz period (bit-identical to a full evaluation);
+    `step` returns `None` for the first `stride − 1` ticks after a reset.
+    `Arm::set_torque_observer` / `clear_torque_observer` /
+    `reset_torque_observer` / `payload_torque` / `step_free_torque` add the
+    payload differential $\tau_{\text{payload}}(P_{\text{runtime}}) -
+    \tau_{\text{payload}}(P_{\text{train}})$ and, in `FrictionResidual`, the
+    model torque; `set_gravity` rejects a gravity that differs from the
+    `FullDynamics` training gravity. `ArmMath` gains
+    `step_free_torque_padded` / `reset_torque_observer_state` /
+    `payload_torque_padded`; `ArmDriver::step_free_torque` /
+    `reset_torque_observer` fall back to model or vendor `aux` dynamics.
+    `DynamicsSource::Learned` (`dynamics_source: learned`) and
+    `ArmManifest::has_torque_observer` (set by the driver; enables
+    `has_residual_dynamics()`); `ModelError::InvalidObserver`;
+    `CONTRACT_VERSION` 0.4. `dexhal-plugin` ABI 3: flags `LEARNED_DYNAMICS`
+    / `TORQUE_OBSERVER`, error code 6, vtable entries `math_step_free_torque`,
+    `math_reset_torque_observer`, `math_payload_torque`. The mock driver takes
+    `MockDriver::with_torque_observer` or plugin config `observer=<path>`.
+    `codegen/next`: `.dexnext` format and NumPy reference (`dexnext.py`),
+    `train_next.py` (training, export, parity check; residual targets use the
+    logged `tau_model`, the driver's own inverse dynamics, not pinocchio),
+    `make_fixtures.py`. Acceptance: PyTorch float64 parity < 1e-10 over 100
+    windows stepped at 1 kHz (`torque_observer::tests::pytorch_parity`;
+    weights and inputs come from a shared LCG, only
+    `tests/fixtures/next/parity.expected` is committed); plugin round trip and
+    rejections (`mock/rust/tests/plugin.rs`); zero allocation in the driver
+    tick and across the plugin, and WCET < 1 ms (`mock/rust/tests/observer_rt.rs`:
+    `LstmObserver::step` at 1 kHz ~0.16 ms mean / ~0.24 ms worst, a whole
+    window at 100 Hz ~1.7 ms worst of 10 ms, on a desktop x86-64);
+    `thumbv7em-none-eabihf` build.
+    Deviations from the spec: weights stay in the `&'static [u8]` (≈ 1.9 MB
+    for 6 joints, stored transposed), so drivers use `include_bytes!` or
+    `Box::leak`; `FrictionResidual` is our extension (the paper trains full
+    torque); head dropout placement (after the ReLU) is assumed; a third vtable
+    entry `math_payload_torque` serves the
+    vendor `aux` path; `FrictionResidual` is rejected whenever
+    `!HAS_DYNAMICS`. Data collection (spec §3.1, including logging
+    `tau_model`), kernel wiring and acceptance criterion 4 (payload / contact
+    isolation in the `dexzero` sim) are **[dexzero]** work.
 60. Done: **[dexhal] [dexzero] Consolidate stateless SE(3), weighted DLS, and Khatib operational-space projectors in `dexhal::math`.**
     Moved all stateless `#![no_std]` spatial, kinematic, and operational-space
     linear algebra out of `dexzero` (`kernel/src/math.rs` and `sim/src/lib.rs`)

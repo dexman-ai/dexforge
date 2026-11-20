@@ -18,7 +18,7 @@
 //! // In a driver: include_str!("../manifest.yaml")
 //! static MANIFEST: &str = "
 //! driver: demo
-//! version: \"0.3\"
+//! version: \"0.4\"
 //! control_freq_hz: 500
 //! control_modes: [joint_pos, joint_vel]
 //! latency:
@@ -55,7 +55,7 @@
 //! | `limits.cartesian_velocity`, `limits.cartesian_acceleration` | no | TCP bound `[linear, angular]` (m/s, rad/s; m/s², rad/s²) |
 //! | `has_static_inertials` | no | Static link mass / inertia model is trustworthy for host impedance, Route 3 (default [`ArmModel::HAS_DYNAMICS`]; must be `false` when `!HAS_DYNAMICS`) |
 //! | `has_residual_inertials` | no | Static link mass / inertia model is trustworthy for torque-residual admittance, Route 6 (default `has_static_inertials`; must be `false` when `!HAS_DYNAMICS`) |
-//! | `dynamics_source` | no | `model` (default) or `vendor` (`aux`): whether per-tick control routes use [`ArmModel`] SymPy dynamics or runtime `gravity_torque`, `coriolis_torque`, `mass_matrix` streamed in `aux` |
+//! | `dynamics_source` | no | `model` (default), `vendor` (`aux`) or `learned`: whether per-tick control routes use [`ArmModel`] SymPy dynamics, runtime `gravity_torque`, `coriolis_torque`, `mass_matrix` streamed in `aux`, or a learned `.dexnext` torque observer the driver installs (FACTR 2) |
 //! | `sensing.torque`, `.wrench`, `.gripper` | no | Hardware sensing (default `false`) |
 //! | `sensing.torque_constants` | no | Per-joint raw-unit → N·m factor when [`CoreState::torques`] carries motor current |
 //! | `sensing.wrench_frame` | no | `base` (default), `flange` or `tcp`: reference of [`CoreState::wrench`] |
@@ -101,6 +101,11 @@ pub enum DynamicsSource {
     /// [`aux_dynamics::CORIOLIS_TORQUE`] (`DOF`) and
     /// [`aux_dynamics::MASS_MATRIX`] (`DOF * DOF`, row-major).
     Vendor,
+    /// A learned torque observer (FACTR 2, `.dexnext`) installed by the
+    /// driver predicts the free-space link torque (`learned`); see
+    /// [`ArmManifest::has_torque_observer`]. `M`, `C qd`, `G` still come from
+    /// the [`ArmModel`] where available.
+    Learned,
 }
 
 /// One field of the driver-specific tail following [`CoreState`].
@@ -377,6 +382,12 @@ pub struct ArmManifest {
     /// Where per-tick control routes obtain link dynamics at the measured
     /// state (`dynamics_source`, default [`DynamicsSource::Model`]).
     pub dynamics_source: DynamicsSource,
+    /// Whether the driver installed a learned torque observer
+    /// ([`Arm::set_torque_observer`](crate::math::arm::Arm::set_torque_observer))
+    /// at construction, so [`ArmDriver::step_free_torque`](super::ArmDriver::step_free_torque)
+    /// predicts the free-space torque with it. Set by the driver, not read
+    /// from the manifest text (default `false`).
+    pub has_torque_observer: bool,
     pub model: ModelCapabilities,
 }
 
@@ -447,6 +458,7 @@ impl ArmManifest {
             has_static_inertials: A::HAS_DYNAMICS,
             has_residual_inertials: A::HAS_DYNAMICS,
             dynamics_source: DynamicsSource::Model,
+            has_torque_observer: false,
             model: ModelCapabilities {
                 dof: DOF as u8,
                 max_ik_solutions: MAX as u16,
@@ -465,12 +477,14 @@ impl ArmManifest {
     }
 
     /// Whether per-tick inverse dynamics are usable for torque-residual
-    /// wrench estimation in `HostAdmittanceTorque` (Route 6): either static
-    /// URDF inertials usable for residual estimation or runtime dynamics
-    /// streamed by the vendor controller in `aux`.
+    /// wrench estimation in `HostAdmittanceTorque` (Route 6): static URDF
+    /// inertials usable for residual estimation, runtime dynamics streamed
+    /// by the vendor controller in `aux`, or a learned torque observer
+    /// (`dynamics_source: learned` or [`has_torque_observer`](Self::has_torque_observer)).
     pub fn has_residual_dynamics(&self) -> bool {
         (self.model.dynamics && self.has_residual_inertials)
-            || self.dynamics_source == DynamicsSource::Vendor
+            || self.dynamics_source != DynamicsSource::Model
+            || self.has_torque_observer
     }
 
     /// Extract the vendor-streamed [`DynamicsState`] (`gravity_torque`,
@@ -698,6 +712,7 @@ fn parse_dynamics_source(s: &str) -> Parsed<DynamicsSource> {
     match unquote(s) {
         "model" => Ok(DynamicsSource::Model),
         "vendor" | "aux" => Ok(DynamicsSource::Vendor),
+        "learned" => Ok(DynamicsSource::Learned),
         _ => Err(ManifestErrorKind::InvalidValue),
     }
 }
@@ -1236,7 +1251,7 @@ mod tests {
     }
 
     const MINIMAL: &str = "driver: six-r
-version: \"0.3\"
+version: \"0.4\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 latency:
@@ -1284,7 +1299,7 @@ limits:
         use ManifestErrorKind::*;
         assert_eq!(kind(""), (0, MissingKey("driver")));
         assert_eq!(
-            kind("driver: six-r\nversion: \"0.3\"\ncontrol_freq_hz: 250\ncontrol_modes: [joint_pos]\nlatency:\n  state_staleness_cycles: 0\n  command_dispatch_cycles: 0\nlimits:\n  velocity: [1, 1, 1, 1, 1, 1]\n  effort: [3, 3, 3, 3, 3, 3]\n"),
+            kind("driver: six-r\nversion: \"0.4\"\ncontrol_freq_hz: 250\ncontrol_modes: [joint_pos]\nlatency:\n  state_staleness_cycles: 0\n  command_dispatch_cycles: 0\nlimits:\n  velocity: [1, 1, 1, 1, 1, 1]\n  effort: [3, 3, 3, 3, 3, 3]\n"),
             (0, MissingKey("limits.acceleration"))
         );
         assert_eq!(kind("driver: other-arm\n"), (1, ModelMismatch));
@@ -1352,7 +1367,7 @@ limits:
 
         // Ratings must be positive and finite, position limits ordered.
         let zero_velocity: &'static str = "driver: six-r
-version: \"0.3\"
+version: \"0.4\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 latency:
@@ -1415,7 +1430,7 @@ limits:
         // Item 57: has_residual_inertials defaults to has_static_inertials when omitted,
         // and can be enabled independently for Route 6 while Route 3 is disabled.
         let both_off: &'static str = "driver: six-r
-version: \"0.3\"
+version: \"0.4\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 has_static_inertials: false
@@ -1434,7 +1449,7 @@ limits:
         assert!(!m_off.has_residual_dynamics());
 
         let route6_only: &'static str = "driver: six-r
-version: \"0.3\"
+version: \"0.4\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 has_static_inertials: false
@@ -1455,7 +1470,7 @@ limits:
 
         // Item 58: dynamics_source: vendor requires canonical aux fields and extracts DynamicsState.
         let missing_aux: &'static str = "driver: six-r
-version: \"0.3\"
+version: \"0.4\"
 control_freq_hz: 250
 control_modes: [joint_pos]
 dynamics_source: vendor
@@ -1470,7 +1485,7 @@ limits:
         assert_eq!(kind(missing_aux), (0, InvalidAux));
 
         let vendor_ok: &'static str = "driver: six-r
-version: \"0.3\"
+version: \"0.4\"
 control_freq_hz: 250
 control_modes: [joint_pos, joint_torque]
 has_static_inertials: false
@@ -1508,5 +1523,32 @@ aux:
         assert_eq!(d.m_matrix[0][0], 100.0);
         assert_eq!(d.m_matrix[5][5], 105.0);
         assert_eq!(d.g_vector[6..], [0.0, 0.0]);
+
+        // Item 59: a learned observer enables Route 6 but never Route 3.
+        let learned: &'static str = "driver: six-r
+version: \"0.4\"
+control_freq_hz: 250
+control_modes: [joint_pos]
+has_static_inertials: false
+dynamics_source: learned
+latency:
+  state_staleness_cycles: 0
+  command_dispatch_cycles: 0
+limits:
+  velocity: [1, 1, 1, 1, 1, 1]
+  acceleration: [2, 2, 2, 2, 2, 2]
+  effort: [3, 3, 3, 3, 3, 3]
+";
+        let m_learned = ArmManifest::from_text::<NoDyn, 6, 1>(learned).unwrap();
+        assert_eq!(m_learned.dynamics_source, DynamicsSource::Learned);
+        assert!(!m_learned.has_torque_observer);
+        assert!(m_learned.has_residual_dynamics());
+        assert!(!m_learned.has_impedance_dynamics());
+
+        let mut m_flag = ArmManifest::from_text::<NoDyn, 6, 1>(MINIMAL).unwrap();
+        assert!(!m_flag.has_residual_dynamics());
+        m_flag.has_torque_observer = true;
+        assert!(m_flag.has_residual_dynamics());
+        assert!(!m_flag.has_impedance_dynamics());
     }
 }

@@ -17,8 +17,12 @@ dependencies = [
     "pytest",
 ]
 
+[project.optional-dependencies]
+# FACTR 2 learned torque observer training (codegen/next/train_next.py).
+next = ["torch"]
+
 [tool.setuptools]
-packages = ["codegen"]
+packages = ["codegen", "codegen.next"]
 
 [tool.setuptools.package-data]
 codegen = ["templates/**/*", "*.md"]
