@@ -104,7 +104,7 @@ def test_scaffold_manifest_draft(ur5_scaffold):
     text = ur5_scaffold.layout.manifest.read_text(encoding="utf-8")
     assert re.search(r"^driver: ur5\b", text, re.M)
     assert 'version: "0.3"' in text
-    assert "velocity: [3.15, 3.15, 3.15, 3.2, 3.2, 3.2]" in text
+    assert "velocity: [" + ", ".join(["3.141592653589793"] * 6) + "]" in text  # UR5e: pi rad/s
     assert "effort: [150.0, 150.0, 150.0, 28.0, 28.0, 28.0]" in text
     assert "has_static_inertials: true" in text
     assert "TODO" in text  # agent-supplied fields stay explicit
