@@ -481,6 +481,31 @@ impl ArmMath for LoadedMath {
         // SAFETY: live handle.
         self.model_call(|h| unsafe { f(h, step) })
     }
+
+    fn step_free_torque_padded(
+        &mut self,
+        q: &Q,
+        qd: &Q,
+        qdd: &Q,
+        q_cmd: Option<&Q>,
+        control_freq_hz: u32,
+    ) -> Option<Q> {
+        let f = self.vtable.math_step_free_torque;
+        let cmd = q_cmd.map_or(core::ptr::null(), |c| c as *const Q);
+        // SAFETY: live handle and valid pointers; `cmd` is null or valid.
+        self.query(|h, out| unsafe { f(h, q, qd, qdd, cmd, control_freq_hz, out) })
+    }
+
+    fn reset_torque_observer_state(&mut self) {
+        let f = self.vtable.math_reset_torque_observer;
+        // SAFETY: live handle.
+        let _ = self.model_call(|h| unsafe { f(h) });
+    }
+
+    fn payload_torque_padded(&self, q: &Q, qd: &Q, qdd: &Q) -> Option<Q> {
+        // SAFETY: live handle and valid pointers.
+        self.query(|h, out| unsafe { (self.vtable.math_payload_torque)(h, q, qd, qdd, out) })
+    }
 }
 
 /// Minimal dynamic-library loading, without dependencies. Libraries are never
