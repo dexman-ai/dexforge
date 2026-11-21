@@ -55,6 +55,7 @@ _MESH_ROOT = _REPO_ROOT / "tools" / "meshes"
 # arm -> (OEM repo directory, Python package)
 _ARMS = {
     "ur5": ("dexforge-ur", "dexforge_ur"),
+    "ur3e": ("dexforge-ur", "dexforge_ur"),
     "z1": ("dexforge-unitree", "dexforge_unitree"),
     "piper": ("dexforge-agilex", "dexforge_agilex"),
     "franka_panda": ("dexforge-franka", "dexforge_franka"),

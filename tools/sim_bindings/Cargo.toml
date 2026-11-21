@@ -7,7 +7,7 @@ license = "BSD-3-Clause"
 publish = false
 
 [lib]
-# The Python module is still named `dexforge_ur` (UR5e only for now); other arms get their own modules.
+# The Python module is named `dexforge_ur` (the OEM crate); each arm is a submodule: `dexforge_ur.ur5`, `dexforge_ur.ur3e`.
 name = "dexforge_ur"
 crate-type = ["cdylib"]
 

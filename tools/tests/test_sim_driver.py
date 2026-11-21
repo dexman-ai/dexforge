@@ -14,14 +14,26 @@ import sim_driver as S  # noqa: E402
 
 import dexforge_ur  # noqa: E402
 
-ur5 = dexforge_ur.ur5
+ARMS = ["ur5", "ur3e"]
+
+
+@pytest.fixture(params=ARMS)
+def arm_name(request):
+    return request.param
+
+
+@pytest.fixture
+def arm(arm_name):
+    return getattr(dexforge_ur, arm_name)
+
+
 Q0 = np.array([0.0, -np.pi / 2, np.pi / 2, -np.pi / 2, -np.pi / 2, 0.0])
 GOAL = Q0 + np.array([0.4, 0.3, -0.3, 0.2, -0.2, 0.3])
 
 
 @pytest.fixture
-def drv():
-    d = S.SimDriver("ur5")
+def drv(arm_name):
+    d = S.SimDriver(arm_name)
     d.connect()
     yield d
     d.disconnect()
@@ -38,7 +50,7 @@ def state(d):
 def cmd_q(d, q):
     c = d.idle_command()
     lay = dexforge_ur.command_layout()
-    c[lay["control_mode"][0]] = ur5.control_modes()["joint_pos"]
+    c[lay["control_mode"][0]] = getattr(dexforge_ur, d.arm).control_modes()["joint_pos"]
     off = lay["target_q"][0]
     c[off : off + 6] = q
     return c
@@ -47,7 +59,7 @@ def cmd_q(d, q):
 def cmd_pose(d, pose):
     c = d.idle_command()
     lay = dexforge_ur.command_layout()
-    c[lay["control_mode"][0]] = ur5.control_modes()["cartesian_pose"]
+    c[lay["control_mode"][0]] = getattr(dexforge_ur, d.arm).control_modes()["cartesian_pose"]
     off = lay["target_pose"][0]
     c[off : off + 7] = pose
     return c
@@ -56,7 +68,7 @@ def cmd_pose(d, pose):
 def cmd_qd(d, qd):
     c = d.idle_command()
     lay = dexforge_ur.command_layout()
-    c[lay["control_mode"][0]] = ur5.control_modes()["joint_vel"]
+    c[lay["control_mode"][0]] = getattr(dexforge_ur, d.arm).control_modes()["joint_vel"]
     off = lay["target_qd"][0]
     c[off : off + 6] = qd
     return c
@@ -110,8 +122,8 @@ def test_joint_velocity_mode(drv):
     assert abs((f("q")[0] - Q0[0]) - 0.2) < 0.02
 
 
-def test_cartesian_pose_uses_generated_ik(drv):
-    pose = np.array(ur5.fk_pose(GOAL.tolist()))
+def test_cartesian_pose_uses_generated_ik(drv, arm):
+    pose = np.array(arm.fk_pose(GOAL.tolist()))
     drv.write_command(cmd_pose(drv, pose))
     drv.step(1500)
     _, f = state(drv)
@@ -142,10 +154,10 @@ def test_unreachable_pose_faults_and_holds_until_cleared(drv):
     assert np.abs(f("q")[:6] - GOAL).max() < 1e-3
 
 
-def test_ik_step_bound_fault():
-    d = S.SimDriver("ur5", ik_max_joint_step=0.01)
+def test_ik_step_bound_fault(arm, arm_name):
+    d = S.SimDriver(arm_name, ik_max_joint_step=0.01)
     d.connect()
-    d.write_command(cmd_pose(d, np.array(ur5.fk_pose(GOAL.tolist()))))
+    d.write_command(cmd_pose(d, np.array(arm.fk_pose(GOAL.tolist()))))
     d.step(50)
     _, f = state(d)
     assert f("fault_code")[0] == S.FAULT_IK_STEP_TOO_LARGE
@@ -184,9 +196,9 @@ def test_idle_holds(drv):
     assert np.abs(f("q")[:6] - GOAL).max() < 1e-3 and np.abs(f("qd")[:6]).max() < 1e-3
 
 
-def test_write_command_rejects_what_the_contract_rejects(drv):
+def test_write_command_rejects_what_the_contract_rejects(drv, arm):
     lay = dexforge_ur.command_layout()
-    modes = ur5.control_modes()
+    modes = arm.control_modes()
 
     unsupported = drv.idle_command()  # joint_torque is not in the manifest
     unsupported[lay["control_mode"][0]] = modes["joint_torque"]
@@ -218,15 +230,15 @@ def first_change_cycle(d):
     raise AssertionError("never moved")
 
 
-def test_latency_queues_shift_by_manifest_cycles():
-    d = S.SimDriver("ur5")
+def test_latency_queues_shift_by_manifest_cycles(arm_name):
+    d = S.SimDriver(arm_name)
     d.connect()
     m = d.manifest()
     expected = m["command_dispatch_cycles"] + m["state_staleness_cycles"] + 1
     assert first_change_cycle(d) == expected
     d.disconnect()
 
-    z = S.SimDriver("ur5")
+    z = S.SimDriver(arm_name)
     z._manifest["command_dispatch_cycles"] = 0
     z._manifest["state_staleness_cycles"] = 0
     z.connect()
@@ -243,8 +255,8 @@ def test_n_cycles_produce_n_timestamps(drv):
     assert abs((f("timestamp")[0] - t0) - (10 - stale) * drv.dt) < 1e-12
 
 
-def test_threaded_loop_latches_commands():
-    d = S.SimDriver("ur5", realtime=False)
+def test_threaded_loop_latches_commands(arm_name):
+    d = S.SimDriver(arm_name, realtime=False)
     d.connect(threaded=True)
     d.write_command(cmd_q(d, GOAL))
     deadline = time.time() + 20
@@ -261,10 +273,10 @@ def test_threaded_loop_latches_commands():
     assert ok, "threaded sim did not converge"
 
 
-def test_sim_entry_point_demo_passes_headless(capsys):
+def test_sim_entry_point_demo_passes_headless(capsys, arm_name):
     import sim
 
-    assert sim.main(["--arm", "ur5", "--headless"]) == 0
+    assert sim.main(["--arm", arm_name, "--headless"]) == 0
     out = capsys.readouterr().out
     assert out.count("ok") == 6 and "FAIL" not in out
 
@@ -297,10 +309,10 @@ def test_streamed_joint_trajectory_tracks_without_fault(drv):
     assert np.abs(f("q")[:6] - traj[-1]).max() < 1e-3  # and it settles on the final target
 
 
-def test_streamed_cartesian_line_follows_ik_branch(drv):
+def test_streamed_cartesian_line_follows_ik_branch(drv, arm):
     """A short TCP line streamed as poses; each is solved by the generated IK on the current branch."""
     n = 1000
-    p0 = np.array(ur5.fk_pose(Q0.tolist()))
+    p0 = np.array(arm.fk_pose(Q0.tolist()))
     poses = []
     for s in np.linspace(0.0, 1.0, n):
         p = p0.copy()
@@ -329,8 +341,8 @@ def test_clear_faults_drops_the_rejected_command(drv):
     assert np.abs(f("q")[:6] - GOAL).max() < 1e-3
 
 
-def test_control_thread_crash_is_reported_as_a_fault():
-    d = S.SimDriver("ur5")
+def test_control_thread_crash_is_reported_as_a_fault(arm_name):
+    d = S.SimDriver(arm_name)
     d.connect(threaded=True)
     try:
         def boom():
@@ -346,15 +358,15 @@ def test_control_thread_crash_is_reported_as_a_fault():
         d.disconnect()
 
 
-def test_use_before_connect_is_a_clear_error():
-    d = S.SimDriver("ur5")
+def test_use_before_connect_is_a_clear_error(arm_name):
+    d = S.SimDriver(arm_name)
     with pytest.raises(RuntimeError, match="not connected"):
         d.step()
     with pytest.raises(RuntimeError, match="not connected"):
         d.read_state(np.zeros(d.manifest()["state_len"]))
 
 
-def test_mjcf_mesh_names_do_not_collide_and_paths_are_escaped(tmp_path):
+def test_mjcf_mesh_names_do_not_collide_and_paths_are_escaped(tmp_path, arm_name):
     import urdf_to_mjcf as G
 
     urdf = tmp_path / "a.urdf"
@@ -373,9 +385,9 @@ def test_mjcf_mesh_names_do_not_collide_and_paths_are_escaped(tmp_path):
     etree.fromstring(xml.encode())  # well-formed despite the '&' in the path
 
 
-def _hold_own_pose(q0, cycles=300):
+def _hold_own_pose(arm_name, q0, cycles=300):
     """Start the arm at ``q0`` and command it its own current TCP pose (cartesian mode)."""
-    d = S.SimDriver("ur5", q0=q0)
+    d = S.SimDriver(arm_name, q0=q0)
     d.connect()
     _, f = state(d)
     pose = f("tcp_pose")[:7].copy()
@@ -384,13 +396,13 @@ def _hold_own_pose(q0, cycles=300):
     return d, state(d)[1]
 
 
-def test_cartesian_at_wrist_singularity_holds_and_faults_then_recovers():
+def test_cartesian_at_wrist_singularity_holds_and_faults_then_recovers(arm_name):
     """At q5 = 0 the solver only returns the far shoulder branch (see the Rust test
     ``wrist_singularity_still_solves``), so commanding the arm its own pose exceeds the IK
     step bound. The sim must hold the arm still, latch fault 2, and recover on clear_faults().
     """
     q0 = np.array([0.3, -1.0, 1.2, -0.5, 0.0, 0.2])
-    d, f = _hold_own_pose(q0)
+    d, f = _hold_own_pose(arm_name, q0)
     try:
         assert f("fault_code")[0] == S.FAULT_IK_STEP_TOO_LARGE
         np.testing.assert_allclose(f("q")[:6], q0, atol=1e-3)  # held, did not swing to the other branch
@@ -404,9 +416,9 @@ def test_cartesian_at_wrist_singularity_holds_and_faults_then_recovers():
         d.disconnect()
 
 
-def test_cartesian_just_off_the_singularity_works():
+def test_cartesian_just_off_the_singularity_works(arm_name):
     q0 = np.array([0.3, -1.0, 1.2, -0.5, 1e-3, 0.2])
-    d, f = _hold_own_pose(q0)
+    d, f = _hold_own_pose(arm_name, q0)
     try:
         assert f("fault_code")[0] == S.FAULT_NONE
         np.testing.assert_allclose(f("q")[:6], q0, atol=1e-3)
@@ -415,10 +427,10 @@ def test_cartesian_just_off_the_singularity_works():
 
 
 @pytest.mark.parametrize("step", [0.4, 0.02, 1e-4])
-def test_reference_acceleration_stays_bounded_through_arrival(step):
+def test_reference_acceleration_stays_bounded_through_arrival(step, arm_name):
     """The reference may never change speed faster than the manifest acceleration limit,
     including when it brakes into the target (no snap to zero on arrival)."""
-    d = S.SimDriver("ur5")
+    d = S.SimDriver(arm_name)
     d.connect()
     try:
         tgt = Q0.copy()
@@ -440,14 +452,14 @@ def test_reference_acceleration_stays_bounded_through_arrival(step):
         d.disconnect()
 
 
-def test_non_positive_acceleration_limit_is_rejected_at_construction(monkeypatch):
-    real = dexforge_ur.ur5.manifest
+def test_non_positive_acceleration_limit_is_rejected_at_construction(monkeypatch, arm_name):
+    real = getattr(dexforge_ur, arm_name).manifest
 
     def bad():
         m = dict(real())
         m["acceleration_limits"] = [0.0] * len(m["acceleration_limits"])
         return m
 
-    monkeypatch.setattr(dexforge_ur.ur5, "manifest", bad, raising=False)
+    monkeypatch.setattr(getattr(dexforge_ur, arm_name), "manifest", bad, raising=False)
     with pytest.raises(ValueError, match="acceleration_limits"):
-        S.SimDriver("ur5")
+        S.SimDriver(arm_name)
