@@ -471,6 +471,48 @@ unsafe extern "C" fn math_apply_ik_max_joint_step<T: PluginDriver>(
     guard(|| Ok(unsafe { math_mut::<T>(h) }.apply_ik_max_joint_step(step)?))
 }
 
+unsafe extern "C" fn math_step_free_torque<T: PluginDriver>(
+    h: MathHandle,
+    q: *const Q,
+    qd: *const Q,
+    qdd: *const Q,
+    q_cmd: *const Q,
+    control_freq_hz: u32,
+    out: *mut Q,
+) -> bool {
+    // SAFETY: live handle and valid pointers; `q_cmd` is null or valid.
+    unsafe {
+        query(out, || {
+            math_mut::<T>(h).step_free_torque_padded(
+                &*q,
+                &*qd,
+                &*qdd,
+                q_cmd.as_ref(),
+                control_freq_hz,
+            )
+        })
+    }
+}
+
+unsafe extern "C" fn math_reset_torque_observer<T: PluginDriver>(h: MathHandle) -> FfiResult {
+    guard(|| {
+        // SAFETY: live handle.
+        unsafe { math_mut::<T>(h) }.reset_torque_observer_state();
+        Ok(())
+    })
+}
+
+unsafe extern "C" fn math_payload_torque<T: PluginDriver>(
+    h: MathHandle,
+    q: *const Q,
+    qd: *const Q,
+    qdd: *const Q,
+    out: *mut Q,
+) -> bool {
+    // SAFETY: live handle and valid pointers.
+    unsafe { query(out, || math_ref::<T>(h).payload_torque_padded(&*q, &*qd, &*qdd)) }
+}
+
 /// The function table of driver `T`; use through
 /// [`export_plugin!`](crate::export_plugin).
 pub const fn vtable<T: PluginDriver>() -> PluginVTable {
@@ -514,5 +556,8 @@ pub const fn vtable<T: PluginDriver>() -> PluginVTable {
         math_apply_calibration: math_apply_calibration::<T>,
         math_remove_calibration: math_remove_calibration::<T>,
         math_apply_ik_max_joint_step: math_apply_ik_max_joint_step::<T>,
+        math_step_free_torque: math_step_free_torque::<T>,
+        math_reset_torque_observer: math_reset_torque_observer::<T>,
+        math_payload_torque: math_payload_torque::<T>,
     }
 }

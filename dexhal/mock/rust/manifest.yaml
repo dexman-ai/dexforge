@@ -5,7 +5,7 @@
 # control mode and reflects the sensing channels below back in its state.
 
 driver: mock-6r               # must equal MockArm::NAME
-version: "0.3"
+version: "0.4"
 control_freq_hz: 500
 control_modes: [joint_pos, joint_vel, joint_torque, cartesian_pose, cartesian_twist, cartesian_wrench]
 realtime: false

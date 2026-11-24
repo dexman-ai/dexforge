@@ -58,7 +58,7 @@ pub use host::{LoadedDriver, LoadedMath, Plugin, PluginError};
 
 /// Version of [`PluginVTable`] and the types it passes. Bumped on any change
 /// to their layout.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 /// Name of the entry point a driver library exports (an [`EntryFn`]).
 pub const ENTRY_SYMBOL: &str = "dexhal_plugin_entry";
@@ -188,6 +188,7 @@ pub const fn model_error_code(e: ModelError) -> u32 {
         ModelError::InvalidPayload => 3,
         ModelError::NonPositive => 4,
         ModelError::ExcessiveDeviation => 5,
+        ModelError::InvalidObserver => 6,
     }
 }
 
@@ -199,6 +200,7 @@ pub const fn model_error_from_code(code: u32) -> ModelError {
         3 => ModelError::InvalidPayload,
         4 => ModelError::NonPositive,
         5 => ModelError::ExcessiveDeviation,
+        6 => ModelError::InvalidObserver,
         _ => ModelError::NonFinite,
     }
 }
@@ -255,6 +257,8 @@ pub mod manifest_flag {
     pub const MODEL_DYNAMICS: u32 = 1 << 16;
     pub const RESIDUAL_INERTIALS: u32 = 1 << 17;
     pub const VENDOR_DYNAMICS: u32 = 1 << 18;
+    pub const LEARNED_DYNAMICS: u32 = 1 << 19;
+    pub const TORQUE_OBSERVER: u32 = 1 << 20;
 }
 
 /// [`ArmManifest`] in C layout. Strings point into the plugin's static data.
@@ -337,6 +341,7 @@ impl ManifestDesc {
             has_static_inertials,
             has_residual_inertials,
             dynamics_source,
+            has_torque_observer,
             model,
         } = *m;
         use manifest_flag::*;
@@ -360,6 +365,8 @@ impl ManifestDesc {
             (model.dynamics, MODEL_DYNAMICS),
             (has_residual_inertials, RESIDUAL_INERTIALS),
             (dynamics_source == DynamicsSource::Vendor, VENDOR_DYNAMICS),
+            (dynamics_source == DynamicsSource::Learned, LEARNED_DYNAMICS),
+            (has_torque_observer, TORQUE_OBSERVER),
         ]
         .iter()
         .filter(|(set, _)| *set)
@@ -440,8 +447,13 @@ impl ManifestDesc {
         if (has_static_inertials || has_residual_inertials) && !model_dynamics {
             return None;
         }
+        if has(VENDOR_DYNAMICS) && has(LEARNED_DYNAMICS) {
+            return None;
+        }
         let dynamics_source = if has(VENDOR_DYNAMICS) {
             DynamicsSource::Vendor
+        } else if has(LEARNED_DYNAMICS) {
+            DynamicsSource::Learned
         } else {
             DynamicsSource::Model
         };
@@ -502,6 +514,7 @@ impl ManifestDesc {
             has_static_inertials,
             has_residual_inertials,
             dynamics_source,
+            has_torque_observer: has(TORQUE_OBSERVER),
             model: ModelCapabilities {
                 dof: u8::try_from(self.model_dof).ok()?,
                 max_ik_solutions: u16::try_from(self.model_max_ik_solutions).ok()?,
@@ -651,6 +664,26 @@ pub struct PluginVTable {
     pub math_remove_calibration: unsafe extern "C" fn(math: MathHandle) -> FfiResult,
     pub math_apply_ik_max_joint_step:
         unsafe extern "C" fn(math: MathHandle, step: f64) -> FfiResult,
+    /// Free-space torque for this control tick, advancing the learned
+    /// torque observer if any. q_cmd may be null.
+    pub math_step_free_torque: unsafe extern "C" fn(
+        math: MathHandle,
+        q: *const Q,
+        qd: *const Q,
+        qdd: *const Q,
+        q_cmd: *const Q,
+        control_freq_hz: u32,
+        out: *mut Q,
+    ) -> bool,
+    pub math_reset_torque_observer: unsafe extern "C" fn(math: MathHandle) -> FfiResult,
+    /// Inverse dynamics of the host payload alone.
+    pub math_payload_torque: unsafe extern "C" fn(
+        math: MathHandle,
+        q: *const Q,
+        qd: *const Q,
+        qdd: *const Q,
+        out: *mut Q,
+    ) -> bool,
 }
 
 /// Export `$driver` (a [`PluginDriver`]) as this library's
@@ -680,6 +713,7 @@ mod tests {
             ModelError::InvalidPayload,
             ModelError::NonPositive,
             ModelError::ExcessiveDeviation,
+            ModelError::InvalidObserver,
         ];
         for e in errors {
             assert_eq!(model_error_from_code(model_error_code(e)), e);
@@ -777,5 +811,19 @@ mod tests {
         let mut bad_no_aux = desc;
         bad_no_aux.aux_len = 0;
         assert!(unsafe { bad_no_aux.to_manifest() }.is_none());
+
+        let mut both = desc;
+        both.flags |= manifest_flag::LEARNED_DYNAMICS;
+        assert!(unsafe { both.to_manifest() }.is_none());
+
+        // A learned observer survives the round trip and enables Route 6.
+        m.dynamics_source = DynamicsSource::Learned;
+        m.has_residual_inertials = false;
+        m.has_torque_observer = true;
+        let rebuilt = unsafe { ManifestDesc::from_manifest(&m).to_manifest() }.unwrap();
+        assert_eq!(rebuilt.dynamics_source, DynamicsSource::Learned);
+        assert!(rebuilt.has_torque_observer);
+        assert!(rebuilt.has_residual_dynamics());
+        assert!(!rebuilt.has_impedance_dynamics());
     }
 }

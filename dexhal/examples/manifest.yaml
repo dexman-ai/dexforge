@@ -8,7 +8,7 @@
 # unit tests, so it always matches the parser.
 
 driver: six-r                 # required; must equal the model's ArmModel::NAME
-version: "0.3"                # required; contract version the driver targets
+version: "0.4"                # required; contract version the driver targets
 control_freq_hz: 500          # required; rate at which the hardware expects commands
 control_modes: [joint_pos, joint_vel, cartesian_pose]   # required; natively executed targets:
                               #   joint_pos, joint_vel, joint_torque,
@@ -44,7 +44,9 @@ has_static_inertials: true    # optional (ArmModel::HAS_DYNAMICS; must be false 
 has_residual_inertials: true  # optional (defaults to has_static_inertials; must be false when !HAS_DYNAMICS);
                               # true allows torque-residual admittance (Route 6) even when has_static_inertials is false
 dynamics_source: model        # optional (model); vendor (or aux) uses gravity_torque (DOF),
-                              # coriolis_torque (DOF) and mass_matrix (DOF*DOF) passed through in aux
+                              # coriolis_torque (DOF) and mass_matrix (DOF*DOF) passed through in aux;
+                              # learned: a FACTR 2 LSTM torque observer (.dexnext, installed by the
+                              # driver with Arm::set_torque_observer) provides Route 6's tau_free
 
 sensing:                      # optional section; every key defaults to false
   torque: true                #   joint torques (native or from motor currents)

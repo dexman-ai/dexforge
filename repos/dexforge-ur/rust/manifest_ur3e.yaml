@@ -8,7 +8,7 @@
 # specification (the manifest does not parse until they are).
 
 driver: ur3e               # must equal Ur3e::NAME
-version: "0.3"
+version: "0.4"
 control_freq_hz: 500          # rate at which the controller expects commands
 control_modes: [joint_pos, joint_vel, cartesian_pose]
 realtime: true

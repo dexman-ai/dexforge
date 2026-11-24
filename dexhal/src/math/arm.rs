@@ -35,6 +35,11 @@ use crate::math::spatial::{
 };
 use crate::math::ssik_core::{add3, cross3, mat3_vec, norm3, wrap_to_pi};
 use crate::math::tolerances::TolerancePolicy;
+use crate::math::torque_observer::{LstmObserver, ObserverMode};
+
+/// Largest per-component difference (m/s²) between the runtime gravity and
+/// the gravity a [`ObserverMode::FullDynamics`] observer was trained under.
+pub const OBSERVER_GRAVITY_TOLERANCE: f64 = 1e-3;
 
 /// Standard gravity (m/s²) used for the default gravity vector `[0, 0, -g]`.
 pub const STANDARD_GRAVITY: f64 = 9.80665;
@@ -108,7 +113,12 @@ pub struct Arm<A, const DOF: usize, const MAX: usize> {
     gravity: [f64; 3],
     calibration: Option<KinematicChain<DOF>>,
     ik_max_joint_step: f64,
+    observer: Option<LstmObserver<DOF>>,
     _model: PhantomData<fn() -> A>,
+}
+
+fn gravity_matches(a: &[f64; 3], b: &[f64; 3]) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= OBSERVER_GRAVITY_TOLERANCE)
 }
 
 impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Default for Arm<A, DOF, MAX> {
@@ -128,6 +138,7 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
             gravity: [0.0, 0.0, -STANDARD_GRAVITY],
             calibration: None,
             ik_max_joint_step: IK_DEFAULT_MAX_JOINT_STEP,
+            observer: None,
             _model: PhantomData,
         }
     }
@@ -158,9 +169,20 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
     }
 
     /// Set the gravity vector in the arm's base frame (wall / ceiling mounts).
+    ///
+    /// Rejected with [`ModelError::InvalidObserver`] while a
+    /// [`ObserverMode::FullDynamics`] torque observer trained under a
+    /// different gravity is installed: its output would silently be wrong.
     pub fn set_gravity(&mut self, gravity: [f64; 3]) -> Result<(), ModelError> {
         if !gravity.iter().all(|v| v.is_finite()) {
             return Err(ModelError::NonFinite);
+        }
+        if let Some(obs) = &self.observer {
+            if obs.mode() == ObserverMode::FullDynamics
+                && !gravity_matches(&gravity, obs.trained_gravity())
+            {
+                return Err(ModelError::InvalidObserver);
+            }
         }
         self.gravity = gravity;
         Ok(())
@@ -221,6 +243,53 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
 
     pub fn ik_max_joint_step(&self) -> f64 {
         self.ik_max_joint_step
+    }
+
+    /// Install a learned torque observer from a `.dexnext` file (FACTR 2).
+    ///
+    /// The bytes are validated ([`LstmObserver::from_bytes`]) and decoded in
+    /// place every tick, so they must outlive the arm: embed them with
+    /// `include_bytes!` or leak a buffer read at start-up. Rejected with
+    /// [`ModelError::InvalidObserver`] if the file is malformed or built for
+    /// another `DOF`, if it is a [`ObserverMode::FrictionResidual`] model and
+    /// the driver has no dynamics, or if it is a
+    /// [`ObserverMode::FullDynamics`] model trained under a gravity other
+    /// than the configured one. The arm is unchanged on error.
+    pub fn set_torque_observer(&mut self, bytes: &'static [u8]) -> Result<(), ModelError> {
+        let obs = LstmObserver::<DOF>::from_bytes(bytes)?;
+        match obs.mode() {
+            ObserverMode::FrictionResidual if !A::HAS_DYNAMICS => {
+                return Err(ModelError::InvalidObserver)
+            }
+            ObserverMode::FullDynamics if !gravity_matches(&self.gravity, obs.trained_gravity()) => {
+                return Err(ModelError::InvalidObserver)
+            }
+            _ => {}
+        }
+        self.observer = Some(obs);
+        Ok(())
+    }
+
+    /// Remove the torque observer; [`step_free_torque`](Self::step_free_torque)
+    /// falls back to the rigid-body model.
+    pub fn clear_torque_observer(&mut self) {
+        self.observer = None;
+    }
+
+    /// Clear the observer's recurrent state and window, e.g. after the arm
+    /// was disabled. No-op without an observer.
+    pub fn reset_torque_observer(&mut self) {
+        if let Some(obs) = &mut self.observer {
+            obs.reset();
+        }
+    }
+
+    pub fn torque_observer(&self) -> Option<&LstmObserver<DOF>> {
+        self.observer.as_ref()
+    }
+
+    pub fn has_torque_observer(&self) -> bool {
+        self.observer.is_some()
     }
 
     // --- kinematics --------------------------------------------------------
@@ -490,6 +559,82 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
                 payload_inverse_dynamics(&pose, &jac, qd, qdd, &self.payload, &self.gravity);
             for i in 0..DOF {
                 tau[i] += extra[i];
+            }
+        }
+        Some(tau)
+    }
+
+    /// Inverse dynamics of the configured payload alone for `(q, qd, qdd)`
+    /// under the configured gravity: what a host adds to a bare-arm torque.
+    pub fn payload_torque(
+        &self,
+        q: &[f64; DOF],
+        qd: &[f64; DOF],
+        qdd: &[f64; DOF],
+    ) -> [f64; DOF] {
+        if self.payload.is_none() {
+            return [0.0; DOF];
+        }
+        let (pose, jac) = self.flange_fk_jacobian(q);
+        payload_inverse_dynamics(&pose, &jac, qd, qdd, &self.payload, &self.gravity)
+    }
+
+    /// Free-space joint torque `τ_free` for this control tick: the torque the
+    /// arm needs for `(q, qd, qdd)` without contact, so
+    /// `τ_measured − τ_free` is the external torque.
+    ///
+    /// With a torque observer installed it is advanced one tick (at
+    /// `control_freq_hz`; it re-evaluates every
+    /// [`LstmObserver::stride_ticks`] ticks and holds its output between)
+    /// and its prediction is used: plus the driver's rigid-body inverse
+    /// dynamics for a [`ObserverMode::FrictionResidual`] model, plus the
+    /// difference between the inverse dynamics of the runtime payload and of
+    /// the payload the observer was trained with. `q_cmd` feeds the
+    /// command-error input feature (zero if `None`); `qdd` is the reference
+    /// acceleration. Without an observer this is
+    /// [`inverse_dynamics`](Self::inverse_dynamics).
+    ///
+    /// `None` without an observer if the driver has no dynamics, if any
+    /// input is not finite (the observer is not advanced), or while the
+    /// observer warms up after a reset (at most `stride − 1` ticks; see
+    /// [`LstmObserver::step`]).
+    pub fn step_free_torque(
+        &mut self,
+        q: &[f64; DOF],
+        qd: &[f64; DOF],
+        qdd: &[f64; DOF],
+        q_cmd: Option<&[f64; DOF]>,
+        control_freq_hz: u32,
+    ) -> Option<[f64; DOF]> {
+        let finite = |v: &[f64; DOF]| v.iter().all(|x| x.is_finite());
+        if !finite(q) || !finite(qd) || !finite(qdd) || !q_cmd.is_none_or(finite) {
+            return None;
+        }
+        let Some(obs) = self.observer.as_mut() else {
+            return self.inverse_dynamics(q, qd, qdd);
+        };
+        let mut u = [*q, *qd, [0.0; DOF]];
+        if let Some(cmd) = q_cmd {
+            for i in 0..DOF {
+                u[2][i] = cmd[i] - q[i];
+            }
+        }
+        let stride = LstmObserver::<DOF>::stride_ticks(control_freq_hz);
+        let mut tau = obs.step(&u, stride)?;
+        let (mode, trained) = (obs.mode(), *obs.trained_payload());
+        if trained != self.payload {
+            let (pose, jac) = self.flange_fk_jacobian(q);
+            let runtime =
+                payload_inverse_dynamics(&pose, &jac, qd, qdd, &self.payload, &self.gravity);
+            let train = payload_inverse_dynamics(&pose, &jac, qd, qdd, &trained, &self.gravity);
+            for i in 0..DOF {
+                tau[i] += runtime[i] - train[i];
+            }
+        }
+        if mode == ObserverMode::FrictionResidual {
+            let rigid = A::flange_inverse_dynamics(q, qd, qdd, &self.gravity);
+            for i in 0..DOF {
+                tau[i] += rigid[i];
             }
         }
         Some(tau)
@@ -1015,5 +1160,180 @@ mod tests {
         let raw = [weight[0], weight[1], weight[2], m[0], m[1], m[2]];
         assert!(close(&arm.external_wrench(&q, &raw, WrenchFrame::Base, false), &[0.0; 6]));
         assert!(close(&arm.external_wrench(&q, &raw, WrenchFrame::Base, true), &raw));
+    }
+
+    mod observer {
+        use super::*;
+        use crate::math::torque_observer::test_support::spec;
+        use crate::math::torque_observer::{LstmObserver, ObserverMode};
+
+        fn motion(k: usize) -> ([f64; 6], [f64; 6], [f64; 6], [f64; 6]) {
+            let q = sample_q::<6>(k as u64, 1.5);
+            let qd = sample_q::<6>(k as u64 + 100, 0.8);
+            let qdd = sample_q::<6>(k as u64 + 200, 2.0);
+            let cmd = q.map(|v| v + 0.01);
+            (q, qd, qdd, cmd)
+        }
+
+        fn raw(obs: &mut LstmObserver<6>, q: &[f64; 6], qd: &[f64; 6], cmd: Option<&[f64; 6]>, stride: usize) -> Option<[f64; 6]> {
+            let mut err = [0.0; 6];
+            if let Some(cmd) = cmd {
+                for i in 0..6 {
+                    err[i] = cmd[i] - q[i];
+                }
+            }
+            obs.step(&[*q, *qd, err], stride)
+        }
+
+        #[test]
+        fn without_an_observer_the_model_is_used() {
+            let mut arm = Arm::<SixR, 6, 1>::new();
+            arm.set_payload(tool_payload()).unwrap();
+            let (q, qd, qdd, cmd) = motion(1);
+            assert_eq!(
+                arm.step_free_torque(&q, &qd, &qdd, Some(&cmd), 1000),
+                arm.inverse_dynamics(&q, &qd, &qdd)
+            );
+            let mut bare = Arm::<Scripted, 6, 3>::new();
+            assert_eq!(bare.step_free_torque(&q, &qd, &qdd, None, 1000), None);
+        }
+
+        #[test]
+        fn full_dynamics_output_is_the_network_plus_the_payload_delta() {
+            let bytes = spec().leak(3);
+            let mut arm = Arm::<Scripted, 6, 3>::new();
+            arm.set_torque_observer(bytes).unwrap();
+            assert!(arm.has_torque_observer());
+            let mut reference = LstmObserver::<6>::from_bytes(bytes).unwrap();
+            for k in 0..25 {
+                let (q, qd, qdd, cmd) = motion(k);
+                // 100 Hz model at 1 kHz: warming up for nine ticks, then
+                // re-evaluated every tenth tick.
+                let expected = raw(&mut reference, &q, &qd, Some(&cmd), 10);
+                assert_eq!(expected.is_none(), k < 9, "tick {k}");
+                let tau = arm.step_free_torque(&q, &qd, &qdd, Some(&cmd), 1000);
+                assert_eq!(tau, expected, "tick {k}");
+            }
+
+            // A runtime payload adds exactly its inverse dynamics (trained bare).
+            let (q, qd, qdd, _) = motion(40);
+            let mut plain = Arm::<Scripted, 6, 3>::new();
+            plain.set_torque_observer(bytes).unwrap();
+            let mut loaded = Arm::<Scripted, 6, 3>::new();
+            loaded.set_torque_observer(bytes).unwrap();
+            loaded.set_payload(tool_payload()).unwrap();
+            let a = plain.step_free_torque(&q, &qd, &qdd, None, 100).unwrap();
+            let b = loaded.step_free_torque(&q, &qd, &qdd, None, 100).unwrap();
+            let p = loaded.payload_torque(&q, &qd, &qdd);
+            assert!(p.iter().any(|v| v.abs() > 1e-3));
+            for i in 0..6 {
+                assert!((b[i] - a[i] - p[i]).abs() < 1e-12);
+            }
+        }
+
+        #[test]
+        fn a_trained_payload_is_not_counted_twice() {
+            let mut s = spec();
+            s.payload = tool_payload();
+            let bytes = s.leak(5);
+            let (q, qd, qdd, _) = motion(2);
+
+            let mut same = Arm::<Scripted, 6, 3>::new();
+            same.set_torque_observer(bytes).unwrap();
+            same.set_payload(tool_payload()).unwrap();
+            let mut none = Arm::<Scripted, 6, 3>::new();
+            none.set_torque_observer(bytes).unwrap();
+            let mut net = LstmObserver::<6>::from_bytes(bytes).unwrap();
+            let raw = raw(&mut net, &q, &qd, None, 1).unwrap();
+
+            assert_eq!(same.step_free_torque(&q, &qd, &qdd, None, 100).unwrap(), raw);
+            // Releasing the trained payload subtracts it.
+            let released = none.step_free_torque(&q, &qd, &qdd, None, 100).unwrap();
+            let p = same.payload_torque(&q, &qd, &qdd);
+            for i in 0..6 {
+                assert!((released[i] - (raw[i] - p[i])).abs() < 1e-12);
+            }
+        }
+
+        #[test]
+        fn friction_residual_adds_the_rigid_body_model() {
+            let mut s = spec();
+            s.mode = ObserverMode::FrictionResidual;
+            let bytes = s.leak(9);
+
+            assert_eq!(
+                Arm::<Scripted, 6, 3>::new().set_torque_observer(bytes),
+                Err(ModelError::InvalidObserver)
+            );
+            let mut arm = Arm::<SixR, 6, 1>::new();
+            arm.set_torque_observer(bytes).unwrap();
+            // A residual model is gravity-independent.
+            arm.set_gravity([0.0, 0.0, STANDARD_GRAVITY]).unwrap();
+            let mut net = LstmObserver::<6>::from_bytes(bytes).unwrap();
+            for k in 0..4 {
+                let (q, qd, qdd, _) = motion(k);
+                let raw = raw(&mut net, &q, &qd, None, 1).unwrap();
+                let rigid = arm.inverse_dynamics(&q, &qd, &qdd).unwrap();
+                let tau = arm.step_free_torque(&q, &qd, &qdd, None, 100).unwrap();
+                for i in 0..6 {
+                    assert!((tau[i] - (raw[i] + rigid[i])).abs() < 1e-12, "tick {k}");
+                }
+            }
+        }
+
+        #[test]
+        fn full_dynamics_is_bound_to_its_training_gravity() {
+            let bytes = spec().leak(1);
+            let ceiling = [0.0, 0.0, STANDARD_GRAVITY];
+
+            let mut arm = Arm::<Scripted, 6, 3>::new();
+            arm.set_gravity(ceiling).unwrap();
+            assert_eq!(arm.set_torque_observer(bytes), Err(ModelError::InvalidObserver));
+            assert!(!arm.has_torque_observer());
+
+            let mut arm = Arm::<Scripted, 6, 3>::new();
+            arm.set_torque_observer(bytes).unwrap();
+            assert_eq!(arm.set_gravity(ceiling), Err(ModelError::InvalidObserver));
+            assert_eq!(arm.gravity(), &[0.0, 0.0, -STANDARD_GRAVITY]);
+            // Within tolerance is fine.
+            arm.set_gravity([0.0, 5e-4, -STANDARD_GRAVITY]).unwrap();
+            arm.clear_torque_observer();
+            arm.set_gravity(ceiling).unwrap();
+
+            let mut s = spec();
+            s.gravity = ceiling;
+            arm.set_torque_observer(s.leak(1)).unwrap();
+        }
+
+        #[test]
+        fn non_finite_input_does_not_advance_the_observer() {
+            let bytes = spec().leak(2);
+            let mut arm = Arm::<Scripted, 6, 3>::new();
+            arm.set_torque_observer(bytes).unwrap();
+            let mut fresh = Arm::<Scripted, 6, 3>::new();
+            fresh.set_torque_observer(bytes).unwrap();
+            let (q, qd, qdd, cmd) = motion(3);
+            let mut bad = qd;
+            bad[2] = f64::NAN;
+            assert_eq!(arm.step_free_torque(&q, &bad, &qdd, None, 100), None);
+            let mut bad_cmd = cmd;
+            bad_cmd[0] = f64::INFINITY;
+            assert_eq!(arm.step_free_torque(&q, &qd, &qdd, Some(&bad_cmd), 100), None);
+            assert_eq!(
+                arm.step_free_torque(&q, &qd, &qdd, Some(&cmd), 100),
+                fresh.step_free_torque(&q, &qd, &qdd, Some(&cmd), 100)
+            );
+
+            // Reset forgets the window: the next tick matches a fresh observer.
+            let (q2, qd2, qdd2, _) = motion(4);
+            let continued = arm.step_free_torque(&q2, &qd2, &qdd2, None, 100).unwrap();
+            arm.reset_torque_observer();
+            let after_reset = arm.step_free_torque(&q2, &qd2, &qdd2, None, 100).unwrap();
+            let mut again = Arm::<Scripted, 6, 3>::new();
+            again.set_torque_observer(bytes).unwrap();
+            let fresh_first = again.step_free_torque(&q2, &qd2, &qdd2, None, 100).unwrap();
+            assert_eq!(after_reset, fresh_first);
+            assert_ne!(continued, fresh_first);
+        }
     }
 }
