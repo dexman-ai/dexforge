@@ -33,6 +33,13 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
   function (`ssik_core::sp6_solve`, `ssik_core::rr_real_roots`,
   `kinematics::lm_refine6`, ...). If a needed kernel is missing from `dexhal`,
   stop and report it instead of writing a local copy.
+- **No finite-difference Jacobians (CRITICAL).** Never write a finite-difference
+  (FD) Jacobian in `ik_solver.rs`, including in refinement, `jac` helpers or
+  tests of the solver. Refinement must use the arm's generated analytic
+  Jacobian: `generated_kinematics::jacobian` (flange `[Jv; Jw]`) converted with
+  `kinematics::residual_columns` and passed to `kinematics::lm_refine_masked_analytic`
+  (or `dls_ik`). Only the test that validates the analytic Jacobian may use
+  central differences, and only as the reference.
 - **Möbius / `pinv` fallback:** do not transpile randomized Möbius transforms or
   `pinv` fallbacks for ill-conditioned eigenproblems. Follow the reference
   pattern: solve a deterministically perturbed pose (e.g. 0.1 mm offset) with
@@ -86,8 +93,63 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
    (by wrap-to-pi distance of the sample to `q_seed[LOCKED_JOINT]`). After each
    sample's candidates are collected, polish them with the reference arm's
    `seed_locked` (locked joint set to the seed's value, seed also used as a
-   start). The first sample that yields a result ends the sweep. Only when no
-   sample closes, run the full sweep and the post-processing above.
+   start). The first sample that yields a result ends the sweep. Polish the
+   seed itself only on the first `seed_locked` call: it is the same start for
+   every sample. When no sample closes, keep the sweep's post-processed result
+   without polishing the sweep solutions again (they already failed the same
+   deterministic polish).
+7. **7-DOF joint-lock `ik_nearest` flavors.** For every 7-DOF joint-lock arm
+   (categories 3–4), provide `Firm` and `Relaxed` flavors through an extra
+   `JointLockFlavor` argument on the generated seeded `ik_nearest` path. Both
+   flavors use three stages, accept a stage only with the checks below, and
+   hand off to the next stage when no candidate is accepted.
+
+   - **Firm:** preserve the locked joint at `q_seed[LOCKED_JOINT]` throughout
+     all stages. Stage 1 is the seed-first masked analytic LM polish (20
+     iterations). Stage 2 tries the nearest lock samples bracketing the seed
+     with the closed-form per-sample solve; use each sample to generate
+     candidates, then set the locked joint to the seed value and polish only
+     the other joints with `lm_refine_masked_analytic` (15 iterations). Stage 3
+     is analytic masked refinement from the seed (20 iterations), again with
+     the locked joint removed from the free set. Use
+     `lm_refine_masked_analytic` and apply the FK acceptance gate; never run
+     full-joint `dls_ik` in this flavor.
+   - **Relaxed:** Stage 1 runs `kinematics::dls_ik` from `q_seed` for 20
+     iterations with all joints free, allowing the redundant joint to move.
+     Stage 2 tries the nearest lock samples bracketing the seed with the
+     closed-form per-sample solve, snaps each candidate's locked joint to that
+     sample value, and polishes only the other joints with
+     `lm_refine_masked_analytic` (15 iterations). Stage 3 is the seed-first
+     masked analytic LM polish (20 iterations), locking the redundant joint
+     at its seed value.
+
+   Use the analytic Jacobian (`residual_columns`); never finite differences.
+   Stage 2 drops candidates whose FK residual before polishing exceeds
+   `policy.subproblem_numerical`. Keep the accepted candidate nearest the seed
+   (`wrap_distance`) when a stage produces multiple candidates.
+
+   **Acceptance:** reject non-finite output, unwrap each joint to the 2π turn
+   nearest the seed when that turn is within its limits, require the result to
+   be within `JOINT_LIMITS`, and require FK residual ≤
+   `policy.subproblem_numerical` (`1e-5`). Do not hard-code a joint-step
+   threshold in the generated solver: the owning `Arm` applies its configured
+   `ik_max_joint_step` after the solver returns, including values set through
+   `Arm::set_ik_max_joint_step`.
+
+   **Do not** add a FLOP budget or a capped variant. The speedup comes from the
+   seed-first firm polish and relaxed full-joint DLS handling common seeds,
+   while the sample stage avoids the full sweep.
+
+   **Historical measured reference (Rizon 4 and Rizon 10, 7-DOF, joint lock).**
+   These figures describe the pre-flavor staged baseline, not measurements of
+   the Firm and Relaxed variants above. Seeds drawn
+   from the perf harness (`dexhal/perf/arm_timing.rs`). Mean ≈ 9 µs for the
+   staged flavour, against ≈ 21 µs for production `ik_nearest` and ≈ 600 µs for
+   the full `ik_all` sweep. On 10k seeds, 9989/10000 (Rizon 4) and 9990/10000
+   (Rizon 10) solved. The unsolved seeds are all stage-3 joint-limit violations
+   (11 and 10). Standalone `dls_ik` with the same acceptance solved 99.31% and
+   99.41%. Use these numbers as a sanity check when a regenerated arm lands far
+   off, not as a pass/fail bar.
 
 ## 5. Tests
 
