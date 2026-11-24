@@ -21,7 +21,7 @@ use core::marker::PhantomData;
 use crate::math::chain::{
     pose_error, transform_from_pose, transform_of, transform_to_pose, KinematicChain, ModelError,
 };
-use crate::math::kinematics::se3_inv;
+use crate::math::kinematics::{residual_columns, se3_inv};
 // Re-exported: a driver's `arm.rs` names its model through this module.
 pub use crate::math::model::{ArmModel, Pose};
 use crate::math::payload::{
@@ -319,6 +319,16 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
     pub fn jacobian(&self, q: &[f64; DOF]) -> [[f64; DOF]; 6] {
         let (pose, jac) = self.flange_fk_jacobian(q);
         tcp_jacobian(&pose, &jac, &self.tcp)
+    }
+
+    /// Jacobian of [`pose_residual12`](crate::math::kinematics::pose_residual12)
+    /// for the TCP pose, as columns (see [`residual_columns`]).
+    pub fn residual_jacobian(&self, q: &[f64; DOF]) -> [[f64; 12]; DOF] {
+        let (pose, jac) = self.flange_fk_jacobian(q);
+        let tcp_pose = pose * self.tcp;
+        let rot: [[f64; 3]; 3] =
+            core::array::from_fn(|i| core::array::from_fn(|j| tcp_pose[(i, j)]));
+        residual_columns(&rot, &tcp_jacobian(&pose, &jac, &self.tcp))
     }
 
     /// Geometric Jacobian at the TCP origin expressed in TCP axes: maps joint
@@ -788,6 +798,34 @@ mod tests {
                 *slot = None;
             }
             out
+        }
+    }
+
+    #[test]
+    fn residual_jacobian_matches_central_differences() {
+        use crate::math::kinematics::pose_residual12;
+
+        let mut arm = Arm::<SixR, 6, 1>::new();
+        let tcp = pose_from_xyz_quat(&[0.05, -0.02, 0.1, 0.0, 0.0, 0.0, 1.0]).unwrap();
+        arm.set_tcp(&tcp).unwrap();
+        let goal = transform_of(&arm.fk(&[-0.1, 0.4, -0.6, 0.8, 0.2, -0.3]));
+        let q = [0.3, -0.5, 0.9, -0.2, 0.6, 1.1];
+        let cols = arm.residual_jacobian(&q);
+        let h = 1e-6;
+        for j in 0..6 {
+            let (mut qp, mut qm) = (q, q);
+            qp[j] += h;
+            qm[j] -= h;
+            let rp = pose_residual12(&transform_of(&arm.fk(&qp)), &goal);
+            let rm = pose_residual12(&transform_of(&arm.fk(&qm)), &goal);
+            for row in 0..12 {
+                let fd = (rp[row] - rm[row]) / (2.0 * h);
+                assert!(
+                    (fd - cols[j][row]).abs() < 1e-6,
+                    "joint {j} row {row}: fd={fd} analytic={}",
+                    cols[j][row]
+                );
+            }
         }
     }
 

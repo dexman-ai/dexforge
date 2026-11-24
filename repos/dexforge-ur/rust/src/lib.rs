@@ -14,3 +14,5 @@ pub mod drivers;
 // Per-arm re-exports (appended by codegen/scaffold.py).
 pub use drivers::ur5;
 pub use drivers::ur5::{Ur5, Ur5Driver};
+pub use drivers::ur3e;
+pub use drivers::ur3e::{Ur3e, Ur3eDriver};

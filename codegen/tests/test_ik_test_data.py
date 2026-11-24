@@ -54,7 +54,7 @@ class IkTestDataTests(unittest.TestCase):
         arms = ik_test_data.verify_all_arms_ssik_version(_REPO_ROOT)
         self.assertEqual(
             set(arms),
-            {"franka_panda", "piper", "rizon10", "rizon4", "ur5", "xarm7", "z1"},
+            {"franka_panda", "piper", "rizon10", "rizon4", "ur3e", "ur5", "xarm7", "z1"},
         )
         for arm in arms:
             ds = ik_test_data.load_arm_test_data(arm, _REPO_ROOT)

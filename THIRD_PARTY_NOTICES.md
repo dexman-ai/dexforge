@@ -16,6 +16,7 @@ The kinematic and inertial models in `repos/*/rust/src/drivers/*/*.urdf` derive 
 | :--- | :--- | :--- |
 | `franka_panda` | franka_description (frankarobotics) | Apache-2.0 |
 | `ur5` | Universal_Robots_ROS2_Description (UniversalRobots) | BSD-3-Clause |
+| `ur3e` | Universal_Robots_ROS2_Description (UniversalRobots), `ur_type:=ur3e`; meshes in `tools/meshes/ur3e/` | BSD-3-Clause |
 | `z1` | unitree_ros | BSD-3-Clause |
 | `piper` | piper_ros (agilexrobotics) | MIT |
 | `rizon4`, `rizon10` | flexiv_description (flexivrobotics) | Apache-2.0 |
