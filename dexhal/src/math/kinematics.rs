@@ -891,6 +891,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lm_refine_masked_analytic_maps_reordered_free_columns() {
+        const DOF: usize = 5;
+        const FREE: [usize; 2] = [4, 1];
+        let q_init = [0.125, 0.7, -0.375, 0.625, -0.5];
+        let target = [q_init[0], -0.4, q_init[2], q_init[3], 1.0];
+        let residual = |q: &[f64; DOF]| {
+            let mut r = [0.0; 12];
+            for i in 0..DOF {
+                r[i] = q[i] - target[i];
+            }
+            r
+        };
+        let jacobian = |_q: &[f64; DOF]| {
+            let mut columns = [[0.0; 12]; DOF];
+            for i in 0..DOF {
+                columns[i][i] = 1.0;
+            }
+            columns
+        };
+
+        let q = lm_refine_masked_analytic::<DOF, 2, _, _>(
+            &q_init,
+            &FREE,
+            residual,
+            jacobian,
+            DLS_MAX_ITERS,
+        );
+
+        assert!(
+            norm12(&residual(&q)) <= DLS_FK_ATOL,
+            "analytic masked refinement did not converge"
+        );
+        assert_eq!(q[4], target[4]);
+        assert_eq!(q[1], target[1]);
+        for i in [0, 2, 3] {
+            assert_eq!(
+                q[i].to_bits(),
+                q_init[i].to_bits(),
+                "locked joint {i} changed"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test: lm_refine (full DOF) and lm_refine_masked with every joint free
     // produce identical results — the two share a single core loop.

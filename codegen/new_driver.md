@@ -112,10 +112,14 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    `seed_locked` call). If no sample closes, return the full sweep's result
    without re-polishing it. Copy
    the reference arm's `seeded_solve_keeps_the_seed_locked_joint` test too.
-   For 7-DOF joint-lock arms, `ik_nearest` must be the three-stage flow in
-   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 7 (seed-first
-   polish at 20 iterations, bracketing lock samples, then `dls_ik` at 20). Do
-   not generate a capped or FLOP-budgeted `ik_nearest`.
+   For 7-DOF joint-lock arms, `ik_nearest` must provide the `Firm` and
+   `Relaxed` flavors (selected by an extra `JointLockFlavor` argument) described
+   in [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 7.
+   Firm keeps the redundant joint at the seed value in all three stages;
+   Relaxed tries full-joint DLS first and then the sampled-lock state. Leave
+   the configurable joint-step continuity check to the owning `Arm`; do not
+   hard-code the default π/2 bound in the generated solver. Do not generate a
+   capped or FLOP-budgeted `ik_nearest`.
 2. **`codegen/generate_code.py`** (categories 2–4): adapt the reference arm's
    script so it reads `codegen/<arm>_ik.py` and writes `../consts.rs` / `../pq.rs`;
    add `pub mod consts;` / `pub mod pq;` to `mod.rs` if the scaffold did not.
