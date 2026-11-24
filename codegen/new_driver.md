@@ -31,6 +31,10 @@ Ask for any missing input rather than inventing hardware facts. Never edit
 - Use the shared kernels from `dexhal::math` (`ssik_core` subproblems,
   `kinematics`, `postprocess`, `tolerances`, LM refinement). Never reimplement
   subproblem solvers, root finders, refinement, joint wrapping or seed sorting.
+- No finite-difference Jacobians anywhere in `ik_solver.rs` (refinement, DLS,
+  or helpers). Use the arm's `generated_kinematics::jacobian` with
+  `kinematics::residual_columns` and `lm_refine_masked_analytic` /
+  `dls_ik`. See `translate_ssik_artifact.md` section 2.
 - Do not hand-edit generated files: `arm.rs`, `generated_*.rs`, `test_data.*`,
   `dynamics_*`, `consts.rs` / `pq.rs`. Fix the generator inputs and rerun.
 - The existing driver repos (`repos/dexforge-*`) predate dexhal and carry their
@@ -104,8 +108,14 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    seed's value on a seeded solve. Copy the reference arm's seeded early exit:
    visit lock samples nearest-first to `q_seed[LOCKED_JOINT]`, polish each
    sample's candidates with `seed_locked` as they are collected, and stop at the
-   first sample that closes. Fall back to the full sweep only if none does. Copy
+   first sample that closes. Polish the seed itself only once (first
+   `seed_locked` call). If no sample closes, return the full sweep's result
+   without re-polishing it. Copy
    the reference arm's `seeded_solve_keeps_the_seed_locked_joint` test too.
+   For 7-DOF joint-lock arms, `ik_nearest` must be the three-stage flow in
+   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 7 (seed-first
+   polish at 20 iterations, bracketing lock samples, then `dls_ik` at 20). Do
+   not generate a capped or FLOP-budgeted `ik_nearest`.
 2. **`codegen/generate_code.py`** (categories 2–4): adapt the reference arm's
    script so it reads `codegen/<arm>_ik.py` and writes `../consts.rs` / `../pq.rs`;
    add `pub mod consts;` / `pub mod pq;` to `mod.rs` if the scaffold did not.

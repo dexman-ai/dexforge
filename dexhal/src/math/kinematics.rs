@@ -28,7 +28,10 @@
 
 use nalgebra::SMatrix;
 
-use crate::math::ssik_core::{add3, mat3_mul, mat3_transpose, mat3_vec, neg3};
+use super::ssik_core::mat3_mul;
+
+use crate::math::ssik_core::{add3, mat3_transpose, mat3_vec, neg3};
+
 
 // ---------------------------------------------------------------------------
 // 4×4 homogeneous-matrix utilities
@@ -191,7 +194,7 @@ pub fn mat4_frob_diff(a: &SMatrix<f64, 4, 4>, b: &SMatrix<f64, 4, 4>) -> f64 {
 
 /// 12-vector pose residual `[vec(a.R − b.R); a.t − b.t]` between two transforms.
 ///
-/// The first 9 elements are the column-major flattening of `(a.R − b.R)` and
+/// The first 9 elements are the row-major flattening of `(a.R − b.R)` and
 /// the last 3 are the translation difference `a.t − b.t`.  This is the
 /// standard residual vector consumed by [`lm_refine`] and [`dls_ik`].
 #[inline]
@@ -208,6 +211,34 @@ pub fn pose_residual12(a: &Transform, b: &Transform) -> [f64; 12] {
         r[9 + i] = a.t[i] - b.t[i];
     }
     r
+}
+
+/// Columns of the `12 × DOF` Jacobian of [`pose_residual12`] from a geometric
+/// Jacobian.
+///
+/// `rot` is the current rotation of the controlled frame and `jac` its base-frame
+/// geometric Jacobian `[Jv; Jw]`. A spatial angular velocity `ω` gives
+/// `∂R = [ω]× R`, and the linear rows are `∂t = Jv`. Column `j` of the result is
+/// `∂residual/∂q_j`, in the layout of [`pose_residual12`].
+pub fn residual_columns<const DOF: usize>(
+    rot: &[[f64; 3]; 3],
+    jac: &[[f64; DOF]; 6],
+) -> [[f64; 12]; DOF] {
+    let mut cols = [[0.0f64; 12]; DOF];
+    for j in 0..DOF {
+        let w = [jac[3][j], jac[4][j], jac[5][j]];
+        let skew = [[0.0, -w[2], w[1]], [w[2], 0.0, -w[0]], [-w[1], w[0], 0.0]];
+        let dr = mat3_mul(&skew, rot);
+        for row in 0..3 {
+            for col in 0..3 {
+                cols[j][3 * row + col] = dr[row][col];
+            }
+        }
+        cols[j][9] = jac[0][j];
+        cols[j][10] = jac[1][j];
+        cols[j][11] = jac[2][j];
+    }
+    cols
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +312,13 @@ where
 {
     // Refine all DOF joints (free = [0, 1, …, DOF−1]).
     let free: [usize; DOF] = core::array::from_fn(|i| i);
-    let (q, rn) = lm_refine_core::<DOF, DOF, F>(q_in, &free, residual_fn, max_iters);
+    let (q, rn) = lm_refine_core::<DOF, DOF, F, _>(
+        q_in,
+        &free,
+        &residual_fn,
+        |q: &[f64; DOF], r: &[f64; 12]| fd_jacobian(&residual_fn, &free, q, r),
+        max_iters,
+    );
     if rn <= fk_atol {
         Some(q)
     } else {
@@ -333,23 +370,91 @@ pub fn lm_refine_masked<const DOF: usize, const FREE: usize, F>(
 where
     F: Fn(&[f64; DOF]) -> [f64; 12],
 {
-    lm_refine_core::<DOF, FREE, F>(q_in, free, residual_fn, max_iters).0
+    lm_refine_core::<DOF, FREE, F, _>(
+        q_in,
+        free,
+        &residual_fn,
+        |q: &[f64; DOF], r: &[f64; 12]| fd_jacobian(&residual_fn, free, q, r),
+        max_iters,
+    )
+    .0
 }
 
-/// Shared accept/reject LM core driving both [`lm_refine`] and
-/// [`lm_refine_masked`].
+/// [`lm_refine_masked`] with a caller-supplied analytic Jacobian.
 ///
-/// Refines the joints listed in `free` and returns the refined joint vector
-/// together with the final 12-vector residual norm so callers can apply their
-/// own convergence gate (or ignore it).
-fn lm_refine_core<const DOF: usize, const FREE: usize, F>(
+/// `jac_fn(q)` returns the full `12×DOF` Jacobian of `residual_fn` as an
+/// array of columns (`jac_fn(q)[j]` is `∂residual/∂q_j`, in the same row
+/// layout as [`pose_residual12`]). Only the columns listed in `free` are used,
+/// so the locked joint's column is ignored.
+pub fn lm_refine_masked_analytic<const DOF: usize, const FREE: usize, F, J>(
     q_in: &[f64; DOF],
     free: &[usize; FREE],
     residual_fn: F,
+    jac_fn: J,
+    max_iters: usize,
+) -> [f64; DOF]
+where
+    F: Fn(&[f64; DOF]) -> [f64; 12],
+    J: Fn(&[f64; DOF]) -> [[f64; 12]; DOF],
+{
+    lm_refine_core::<DOF, FREE, F, _>(
+        q_in,
+        free,
+        &residual_fn,
+        |q: &[f64; DOF], _r: &[f64; 12]| {
+            let cols = jac_fn(q);
+            let mut jac = SMatrix::<f64, 12, FREE>::zeros();
+            for (c, &jidx) in free.iter().enumerate() {
+                for row in 0..12 {
+                    jac[(row, c)] = cols[jidx][row];
+                }
+            }
+            jac
+        },
+        max_iters,
+    )
+    .0
+}
+
+/// Forward-difference Jacobian (12×FREE) over the columns listed in `free`.
+fn fd_jacobian<const DOF: usize, const FREE: usize, F>(
+    residual_fn: &F,
+    free: &[usize; FREE],
+    q: &[f64; DOF],
+    r: &[f64; 12],
+) -> SMatrix<f64, 12, FREE>
+where
+    F: Fn(&[f64; DOF]) -> [f64; 12],
+{
+    let mut jac = SMatrix::<f64, 12, FREE>::zeros();
+    for (c, &jidx) in free.iter().enumerate() {
+        let mut qp = *q;
+        qp[jidx] += REFINE_EPS;
+        let rp = residual_fn(&qp);
+        for row in 0..12 {
+            jac[(row, c)] = (rp[row] - r[row]) / REFINE_EPS;
+        }
+    }
+    jac
+}
+
+/// Shared accept/reject LM core driving [`lm_refine`], [`lm_refine_masked`],
+/// and [`lm_refine_masked_analytic`].
+///
+/// `jac_fn(q, r)` returns the `12×FREE` Jacobian over the joints in `free`.
+/// Refines those joints and returns the refined joint vector together with
+/// the final 12-vector residual norm so callers can apply their own
+/// convergence gate (or ignore it).
+fn lm_refine_core<const DOF: usize, const FREE: usize, F, J>(
+    q_in: &[f64; DOF],
+    free: &[usize; FREE],
+    residual_fn: &F,
+    jac_fn: J,
     max_iters: usize,
 ) -> ([f64; DOF], f64)
 where
     F: Fn(&[f64; DOF]) -> [f64; 12],
+    J: Fn(&[f64; DOF], &[f64; 12]) -> SMatrix<f64, 12, FREE>,
 {
     let mut q = *q_in;
     let mut lambda = LM_INITIAL_LAMBDA;
@@ -360,16 +465,7 @@ where
         if rn < LM_CONVERGENCE_THRESHOLD {
             break;
         }
-        // Finite-difference Jacobian J (12×FREE) over the free joints.
-        let mut jac = SMatrix::<f64, 12, FREE>::zeros();
-        for (c, &jidx) in free.iter().enumerate() {
-            let mut qp = q;
-            qp[jidx] += REFINE_EPS;
-            let rp = residual_fn(&qp);
-            for row in 0..12 {
-                jac[(row, c)] = (rp[row] - r[row]) / REFINE_EPS;
-            }
-        }
+        let jac = jac_fn(&q, &r);
         let rv = SMatrix::<f64, 12, 1>::from_column_slice(&r);
         let jt = jac.transpose();
         let jtj = jt * jac; // FREE×FREE
@@ -464,10 +560,11 @@ pub const DLS_FK_ATOL: f64 = 1e-5;
 /// URDF), and iteratively refines the joint angles until the FK of the actual
 /// arm satisfies the pose goal within `fk_atol`.
 ///
-/// Internally delegates to [`lm_refine`] with the standard 12-vector pose
-/// residual `[vec(R(q) − R_goal); t(q) − t_goal]`, so all coding restrictions
-/// are inherited: zero allocation, `#![no_std]`-compatible, and bounded
-/// iteration count (hard-capped at `max_iters`).
+/// Each iteration uses the analytic residual Jacobian `jac_fn` (see
+/// [`residual_columns`]) inside the shared LM core, so no finite differences
+/// are taken. The residual is the 12-vector pose residual
+/// `[vec(R(q) − R_goal); t(q) − t_goal]`. The loop is zero-allocation and
+/// bounded by `max_iters`.
 ///
 /// # Arguments
 ///
@@ -476,6 +573,8 @@ pub const DLS_FK_ATOL: f64 = 1e-5;
 ///                 analytical IK solution for the idealized arm.
 /// * `fk_fn`     — Forward kinematics of the **actual** arm.  Must be
 ///                 deterministic and return a [`Transform`].
+/// * `jac_fn`   — Analytic `12 × DOF` Jacobian of the pose residual of `fk_fn`
+///                 at `q`, as columns (see [`residual_columns`]).
 /// * `max_iters` — Hard iteration ceiling. Use [`DLS_MAX_ITERS`] unless a
 ///                 tighter real-time budget is needed.
 /// * `fk_atol`   — FK closure tolerance (Frobenius norm). Use [`DLS_FK_ATOL`]
@@ -491,28 +590,46 @@ pub const DLS_FK_ATOL: f64 = 1e-5;
 /// ```ignore
 /// // Refine a 6-DOF analytical seed onto a calibrated arm.
 /// let q_seed: [f64; 6] = analytical_ik(&idealized_model, &goal);
-/// let q_refined = dls_ik(&goal, &q_seed, |q| calibrated_fk(q), DLS_MAX_ITERS, DLS_FK_ATOL);
+/// let q_refined = dls_ik(&goal, &q_seed, |q| calibrated_fk(q), |q| calibrated_jac(q), DLS_MAX_ITERS, DLS_FK_ATOL);
 ///
 /// // Works for any DOF, e.g. a 7-DOF arm:
 /// let q_seed7: [f64; 7] = analytical_ik7(&idealized_model, &goal);
-/// let q_refined7 = dls_ik(&goal, &q_seed7, |q| calibrated_fk7(q), DLS_MAX_ITERS, DLS_FK_ATOL);
+/// let q_refined7 = dls_ik(&goal, &q_seed7, |q| calibrated_fk7(q), |q| calibrated_jac7(q), DLS_MAX_ITERS, DLS_FK_ATOL);
 /// ```
-pub fn dls_ik<const DOF: usize, F>(
+pub fn dls_ik<const DOF: usize, F, J>(
     goal: &Transform,
     q_init: &[f64; DOF],
     fk_fn: F,
+    jac_fn: J,
     max_iters: usize,
     fk_atol: f64,
 ) -> Option<[f64; DOF]>
 where
     F: Fn(&[f64; DOF]) -> Transform,
+    J: Fn(&[f64; DOF]) -> [[f64; 12]; DOF],
 {
-    lm_refine::<DOF, _>(
+    let free: [usize; DOF] = core::array::from_fn(|i| i);
+    let (q, rn) = lm_refine_core::<DOF, DOF, _, _>(
         q_init,
-        |q| pose_residual12(&fk_fn(q), goal),
+        &free,
+        &|q: &[f64; DOF]| pose_residual12(&fk_fn(q), goal),
+        |q: &[f64; DOF], _r: &[f64; 12]| {
+            let cols = jac_fn(q);
+            let mut jac = SMatrix::<f64, 12, DOF>::zeros();
+            for (c, col) in cols.iter().enumerate() {
+                for row in 0..12 {
+                    jac[(row, c)] = col[row];
+                }
+            }
+            jac
+        },
         max_iters,
-        fk_atol,
-    )
+    );
+    if rn <= fk_atol {
+        Some(q)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +641,32 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    /// Central-difference residual Jacobian of `fk` against `goal`, in the
+    /// column layout expected by [`dls_ik`]'s `jac_fn`.
+    fn fd_residual_columns<const DOF: usize, F>(
+        fk: &F,
+        goal: &Transform,
+        q: &[f64; DOF],
+    ) -> [[f64; 12]; DOF]
+    where
+        F: Fn(&[f64; DOF]) -> Transform,
+    {
+        let h = 1e-7;
+        let mut cols = [[0.0f64; 12]; DOF];
+        for j in 0..DOF {
+            let mut qp = *q;
+            let mut qm = *q;
+            qp[j] += h;
+            qm[j] -= h;
+            let rp = pose_residual12(&fk(&qp), goal);
+            let rm = pose_residual12(&fk(&qm), goal);
+            for row in 0..12 {
+                cols[j][row] = (rp[row] - rm[row]) / (2.0 * h);
+            }
+        }
+        cols
+    }
 
     // -----------------------------------------------------------------------
     // Minimal 2-DOF planar arm for self-contained tests
@@ -590,7 +733,14 @@ mod tests {
     fn dls_ik_already_exact() {
         let q_true = [0.5f64, -0.3f64];
         let goal = fk_2dof_nominal(&q_true);
-        let result = dls_ik(&goal, &q_true, fk_2dof_nominal, DLS_MAX_ITERS, DLS_FK_ATOL);
+        let result = dls_ik(
+            &goal,
+            &q_true,
+            fk_2dof_nominal,
+            |q| fd_residual_columns(&fk_2dof_nominal, &goal, q),
+            DLS_MAX_ITERS,
+            DLS_FK_ATOL,
+        );
         assert!(result.is_some(), "expected Some but got None");
         let residual = frob_diff(&fk_2dof_nominal(&result.unwrap()), &goal);
         assert!(
@@ -610,7 +760,14 @@ mod tests {
         let goal = fk_2dof_nominal(&q_true);
         // Perturb the initial guess by 0.1 rad in each joint.
         let q_init = [q_true[0] + 0.1, q_true[1] - 0.1];
-        let result = dls_ik(&goal, &q_init, fk_2dof_nominal, DLS_MAX_ITERS, DLS_FK_ATOL);
+        let result = dls_ik(
+            &goal,
+            &q_init,
+            fk_2dof_nominal,
+            |q| fd_residual_columns(&fk_2dof_nominal, &goal, q),
+            DLS_MAX_ITERS,
+            DLS_FK_ATOL,
+        );
         assert!(result.is_some(), "expected Some but got None");
         let residual = frob_diff(&fk_2dof_nominal(&result.unwrap()), &goal);
         assert!(
@@ -637,8 +794,14 @@ mod tests {
         let q_init = [q_true[0] + 0.02, q_true[1] + 0.02];
         // DLS with the calibrated FK should converge to q_refined such that
         // calibrated_fk(q_refined) ≈ goal.
-        let result =
-            dls_ik(&goal, &q_init, fk_2dof_calibrated, DLS_MAX_ITERS, DLS_FK_ATOL);
+        let result = dls_ik(
+            &goal,
+            &q_init,
+            fk_2dof_calibrated,
+            |q| fd_residual_columns(&fk_2dof_calibrated, &goal, q),
+            DLS_MAX_ITERS,
+            DLS_FK_ATOL,
+        );
         assert!(result.is_some(), "expected Some but got None");
         let residual = frob_diff(&fk_2dof_calibrated(&result.unwrap()), &goal);
         assert!(
@@ -657,7 +820,14 @@ mod tests {
         let q_true = [0.4f64, 0.6f64, -0.5f64];
         let goal = fk_3dof_nominal(&q_true);
         let q_init = [q_true[0] + 0.05, q_true[1] - 0.05, q_true[2] + 0.03];
-        let result = dls_ik(&goal, &q_init, fk_3dof_nominal, DLS_MAX_ITERS, DLS_FK_ATOL);
+        let result = dls_ik(
+            &goal,
+            &q_init,
+            fk_3dof_nominal,
+            |q| fd_residual_columns(&fk_3dof_nominal, &goal, q),
+            DLS_MAX_ITERS,
+            DLS_FK_ATOL,
+        );
         assert!(result.is_some(), "expected Some but got None");
         let residual = frob_diff(&fk_3dof_nominal(&result.unwrap()), &goal);
         assert!(
