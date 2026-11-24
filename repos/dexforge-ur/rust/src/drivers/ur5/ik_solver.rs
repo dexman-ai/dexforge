@@ -23,7 +23,7 @@
 
 use nalgebra::SMatrix;
 
-use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff};
+use dexhal::math::kinematics::{lm_refine_masked_analytic, mat4_frob_diff, residual_columns};
 use dexhal::math::ssik_core::{sp6_solve, wrap_to_pi};
 pub use dexhal::math::tolerances::TolerancePolicy;
 
@@ -105,29 +105,33 @@ pub fn solve(
     let mut cands = [[0.0f64; 6]; 8];
     let cand_count = solve_algebraic(t, &mut cands, policy);
 
+    // One seeded solution: stop at the nearest accepted candidate instead of
+    // closing, deduplicating and sorting the whole set.
+    if let (Some(1), Some(seed)) = (max_solutions, q_seed) {
+        let mut out: [Option<[f64; 6]>; 16] = [None; 16];
+        out[0] = nearest_accepted(
+            &cands[..cand_count],
+            seed,
+            t,
+            respect_limits,
+            fk_atol,
+            allow_refinement,
+            refinement_max_iters,
+        );
+        return out;
+    }
+
     for ci in 0..cand_count {
         let q = cands[ci];
         // Reject non-finite candidates (mirrors np.isfinite filter).
         if !q.iter().all(|v| v.is_finite()) {
             continue;
         }
-        // FK closure check.
-        let residual = fk_residual(&q, t);
-        let accepted_q: [f64; 6];
-        if residual <= fk_atol {
-            accepted_q = q;
-        } else if allow_refinement {
-            // Newton polish for near-miss candidates, mirroring Python's
-            // `allow_refinement` path (lm_refine via _spatial_jacobian).
-            match refine6(&q, t, refinement_max_iters, fk_atol) {
-                Some(refined) => {
-                    accepted_q = refined;
-                }
-                None => continue,
-            }
-        } else {
+        let Some(accepted_q) =
+            accept_candidate(&q, t, fk_atol, allow_refinement, refinement_max_iters)
+        else {
             continue;
-        }
+        };
 
         // Wrap-to-pi de-duplication against accepted solutions.
         let mut dup = false;
@@ -244,6 +248,64 @@ fn seed_dist(q: &[f64; 6], seed: &[f64; 6]) -> f64 {
     s
 }
 
+/// FK closure check for one algebraic candidate. Near misses are polished with
+/// the analytic masked LM when `allow_refinement` is set (see `refine6`).
+fn accept_candidate(
+    q: &[f64; 6],
+    t: &SMatrix<f64, 4, 4>,
+    fk_atol: f64,
+    allow_refinement: bool,
+    refinement_max_iters: usize,
+) -> Option<[f64; 6]> {
+    if fk_residual(q, t) <= fk_atol {
+        Some(*q)
+    } else if allow_refinement {
+        refine6(q, t, refinement_max_iters, fk_atol)
+    } else {
+        None
+    }
+}
+
+/// Nearest accepted candidate to `seed`. Candidates are ranked by their raw
+/// wrap-to-π distance (earlier index wins ties), then tried in that order; the
+/// first one that closes and, when `respect_limits`, lies within the limits is
+/// returned. Refined near misses are ranked by their pre-polish distance.
+fn nearest_accepted(
+    cands: &[[f64; 6]],
+    seed: &[f64; 6],
+    t: &SMatrix<f64, 4, 4>,
+    respect_limits: bool,
+    fk_atol: f64,
+    allow_refinement: bool,
+    refinement_max_iters: usize,
+) -> Option<[f64; 6]> {
+    let mut used = [false; 8];
+    for _ in 0..cands.len() {
+        let mut best: Option<(f64, usize)> = None;
+        for (i, q) in cands.iter().enumerate() {
+            if used[i] || !q.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let d = seed_dist(q, seed);
+            if best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, i));
+            }
+        }
+        let Some((_, i)) = best else { break };
+        used[i] = true;
+        if let Some(q) = accept_candidate(&cands[i], t, fk_atol, allow_refinement, refinement_max_iters) {
+            if !respect_limits {
+                return Some(q);
+            }
+            let q = wrap_to_limits(&q);
+            if in_limits(&q) {
+                return Some(q);
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Levenberg-Marquardt refinement (for `allow_refinement = true`)
 // ---------------------------------------------------------------------------
@@ -266,16 +328,33 @@ fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
 }
 
 /// Levenberg-Marquardt polish of a 6-DOF UR5 configuration onto the exact
-/// pose root. Mirrors the Python `_lm_refine` path used when
-/// `allow_refinement = True`. Returns `Some(q_refined)` if the FK residual
-/// converges within `fk_atol`, otherwise `None`.
+/// pose root, used when `allow_refinement = True`. The Jacobian is the
+/// generated analytic flange Jacobian, converted to pose-residual columns.
+/// Returns `Some(q_refined)` if the FK residual converges within `fk_atol`,
+/// otherwise `None`.
 fn refine6(
     q_in: &[f64; 6],
     target: &SMatrix<f64, 4, 4>,
     max_iters: usize,
     fk_atol: f64,
 ) -> Option<[f64; 6]> {
-    lm_refine6(q_in, |q| pose_residual12(q, target), max_iters, fk_atol)
+    const FREE: [usize; 6] = [0, 1, 2, 3, 4, 5];
+    let q = lm_refine_masked_analytic::<6, 6, _, _>(
+        q_in,
+        &FREE,
+        |q| pose_residual12(q, target),
+        |q| {
+            let tf = fk(q);
+            let rot = [
+                [tf[(0, 0)], tf[(0, 1)], tf[(0, 2)]],
+                [tf[(1, 0)], tf[(1, 1)], tf[(1, 2)]],
+                [tf[(2, 0)], tf[(2, 1)], tf[(2, 2)]],
+            ];
+            residual_columns(&rot, &super::generated_kinematics::jacobian(q))
+        },
+        max_iters,
+    );
+    (fk_residual(&q, target) <= fk_atol).then_some(q)
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +580,43 @@ mod tests {
     /// the UR5e (q5 = 0), where the solver returns only one shoulder branch (see
     /// `wrist_singularity_still_solves`), so round-trip tests use this instead.
     const REF_Q: [f64; 6] = [0.3, -1.0, 1.2, -0.5, 0.8, 0.2];
+
+    #[test]
+    fn refine6_recovers_a_perturbed_configuration() {
+        let q_true = [0.4, -1.1, 0.9, -1.3, 0.7, 0.2];
+        let target = fk(&q_true);
+        let seed = [0.45, -1.05, 0.85, -1.35, 0.65, 0.25];
+        let q = refine6(&seed, &target, 30, TolerancePolicy::DEFAULT.subproblem_numerical)
+            .expect("refine6 should converge from a nearby seed");
+        assert!(fk_residual(&q, &target) <= TolerancePolicy::DEFAULT.subproblem_numerical);
+    }
+
+    #[test]
+    fn seeded_single_solution_matches_nearest_of_full_set() {
+        let policy = TolerancePolicy::DEFAULT;
+        let configs = [REF_Q, [0.4, -1.1, 0.9, -1.3, 0.7, 0.2], [-0.7, -0.6, 1.8, 0.4, -1.2, 1.0]];
+        let offsets = [-0.4, -0.1, 0.05, 0.3];
+        for q_true in configs {
+            let t = fk(&q_true);
+            for off in offsets {
+                let seed = [
+                    q_true[0] + off,
+                    q_true[1] - off,
+                    q_true[2] + off,
+                    q_true[3] - off,
+                    q_true[4] + off,
+                    q_true[5] - off,
+                ];
+                let single = solve(&t, Some(1), Some(&seed), true, true, policy, 15)[0];
+                let full = solve(&t, None, Some(&seed), true, true, policy, 15)[0];
+                match (single, full) {
+                    (Some(a), Some(b)) => assert!(q_eq_mod(&a, &b, 1e-9), "single {a:?} != full {b:?}"),
+                    (None, None) => {}
+                    _ => panic!("single/full disagree on existence: {single:?} vs {full:?}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn fk_home_pose() {

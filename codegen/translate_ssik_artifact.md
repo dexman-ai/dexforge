@@ -30,9 +30,10 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
   blocks** from the Python file and wire them to those kernels.
 - Wherever the artifact calls `_sp6_runtime.solve`, `eliminate_q0_q1`,
   `lm_refine` or root-finding helpers, call the matching `dexhal::math`
-  function (`ssik_core::sp6_solve`, `ssik_core::rr_real_roots`,
-  `kinematics::lm_refine6`, ...). If a needed kernel is missing from `dexhal`,
-  stop and report it instead of writing a local copy.
+  function (`ssik_core::sp6_solve`, `ssik_core::rr_real_roots`, and
+  `kinematics::lm_refine_masked_analytic` fed by `kinematics::residual_columns`,
+  not the finite-difference `lm_refine6`/`lm_refine`). If a needed kernel is
+  missing from `dexhal`, stop and report it instead of writing a local copy.
 - **No finite-difference Jacobians (CRITICAL).** Never write a finite-difference
   (FD) Jacobian in `ik_solver.rs`, including in refinement, `jac` helpers or
   tests of the solver. Refinement must use the arm's generated analytic
@@ -150,6 +151,19 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
    (11 and 10). Standalone `dls_ik` with the same acceptance solved 99.31% and
    99.41%. Use these numbers as a sanity check when a regenerated arm lands far
    off, not as a pass/fail bar.
+8. **6-DOF seeded early exit (closed-form arms).** For a 6-DOF closed-form
+   arm, `solve(max_solutions = Some(1), q_seed = Some(seed))` takes a
+   nearest-first early exit instead of the full sort. Rank the raw algebraic
+   candidates by `seed_dist` before refinement, then accept candidates in
+   rank order through the same FK / refine / joint-limit gate as the full
+   path. Return the first that passes. Skip dedup and the full sort on this
+   path; the first accepted candidate cannot be a duplicate. No lock and no
+   `Firm` / `Relaxed` flavors apply to 6-DOF arms. The ranking uses
+   pre-refinement distance, so equivalence with the full set holds on the
+   tested configurations but is not proven. Reference:
+   `repos/dexforge-ur/rust/src/drivers/ur5/ik_solver.rs` (`nearest_accepted`,
+   `accept_candidate`) and its `seeded_single_solution_matches_nearest_of_full_set`
+   test.
 
 ## 5. Tests
 

@@ -31,7 +31,7 @@ Each OEM lives in `repos/dexforge-<oem>/rust` and implements [`dexhal::math::Arm
 
 | Arm | Crate | DOF | `ssik` Solver Family | `MAX_SOL` | IK All (µs) | `ik_nearest` (µs) | Dynamics (µs) | Inv. Dynamics (µs) | Nearest Hit % |
 | :--- | :--- | :---: | :--- | :---: | ---: | ---: | ---: | ---: | ---: |
-| **UR5** | `dexforge-ur-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 11.97 | 12.78 | 1.23 | 1.20 | 100.0% |
+| **UR5** | `dexforge-ur-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 10.70 | 2.23 | 1.64 | 1.63 | 100.0% |
 | **Unitree Z1** | `dexforge-unitree-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 17.31 | 17.15 | 1.79 | 1.79 | 100.0% |
 | **AgileX Piper** | `dexforge-agilex-core` | 6 | General 6R (`ikgeo.general_6r`, Raghavan-Roth) | 16 | 46.66 | 47.91 | 5.21 | 5.37 | 100.0% |
 | **Franka Panda** | `dexforge-franka-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, SP6 inner) | 128 | 156.13 | 40.12 | 6.04 | 6.05 | 100.0% |

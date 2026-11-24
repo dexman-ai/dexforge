@@ -119,7 +119,10 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    Relaxed tries full-joint DLS first and then the sampled-lock state. Leave
    the configurable joint-step continuity check to the owning `Arm`; do not
    hard-code the default π/2 bound in the generated solver. Do not generate a
-   capped or FLOP-budgeted `ik_nearest`.
+   capped or FLOP-budgeted `ik_nearest`. For 6-DOF closed-form arms, use the
+   nearest-first single-solution early exit in
+   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 8 (no lock,
+   no flavors).
 2. **`codegen/generate_code.py`** (categories 2–4): adapt the reference arm's
    script so it reads `codegen/<arm>_ik.py` and writes `../consts.rs` / `../pq.rs`;
    add `pub mod consts;` / `pub mod pq;` to `mod.rs` if the scaffold did not.
