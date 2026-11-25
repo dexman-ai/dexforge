@@ -94,6 +94,7 @@ impl SphericalLockModel {
 }
 
 /// POE forward kinematics of the reversed 6R sub-chain `sample`.
+#[inline]
 fn fk_sub(m: &SphericalLockModel, sample: usize, q: &[f64; 6]) -> Transform {
     let axes = &m.sub_axes[sample];
     let tl = &m.sub_tl[sample];
@@ -121,6 +122,7 @@ fn fk_sub(m: &SphericalLockModel, sample: usize, q: &[f64; 6]) -> Transform {
 }
 
 /// POE forward kinematics of the full 7R chain (the solver's verification FK).
+#[inline]
 pub fn fk7(m: &SphericalLockModel, q: &[f64; 7]) -> Transform {
     let mut t = IDENTITY;
     for i in 0..7 {
@@ -146,6 +148,7 @@ pub fn fk7(m: &SphericalLockModel, q: &[f64; 7]) -> Transform {
 /// Wrist back-substitution shared by both inner solvers: given `r06` and the
 /// three shoulder angles, append every `(q4, q5, q6)` branch as a candidate.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn wrist_branches(
     axes: &[[f64; 3]; 6],
     r06: &[[f64; 3]; 3],
@@ -192,6 +195,7 @@ fn wrist_branches(
 }
 
 /// `ikgeo.spherical` on reversed sub-chain `sample` with target `tt`.
+#[inline]
 fn spherical_candidates(
     m: &SphericalLockModel,
     sample: usize,
@@ -235,6 +239,7 @@ fn spherical_candidates(
 }
 
 /// `ikgeo.spherical_two_parallel` on reversed sub-chain `sample`, target `tt`.
+#[inline]
 fn sph2par_candidates(
     m: &SphericalLockModel,
     sample: usize,
@@ -297,6 +302,7 @@ fn sph2par_candidates(
 /// 6R candidates of `sample` against `tt`. Writes survivors and their
 /// residuals to `out` / `res` and returns the count.
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn verify_inner(
     m: &SphericalLockModel,
     sample: usize,
@@ -335,6 +341,7 @@ fn verify_inner(
 
 /// Verified 7R candidates of lock sample `sample` against the reversed target
 /// `target_rev`, with their inner residuals. Returns `(q, residual, count)`.
+#[inline]
 fn sample_candidates(
     m: &SphericalLockModel,
     sample: usize,

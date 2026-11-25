@@ -145,6 +145,8 @@ The coding agent executes the deterministic generators in order and runs the tes
    - `const JOINT_LIMITS: [JointLimit; DOF]` sourced from the URDF / `ssik` artifact.
    - `const HAS_DYNAMICS: bool = true;` (when the URDF provides valid `<inertial>` data).
    - `flange_fk`, `flange_jacobian`, `flange_all`, `flange_one`, `flange_gravity`, `flange_mass_matrix`, `flange_coriolis`, and `flange_inverse_dynamics`.
+   - `flange_all` calls `ik_solver::solve`; `flange_one` calls `dexhal::math::single::six_dof_one` with `ik_solver::raw_candidates` (6-DOF) or `seven_dof_one` with `ik_solver::{LOCKED_JOINT, LOCK_SAMPLES, lock_sample_solutions}` (7-DOF), so `ik_solver.rs` must export those names.
+   - A `#[cfg(test)]` module (nominal chain vs generated FK/Jacobian, `flange_all` closure, ssik fuzz suite, DOF-specific `flange_one` checks). Hand edits to `arm.rs` are lost on regeneration; put extra tests in `ik_solver.rs` or `rust/tests/`.
 
 4. **Generate `ssik` IK Ground-Truth Test Data:**
    ```sh

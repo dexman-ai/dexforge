@@ -118,6 +118,9 @@ pub const T_HOME: [[f64; 4]; 4] = [
 /// The joint the sweep locks.
 pub const LOCKED_JOINT: usize = 4;
 
+/// Lock-joint sample values of the sweep, in sweep order.
+pub const LOCK_SAMPLES: [f64; 16] = consts::LOCK_SAMPLES;
+
 /// Baked geometry of the 16 reversed, joint-4-locked sub-chains.
 const MODEL: SphericalLockModel = SphericalLockModel {
     lock_samples: &consts::LOCK_SAMPLES,
@@ -138,7 +141,7 @@ const MODEL: SphericalLockModel = SphericalLockModel {
 const REFINE_ITERS: usize = 60;
 
 /// Driver candidates with lock joint 4 pinned to `lock_value` (one of
-/// [`consts::LOCK_SAMPLES`]), as a 7R configuration set. Unknown values give
+/// [`LOCK_SAMPLES`]), as a 7R configuration set. Unknown values give
 /// no candidates. Used as the sample solver of [`seven_dof_one`].
 ///
 /// [`seven_dof_one`]: dexhal::math::single::seven_dof_one

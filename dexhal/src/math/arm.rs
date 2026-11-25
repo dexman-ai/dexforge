@@ -23,12 +23,13 @@ use crate::math::chain::{
 use crate::math::kinematics::{residual_columns, se3_inv};
 // Re-exported: a driver's `arm.rs` names its model through this module.
 pub use crate::math::model::{ArmModel, IkKind, Pose};
+use crate::math::single::IK_LOCK_MAX_STEP;
 use crate::math::payload::{
     payload_coriolis_torque, payload_gravity_torque, payload_inertia_matrix,
     payload_inverse_dynamics, Payload,
 };
 use crate::math::contract::WrenchFrame;
-use crate::math::postprocess::{q_close, within_limits};
+use crate::math::postprocess::{nearest_to_seed, q_close, within_limits};
 use crate::math::spatial::{
     jacobian_in_frame, pose_rotation, pseudo_inverse, tcp_jacobian, wrench_tool_to_base,
 };
@@ -378,7 +379,9 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
     /// calibrated chain ([`KinematicChain::refine_ik`]), re-verified against
     /// `policy.subproblem_numerical`, re-checked against
     /// [`ArmModel::JOINT_LIMITS`] if `respect_limits`, and de-duplicated with
-    /// `policy.subproblem_dedup`; the nominal order is kept. A target reachable
+    /// `policy.subproblem_dedup`, then re-sorted nearest-first to `q_seed`
+    /// (the polish moves each solution, so the nominal order may not hold
+    /// after it). A target reachable
     /// only by the calibrated geometry (within a millimetre of the workspace
     /// boundary) has no nominal solution to start from and yields none.
     pub fn ik_all(
@@ -412,24 +415,31 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
             policy,
             refinement_max_iters,
         );
-        let mut out = [None; MAX];
+        let mut kept = [[0.0; DOF]; MAX];
         let mut n = 0;
-        for seed in nominal.iter().flatten() {
-            let mut q = *seed;
+        for q_nominal in nominal.iter().flatten() {
+            let mut q = *q_nominal;
             if chain.refine_ik(&flange_target, &mut q) > policy.subproblem_numerical {
                 continue;
             }
             if respect_limits && !within_limits(&q, &A::JOINT_LIMITS) {
                 continue;
             }
-            let duplicate = out[..n]
+            if !kept[..n]
                 .iter()
-                .flatten()
-                .any(|kept| q_close(&q, kept, policy.subproblem_dedup));
-            if !duplicate {
-                out[n] = Some(q);
+                .any(|k| q_close(&q, k, policy.subproblem_dedup))
+            {
+                kept[n] = q;
                 n += 1;
             }
+        }
+        // The polish moves every solution, so the nominal order can break.
+        if let Some(seed) = q_seed {
+            nearest_to_seed(&mut kept, n, seed);
+        }
+        let mut out = [None; MAX];
+        for (slot, q) in out.iter_mut().zip(&kept[..n]) {
+            *slot = Some(*q);
         }
         out
     }
@@ -440,15 +450,16 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
     /// solution. `kind` selects the trade-off ([`IkKind`]): [`IkKind::Near`]
     /// returns the solution closest to `q_seed`, [`IkKind::Fast`] a
     /// converged solution that may lie on another branch. With a calibration
-    /// installed the solution is polished onto the calibrated chain. Each
-    /// joint is then moved to the 2π turn nearest the seed when
+    /// installed the solution is polished onto the calibrated chain, holding
+    /// the 7-DOF lock joint ([`ArmModel::LOCKED_JOINT`]) fixed for `Near`.
+    /// Each joint is then moved to the 2π turn nearest the seed when
     /// [`ArmModel::JOINT_LIMITS`] allow, so a continuous Cartesian path maps
     /// to a continuous joint path.
     ///
     /// Returns `None` if the target is unreachable, or if any joint of the
     /// result lies further than [`ik_max_joint_step`](Self::ik_max_joint_step)
-    /// from the seed: following a solution on another branch would command a
-    /// jump.
+    /// from the seed, or the lock joint further than [`IK_LOCK_MAX_STEP`]:
+    /// following a solution on another branch would command a jump.
     pub fn ik_one(
         &self,
         tcp_target: &Pose,
@@ -464,8 +475,11 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
             policy,
             IK_ONE_REFINEMENT_ITERS,
         )?;
+        let lock = A::LOCKED_JOINT;
         if let Some(chain) = &self.calibration {
-            if chain.refine_ik(&flange_target, &mut q) > policy.subproblem_numerical
+            // `Near` holds the lock joint at the seed value; keep it there.
+            let hold = if kind == IkKind::Near { lock } else { None };
+            if chain.refine_ik_fixed(&flange_target, &mut q, hold) > policy.subproblem_numerical
                 || !within_limits(&q, &A::JOINT_LIMITS)
             {
                 return None;
@@ -476,8 +490,13 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
             if A::JOINT_LIMITS[i].is_none_or(|(lo, hi)| near >= lo && near <= hi) {
                 q[i] = near;
             }
+            let max_step = if lock == Some(i) {
+                self.ik_max_joint_step.min(IK_LOCK_MAX_STEP)
+            } else {
+                self.ik_max_joint_step
+            };
             let step = (q[i] - q_seed[i]).abs();
-            if step.is_nan() || step > self.ik_max_joint_step {
+            if step.is_nan() || step > max_step {
                 return None;
             }
         }
@@ -694,6 +713,7 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
 mod tests {
     use super::*;
     use crate::math::chain::pose_from_xyz_quat;
+    use crate::math::postprocess::wrap_distance;
     use crate::math::testing::{calibrated_chain, sample_q, SixR};
     use core::f64::consts::PI;
 
@@ -829,6 +849,214 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A scripted driver listing two distinct branches farthest-first, so only
+    /// `ik_all`'s own ordering can put the seed's branch in front.
+    struct FarFirst;
+
+    impl FarFirst {
+        fn other_branch(target: &Pose, near: &[f64; 6]) -> [f64; 6] {
+            let chain = crate::math::testing::nominal_chain();
+            (0..64)
+                .find_map(|k| {
+                    let mut q = sample_q::<6>(1000 + k, PI);
+                    let ok = chain.refine_ik(target, &mut q) < 1e-9;
+                    let q = q.map(wrap_to_pi);
+                    (ok && !q_close(&q, near, 1e-3)).then_some(q)
+                })
+                .expect("no second branch found")
+        }
+    }
+
+    impl ArmModel<6, 2> for FarFirst {
+        const JOINT_LIMITS: [crate::math::postprocess::JointLimit; 6] = [None; 6];
+
+        fn flange_fk(q: &[f64; 6]) -> Pose {
+            SixR::flange_fk(q)
+        }
+
+        fn flange_jacobian(q: &[f64; 6]) -> [[f64; 6]; 6] {
+            SixR::flange_jacobian(q)
+        }
+
+        fn flange_all(
+            target: &Pose,
+            q_seed: Option<&[f64; 6]>,
+            respect_limits: bool,
+            allow_refinement: bool,
+            policy: TolerancePolicy,
+            refinement_max_iters: usize,
+        ) -> [Option<[f64; 6]>; 2] {
+            let near = SixR::flange_all(
+                target,
+                q_seed,
+                respect_limits,
+                allow_refinement,
+                policy,
+                refinement_max_iters,
+            )[0];
+            [near.map(|q| Self::other_branch(target, &q)), near]
+        }
+
+        fn flange_one(
+            target: &Pose,
+            q_seed: &[f64; 6],
+            kind: IkKind,
+            policy: TolerancePolicy,
+            refinement_max_iters: usize,
+        ) -> Option<[f64; 6]> {
+            SixR::flange_one(target, q_seed, kind, policy, refinement_max_iters)
+        }
+    }
+
+    #[test]
+    fn calibrated_ik_all_is_sorted_nearest_first_after_the_polish() {
+        let mut arm = Arm::<FarFirst, 6, 2>::new();
+        arm.set_calibration(calibrated_chain()).unwrap();
+        let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];
+        let target = arm.fk(&q_true);
+        let policy = TolerancePolicy::DEFAULT;
+
+        let all = arm.ik_all(&target, Some(&q_true), false, true, policy, 15);
+        let [Some(first), Some(second)] = all else {
+            panic!("expected two branches, got {all:?}");
+        };
+        assert!(q_close(&first, &q_true, 1e-6), "{first:?}");
+        assert!(wrap_distance(&first, &q_true) < wrap_distance(&second, &q_true));
+        for q in [first, second] {
+            assert!((arm.fk(&q) - target).norm() < 1e-9);
+        }
+    }
+
+    /// A 7R stand-in whose `flange_one` holds the lock joint at the seed value
+    /// (`Near`) or pins it [`SEVEN_R_FAST_PIN`] away from it (`Fast`, as a lock
+    /// sample would), solving the other six joints on the nominal chain.
+    struct SevenR;
+
+    const SEVEN_R_LOCK: usize = 2;
+    const SEVEN_R_FAST_PIN: f64 = 0.5;
+
+    const SEVEN_R_DH: [crate::math::chain::DhRow; 7] = {
+        use crate::math::chain::DhRow;
+        use core::f64::consts::FRAC_PI_2;
+        [
+            DhRow::new(0.0, -FRAC_PI_2, 0.333, 0.0),
+            DhRow::new(0.0, FRAC_PI_2, 0.0, 0.0),
+            DhRow::new(0.0825, FRAC_PI_2, 0.316, 0.0),
+            DhRow::new(-0.0825, -FRAC_PI_2, 0.0, 0.0),
+            DhRow::new(0.0, FRAC_PI_2, 0.384, 0.0),
+            DhRow::new(0.088, FRAC_PI_2, 0.0, 0.0),
+            DhRow::new(0.0, 0.0, 0.107, 0.0),
+        ]
+    };
+
+    fn seven_r_chain(calibrated: bool) -> KinematicChain<7> {
+        use crate::math::chain::{apply_dh_deltas, DhConvention, DhRow};
+        let delta = [
+            DhRow::new(1.2e-4, -3.0e-4, 2.1e-4, 4.0e-4),
+            DhRow::new(-2.5e-4, 5.0e-4, 0.0, -6.0e-4),
+            DhRow::new(3.1e-4, -2.0e-4, 1.0e-4, 3.0e-4),
+            DhRow::new(-0.7e-4, 4.0e-4, -1.5e-4, -2.0e-4),
+            DhRow::new(0.4e-4, -1.0e-4, 0.9e-4, 5.0e-4),
+            DhRow::new(1.0e-4, 2.0e-4, 0.0, -3.0e-4),
+            DhRow::new(0.0, 0.0, -1.1e-4, 2.0e-4),
+        ];
+        let dh = if calibrated {
+            apply_dh_deltas(&SEVEN_R_DH, &delta)
+        } else {
+            SEVEN_R_DH
+        };
+        KinematicChain::from_dh(DhConvention::Standard, &dh).unwrap()
+    }
+
+    impl ArmModel<7, 1> for SevenR {
+        const LOCKED_JOINT: Option<usize> = Some(SEVEN_R_LOCK);
+
+        fn flange_fk(q: &[f64; 7]) -> Pose {
+            seven_r_chain(false).fk(q)
+        }
+
+        fn flange_jacobian(q: &[f64; 7]) -> [[f64; 7]; 6] {
+            seven_r_chain(false).jacobian(q)
+        }
+
+        fn flange_all(
+            target: &Pose,
+            q_seed: Option<&[f64; 7]>,
+            _respect_limits: bool,
+            _allow_refinement: bool,
+            policy: TolerancePolicy,
+            refinement_max_iters: usize,
+        ) -> [Option<[f64; 7]>; 1] {
+            let seed = q_seed.copied().unwrap_or([0.0; 7]);
+            [Self::flange_one(target, &seed, IkKind::Near, policy, refinement_max_iters)]
+        }
+
+        fn flange_one(
+            target: &Pose,
+            q_seed: &[f64; 7],
+            kind: IkKind,
+            policy: TolerancePolicy,
+            _refinement_max_iters: usize,
+        ) -> Option<[f64; 7]> {
+            let mut q = *q_seed;
+            if kind == IkKind::Fast {
+                q[SEVEN_R_LOCK] += SEVEN_R_FAST_PIN;
+            }
+            let chain = seven_r_chain(false);
+            let mut res = f64::INFINITY;
+            for _ in 0..8 {
+                res = chain.refine_ik_fixed(target, &mut q, Some(SEVEN_R_LOCK));
+                if res <= policy.subproblem_numerical {
+                    break;
+                }
+            }
+            (res <= policy.subproblem_numerical).then_some(q)
+        }
+    }
+
+    /// A configuration where the `Fast` pin is still reachable.
+    fn seven_r_q() -> [f64; 7] {
+        sample_q::<7>(1, 1.5)
+    }
+
+    #[test]
+    fn calibrated_ik_one_near_holds_the_lock_joint() {
+        let q_true = seven_r_q();
+        let mut arm = Arm::<SevenR, 7, 1>::new();
+        arm.set_calibration(seven_r_chain(true)).unwrap();
+        let target = arm.fk(&q_true);
+        let seed = q_true.map(|v| v + 0.02);
+
+        let q = arm
+            .ik_one(&target, &seed, IkKind::Near, TolerancePolicy::DEFAULT)
+            .expect("calibrated Near solution");
+        assert_eq!(q[SEVEN_R_LOCK], seed[SEVEN_R_LOCK]);
+        assert!((arm.fk(&q) - target).norm() < 1e-9);
+    }
+
+    #[test]
+    fn calibrated_ik_one_bounds_the_lock_joint_step() {
+        let q_true = seven_r_q();
+        let mut arm = Arm::<SevenR, 7, 1>::new();
+        arm.set_calibration(seven_r_chain(true)).unwrap();
+        let target = arm.fk(&q_true);
+        let policy = TolerancePolicy::DEFAULT;
+
+        // The driver's Fast answer polishes onto the calibrated chain with
+        // every other joint inside the π/2 step, but its lock joint lies
+        // beyond π/8 of the seed, so `ik_one` must refuse it.
+        let mut q = SevenR::flange_one(&target, &q_true, IkKind::Fast, policy, 0)
+            .expect("nominal Fast solution");
+        assert!(seven_r_chain(true).refine_ik(&target, &mut q) < policy.subproblem_numerical);
+        let step = |i: usize| wrap_to_pi(q[i] - q_true[i]).abs();
+        assert!(step(SEVEN_R_LOCK) > IK_LOCK_MAX_STEP);
+        assert!((0..7).all(|i| step(i) <= IK_DEFAULT_MAX_JOINT_STEP));
+        assert!(arm.ik_one(&target, &q_true, IkKind::Fast, policy).is_none());
+
+        // Near holds the lock at the seed and is accepted.
+        assert!(arm.ik_one(&target, &q_true, IkKind::Near, policy).is_some());
     }
 
     #[test]

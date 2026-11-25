@@ -4,6 +4,7 @@
 //! `rizon4.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
+use dexhal::math::single;
 use dexhal::math::{ArmModel, ChainJoint, IkKind, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{generated_dynamics, generated_kinematics, ik_solver};
@@ -65,6 +66,7 @@ pub struct Rizon4;
 
 impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon4 {
     const NAME: &'static str = "rizon4";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
         Some((-2.8798, 2.8798)),
         Some((-2.3562, 2.3562)),
@@ -75,6 +77,7 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon4 {
         Some((-3.0543, 3.0543)),
     ];
     const HAS_DYNAMICS: bool = true;
+    const LOCKED_JOINT: Option<usize> = Some(ik_solver::LOCKED_JOINT);
 
     #[inline]
     fn flange_fk(q: &[f64; DOF]) -> Pose {
@@ -96,8 +99,9 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon4 {
         policy: TolerancePolicy,
         refinement_max_iters: usize,
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
-        ik_solver::solve_all::<Self>(
+        ik_solver::solve(
             target,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
@@ -114,7 +118,16 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon4 {
         policy: TolerancePolicy,
         refinement_max_iters: usize,
     ) -> Option<[f64; DOF]> {
-        ik_solver::solve_one::<Self>(target, q_seed, kind, policy, refinement_max_iters)
+        single::seven_dof_one::<Self, MAX_SOLUTIONS>(
+            target,
+            q_seed,
+            kind,
+            policy,
+            refinement_max_iters,
+            ik_solver::LOCKED_JOINT,
+            &ik_solver::LOCK_SAMPLES,
+            |v| ik_solver::lock_sample_solutions(target, v, policy),
+        )
     }
 
     #[inline]
@@ -182,16 +195,37 @@ mod tests {
         for k in 0..16 {
             let q = sample(k);
             let target = Rizon4::flange_fk(&q);
-            let sols = Rizon4::flange_all(&target, Some(&q), true, false, DEFAULT_TOLERANCE_POLICY, 15);
+            let sols = Rizon4::flange_all(
+                &target,
+                Some(&q),
+                true,
+                false,
+                DEFAULT_TOLERANCE_POLICY,
+                15,
+            );
             let first = sols[0].expect("a reachable in-limit target has a solution");
             assert!((Rizon4::flange_fk(&first) - target).norm() < 1e-5);
             for sol in sols.iter().flatten() {
                 assert!((Rizon4::flange_fk(sol) - target).norm() < 1e-5);
             }
+        }
+    }
 
-            let one = Rizon4::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
-                .expect("flange_one closes a reachable target from its own seed");
-            assert!((Rizon4::flange_fk(&one) - target).norm() < 1e-5);
+    #[test]
+    fn flange_one_closes_and_near_returns_seed_configuration() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Rizon4::flange_fk(&q);
+            let fast = Rizon4::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable target has a single solution");
+            assert!((Rizon4::flange_fk(&fast) - target).norm() < 1e-5);
+            assert!(dexhal::math::postprocess::within_limits(&fast, &Rizon4::JOINT_LIMITS));
+            let near = Rizon4::flange_one(&target, &q, IkKind::Near, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("the seed is itself a root");
+            assert!((Rizon4::flange_fk(&near) - target).norm() < 1e-5);
+            for i in 0..DOF {
+                assert!(libm::fabs(near[i] - q[i]) < 1e-5, "Near drifted from seed at joint {i}");
+            }
         }
     }
 
@@ -230,7 +264,14 @@ mod tests {
             }
             let target = Rizon4::flange_fk(&q);
 
-            let sols = Rizon4::flange_all(&target, None, false, false, DEFAULT_TOLERANCE_POLICY, 15);
+            let sols = Rizon4::flange_all(
+                &target,
+                None,
+                false,
+                false,
+                DEFAULT_TOLERANCE_POLICY,
+                15,
+            );
             assert!(
                 sols.iter().any(Option::is_some),
                 "non-singular reachable pose returned no IK at q={q:?}"
@@ -241,7 +282,14 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = Rizon4::flange_all(&target, None, false, true, tight_policy, 15);
+                let tight_sols = Rizon4::flange_all(
+                    &target,
+                    None,
+                    false,
+                    true,
+                    tight_policy,
+                    15,
+                );
                 assert!(
                     tight_sols.iter().any(Option::is_some),
                     "tight-policy pose returned no IK at q={q:?}"

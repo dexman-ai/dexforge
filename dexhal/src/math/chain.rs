@@ -570,6 +570,12 @@ impl<const DOF: usize> KinematicChain<DOF> {
     /// (`lm_refine`, `dls_ik`), which only need an FK closure, this uses the
     /// chain's analytic Jacobian: one chain evaluation per iteration.
     pub fn refine_ik(&self, target: &Pose, q: &mut [f64; DOF]) -> f64 {
+        self.refine_ik_fixed(target, q, None)
+    }
+
+    /// [`refine_ik`](Self::refine_ik) with joint `fixed` (if any) held at its
+    /// value in `q`: its Jacobian column is dropped from every step.
+    pub fn refine_ik_fixed(&self, target: &Pose, q: &mut [f64; DOF], fixed: Option<usize>) -> f64 {
         let target = match transform_from_pose(target) {
             Ok(t) => t,
             Err(_) => return f64::INFINITY,
@@ -578,7 +584,12 @@ impl<const DOF: usize> KinematicChain<DOF> {
         let mut best = *q;
         let mut best_res = f64::INFINITY;
         for iter in 0..=CHAIN_IK_MAX_ITERS {
-            let (tip, jac) = self.fk_jacobian_rigid(&cur);
+            let (tip, mut jac) = self.fk_jacobian_rigid(&cur);
+            if let Some(f) = fixed {
+                for row in jac.iter_mut() {
+                    row[f] = 0.0;
+                }
+            }
             let res = frob_diff(&tip, &target);
             if !res.is_finite() {
                 break;

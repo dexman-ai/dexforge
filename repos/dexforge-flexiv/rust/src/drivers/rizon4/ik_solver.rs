@@ -10,7 +10,8 @@
 //! **Raghavan-Roth** kernel. The whole sweep is implemented by the shared
 //! [`crate::drivers::rizon_common`] solver; this module only supplies the baked
 //! [`Model`] built from the generated [`consts`] / [`pq`] tables and re-exports
-//! the public surface (`solve`, `fk`, [`TolerancePolicy`]).
+//! the standard public surface (`solve`, `LOCKED_JOINT`, `LOCK_SAMPLES`,
+//! `lock_sample_solutions`, `fk`, [`TolerancePolicy`]).
 //!
 //! See [`crate::drivers::rizon_common`] for the algorithm and the
 //! deterministic-execution note.
@@ -21,9 +22,8 @@ use crate::drivers::rizon_common::{self, Model};
 
 pub use crate::drivers::rizon_common::{DOF, MAX_SOLUTIONS};
 pub use dexhal::math::tolerances::TolerancePolicy;
-use dexhal::math::single::seven_dof_one;
-use dexhal::math::{ArmModel, IkKind};
 
+use super::arm::Rizon4;
 use super::consts;
 use super::pq;
 
@@ -70,17 +70,37 @@ const MODEL: Model = Model {
     t_rights7: &consts::T_RIGHTS7,
 };
 
-/// Every inverse-kinematics solution — mirrors `rizon4_ik.solve`, with the
-/// full-sweep semantics of [`ArmModel::flange_all`]. Called by `arm.rs`.
-pub fn solve_all<A: ArmModel<DOF, MAX_SOLUTIONS>>(
+/// The joint the sweep locks.
+pub const LOCKED_JOINT: usize = consts::LOCK_IDX;
+
+/// Lock-joint sample values of the sweep, in sweep order.
+pub const LOCK_SAMPLES: [f64; rizon_common::N_SAMPLES] = consts::LOCK_SAMPLES;
+
+/// Raw 7R candidates with lock joint [`LOCKED_JOINT`] pinned to `lock_value` (one
+/// of [`LOCK_SAMPLES`]). Unknown values give no candidates. The standard sample
+/// source of [`dexhal::math::single::seven_dof_one`]; refinement and acceptance
+/// are left to it, so `_policy` is unused.
+pub fn lock_sample_solutions(
     t: &SMatrix<f64, 4, 4>,
+    lock_value: f64,
+    _policy: TolerancePolicy,
+) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
+    rizon_common::sample_candidates(&MODEL, lock_value, t)
+}
+
+/// Every inverse-kinematics solution — mirrors `rizon4_ik.solve`, with the
+/// full-sweep semantics of `ArmModel::flange_all`. `max_solutions` caps the
+/// returned set (after limits and seed ordering).
+pub fn solve(
+    t: &SMatrix<f64, 4, 4>,
+    max_solutions: Option<usize>,
     q_seed: Option<&[f64; 7]>,
     respect_limits: bool,
     allow_refinement: bool,
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    rizon_common::solve::<A>(
+    let mut sols = rizon_common::solve::<Rizon4>(
         &MODEL,
         t,
         q_seed,
@@ -88,30 +108,12 @@ pub fn solve_all<A: ArmModel<DOF, MAX_SOLUTIONS>>(
         allow_refinement,
         policy,
         refinement_max_iters,
-    )
+    );
+    if let Some(cap) = max_solutions {
+        sols.iter_mut().skip(cap).for_each(|s| *s = None);
+    }
+    sols
 }
-
-/// Single solution — the [`ArmModel::flange_one`] path: the shared 7-DOF
-/// analytic seven-DOF search with the Rizon lock joint and 6R sample closure.
-pub fn solve_one<A: ArmModel<DOF, MAX_SOLUTIONS>>(
-    t: &SMatrix<f64, 4, 4>,
-    q_seed: &[f64; 7],
-    kind: IkKind,
-    policy: TolerancePolicy,
-    refinement_max_iters: usize,
-) -> Option<[f64; 7]> {
-    seven_dof_one::<A, MAX_SOLUTIONS>(
-        t,
-        q_seed,
-        kind,
-        policy,
-        refinement_max_iters,
-        MODEL.lock_idx,
-        MODEL.lock_samples,
-        |lock_value| rizon_common::sample_candidates(&MODEL, lock_value, t),
-    )
-}
-
 
 /// Forward kinematics — mirrors `rizon4_ik.fk`.
 ///
@@ -131,7 +133,7 @@ pub fn fk(q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drivers::rizon4::Rizon4;
+    use dexhal::math::{ArmModel, IkKind};
     use std::vec::Vec;
 
     fn tf_from_row_major(a: &[f64; 16]) -> SMatrix<f64, 4, 4> {

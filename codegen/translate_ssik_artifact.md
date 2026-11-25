@@ -85,6 +85,36 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
    FK and the Jacobian come from `generated_kinematics`; do not add another
    public FK (an internal chain FK used on the refinement hot path is fine).
 
+   `flange_one` (`ik_one`) is generated too, by DOF, and calls the shared
+   searches in `dexhal::math::single` with a fixed candidate source:
+
+   - **6-DOF:** `six_dof_one(..., || ik_solver::raw_candidates(target, policy))`.
+     Export
+
+     ```rust
+     pub fn raw_candidates(target: &Pose, policy: TolerancePolicy)
+         -> ([[f64; DOF]; single::CANDIDATES], usize)
+     ```
+
+     returning the raw closed-form candidates (padded, count in `.1`): not
+     FK-gated, not refined, not deduplicated, not limit-filtered. Never build it
+     from `solve(..., allow_refinement = false, ...)`: that gate drops
+     candidates whose unpolished residual misses the tolerance, which
+     `six_dof_one` would have polished onto a root.
+   - **7-DOF joint lock:** `seven_dof_one(..., ik_solver::LOCKED_JOINT,
+     &ik_solver::LOCK_SAMPLES, |v| ik_solver::lock_sample_solutions(target, v, policy))`.
+     Export `pub const LOCKED_JOINT: usize`, `pub const LOCK_SAMPLES: [f64; N]`
+     (the sweep's lock values, in sweep order) and
+
+     ```rust
+     pub fn lock_sample_solutions(target: &Pose, lock_value: f64, policy: TolerancePolicy)
+         -> [Option<[f64; DOF]>; MAX_SOLUTIONS]
+     ```
+
+     returning the candidates of the one sample equal to `lock_value`, with
+     the lock joint at that value (none for an unknown value). As with
+     `raw_candidates`, leave refinement and acceptance to `seven_dof_one`.
+
    **Entry points.** `solve(max_solutions = None, q_seed = Some(seed), ...)` is
    `ik_all`: it returns every solution (up to `MAX_SOLUTIONS`), sorted
    nearest-first by distance to the seed. It never early-exits, and joint-lock
@@ -203,7 +233,7 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
    cannot be a duplicate. The ranking uses pre-refinement distance, so
    equivalence with the full set holds on the tested configurations but is
    not proven. Reference: `dexhal::math::single::six_dof_one` (shared by every
-   6-DOF arm; the driver supplies only its raw candidates) and the
+   6-DOF arm; the driver supplies only `ik_solver::raw_candidates`) and the
    `flange_one_near_matches_nearest_of_full_set` test in each `arm.rs`.
    **Piper (general 6R).** Enumeration is slow, so `Fast` matters most here:
    the seeded `refine6` usually closes and the enumeration is skipped. The

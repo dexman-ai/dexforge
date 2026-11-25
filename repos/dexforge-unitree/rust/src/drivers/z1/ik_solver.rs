@@ -12,6 +12,7 @@
 use nalgebra::SMatrix;
 
 use dexhal::math::closed_form::finish6;
+use dexhal::math::single::CANDIDATES;
 use dexhal::math::ssik_core::{sp6_solve, wrap_to_pi};
 pub use dexhal::math::tolerances::TolerancePolicy;
 
@@ -96,6 +97,17 @@ pub fn solve(
         policy,
         refinement_max_iters,
     )
+}
+
+/// Raw (unfiltered, unpolished) closed-form IK candidates for `t`, padded to
+/// [`CANDIDATES`]. The standard candidate source of `ArmModel::flange_one`:
+/// refinement and acceptance are left to [`dexhal::math::single::six_dof_one`].
+pub fn raw_candidates(t: &SMatrix<f64, 4, 4>, policy: TolerancePolicy) -> ([[f64; 6]; CANDIDATES], usize) {
+    let mut raw = [[0.0; 6]; 8];
+    let n = solve_algebraic(t, &mut raw, policy);
+    let mut out = [[0.0; 6]; CANDIDATES];
+    out[..n].copy_from_slice(&raw[..n]);
+    (out, n)
 }
 
 // ---------------------------------------------------------------------------

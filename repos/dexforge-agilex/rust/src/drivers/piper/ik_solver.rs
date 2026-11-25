@@ -51,6 +51,7 @@ use nalgebra::SMatrix;
 use dexhal::math::closed_form::{finish6, refine6};
 use dexhal::math::kinematics::mat4_frob_diff;
 use dexhal::math::raghavan_roth::{mat4, solve_6r, RrChain};
+use dexhal::math::single::CANDIDATES;
 pub use dexhal::math::tolerances::TolerancePolicy;
 
 use super::arm::{Piper, MAX_SOLUTIONS};
@@ -243,6 +244,17 @@ pub(super) fn solve_candidates(
         return n;
     }
     spatial_bypass(t, policy, out)
+}
+
+/// Raw (unfiltered, unpolished) closed-form IK candidates for `t`, padded to
+/// [`CANDIDATES`]. The standard candidate source of `ArmModel::flange_one`:
+/// refinement and acceptance are left to [`dexhal::math::single::six_dof_one`].
+pub fn raw_candidates(t: &SMatrix<f64, 4, 4>, policy: TolerancePolicy) -> ([[f64; 6]; CANDIDATES], usize) {
+    let mut raw = [[0.0; 6]; MAX_SOLUTIONS];
+    let n = solve_candidates(t, policy, &mut raw).min(CANDIDATES);
+    let mut out = [[0.0; 6]; CANDIDATES];
+    out[..n].copy_from_slice(&raw[..n]);
+    (out, n)
 }
 
 /// Deterministic Spatial Bypass for ill-conditioned targets.

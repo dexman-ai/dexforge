@@ -63,6 +63,7 @@ ARM_OUTPUTS = ("arm.rs", "mod.rs", "driver.rs", "manifest.yaml", "generate_test_
 VENDOR_OUTPUTS = ("Cargo.toml", "README.md", "rust/Cargo.toml", "rust/src/lib.rs", "rust/src/drivers/mod.rs")
 
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
+_SECTION = re.compile(r"^[ \t]*\{\{#(\w+)\}\}[ \t]*\n(.*?)^[ \t]*\{\{/\1\}\}[ \t]*\n", re.S | re.M)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +72,17 @@ _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
 
 def render(template: str, values: Dict[str, object]) -> str:
-    """Substitute ``{{key}}`` placeholders; every placeholder must be provided."""
+    """Substitute ``{{key}}`` placeholders; every placeholder must be provided.
+
+    ``{{#key}}`` ... ``{{/key}}`` sections (each marker on its own line) are kept
+    when ``values[key]`` is truthy and dropped otherwise.
+    """
+
+    def section(m: re.Match) -> str:
+        key = m.group(1)
+        if key not in values:
+            raise KeyError(f"template section {{{{#{key}}}}} has no value")
+        return m.group(2) if values[key] else ""
 
     def sub(m: re.Match) -> str:
         key = m.group(1)
@@ -79,7 +90,7 @@ def render(template: str, values: Dict[str, object]) -> str:
             raise KeyError(f"template placeholder {{{{{key}}}}} has no value")
         return str(values[key])
 
-    return _PLACEHOLDER.sub(sub, template)
+    return _PLACEHOLDER.sub(sub, _SECTION.sub(section, template))
 
 
 def render_template(name: str, values: Dict[str, object]) -> str:
@@ -179,6 +190,8 @@ def contract_version(repo_root: Path) -> str:
 
 def generate_arm_rs(info: ArtifactInfo, artifact: Path, has_dynamics: bool) -> str:
     """Render ``arm.rs`` (``ArmModel`` + nominal ``KinematicChain``) for *info*."""
+    if info.dof not in (6, 7):
+        raise ValueError(f"arm.rs template supports 6- and 7-DOF arms, not {info.dof}-DOF")
     origins, axes, flange = nominal_chain(load_artifact(artifact))
     name = struct_name(info.arm)
 
@@ -239,6 +252,8 @@ def generate_arm_rs(info: ArtifactInfo, artifact: Path, has_dynamics: bool) -> s
             "has_dynamics": "true" if has_dynamics else "false",
             "module_uses": "{" + ", ".join(modules) + "}",
             "dynamics_impl": dynamics_impl,
+            "six_dof": info.dof == 6,
+            "seven_dof": info.dof == 7,
         },
     )
 
@@ -487,10 +502,19 @@ def _next_steps(res: ScaffoldResult, repo_root: Path) -> str:
     lay, info = res.layout, res.info
     d = _rel(lay.driver_dir, repo_root)
     ref = info.reference_driver_dir
+    if info.dof == 6:
+        one_api = "`raw_candidates(target, policy) -> ([[f64; 6]; CANDIDATES], usize)` (unfiltered algebraic candidates)"
+    else:
+        one_api = (
+            "`LOCKED_JOINT`, `LOCK_SAMPLES` and "
+            f"`lock_sample_solutions(target, lock_value, policy) -> [Option<[f64; 7]>; {info.max_solutions}]`"
+        )
     steps = [
         f"Reference arm: {info.reference_arm} ({ref}); family: category {info.category}, {info.family_title}.",
         f"Write {d}/ik_solver.rs from {d}/codegen/{lay.arm}_ik.py following codegen/translate_ssik_artifact.md "
-        f"and {ref}/ik_solver.rs; it must export `solve(...) -> [Option<[f64; {info.dof}]>; {info.max_solutions}]`.",
+        f"and {ref}/ik_solver.rs; it must export `solve(target, max_solutions, q_seed, respect_limits, "
+        f"allow_refinement, policy, refinement_max_iters) -> [Option<[f64; {info.dof}]>; {info.max_solutions}]` "
+        f"(flange_all) and {one_api} (flange_one).",
     ]
     if info.generate_code:
         steps.append(

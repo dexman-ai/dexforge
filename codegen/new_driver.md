@@ -110,9 +110,12 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    closed-form arms, `math::jointlock` for spherical-inner joint-lock 7R arms)
    instead of copying helpers; see
    [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 5.
-   `ik_one` is `ArmModel::flange_one`, implemented by
-   `dexhal::math::single::{six_dof_one, seven_dof_one}`; the driver supplies only
-   its raw candidates (6-DOF) or its per-sample solve (7-DOF).
+   `ik_one` is `ArmModel::flange_one`, generated in `arm.rs` on top of
+   `dexhal::math::single::{six_dof_one, seven_dof_one}`; `ik_solver.rs` supplies
+   only the standard candidate source: `raw_candidates(target, policy)` (6-DOF,
+   unfiltered closed-form candidates, never `solve` with refinement off) or
+   `LOCKED_JOINT`, `LOCK_SAMPLES` and `lock_sample_solutions(target, v, policy)`
+   (7-DOF). See [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 3.
    For 7-DOF joint-lock arms, `ik_one` must provide the `Fast` and `Near` kinds
    (selected by an extra `kind: IkKind` argument, default `Fast`) described in
    [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 7. `Near`

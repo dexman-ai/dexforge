@@ -151,9 +151,13 @@ What changes once a calibration is installed, and what it costs:
 
 - **FK / Jacobian** come from the chain: one fixed `DOF` loop.
 - **`ik_all`** polishes every nominal solution onto the calibrated chain,
-  re-verifies and de-duplicates them, and keeps the nominal order (nearest
-  first when a seed is given). Nothing is truncated.
-- **`ik_one`** polishes only the one solution the driver returned.
+  re-verifies and de-duplicates them, then re-sorts them nearest-first to the
+  seed when one is given (the polish moves each solution, so the nominal
+  order may not survive it). Nothing is truncated.
+- **`ik_one`** polishes only the one solution the driver returned, holding the
+  7-DOF lock joint (`ArmModel::LOCKED_JOINT`) fixed for `Near`; the result is
+  rejected if the lock joint moved more than π/8 from the seed (any other
+  joint, π/2).
 - **Dynamics** of the arm's own links stay nominal; payload terms use the
   calibrated flange.
 - **Uncalibrated arms** take the generated path and pay nothing.

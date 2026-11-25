@@ -23,6 +23,7 @@
 use nalgebra::SMatrix;
 
 use crate::drivers::ur_common::{self, Model, MAX_CANDIDATES};
+use dexhal::math::single::CANDIDATES;
 pub use dexhal::math::tolerances::TolerancePolicy;
 
 use super::arm::{Ur3e, MAX_SOLUTIONS};
@@ -121,6 +122,17 @@ pub(crate) fn solve_algebraic(
     policy: TolerancePolicy,
 ) -> usize {
     ur_common::solve_algebraic(&MODEL, t, out, policy)
+}
+
+/// Raw (unfiltered, unpolished) closed-form IK candidates for `t`, padded to
+/// [`CANDIDATES`]. The standard candidate source of `ArmModel::flange_one`:
+/// refinement and acceptance are left to [`dexhal::math::single::six_dof_one`].
+pub fn raw_candidates(t: &SMatrix<f64, 4, 4>, policy: TolerancePolicy) -> ([[f64; 6]; CANDIDATES], usize) {
+    let mut raw = [[0.0; 6]; MAX_CANDIDATES];
+    let n = solve_algebraic(t, &mut raw, policy);
+    let mut out = [[0.0; 6]; CANDIDATES];
+    out[..n].copy_from_slice(&raw[..n]);
+    (out, n)
 }
 
 // ---------------------------------------------------------------------------

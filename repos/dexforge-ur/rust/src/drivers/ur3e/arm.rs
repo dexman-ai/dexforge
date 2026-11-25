@@ -4,7 +4,7 @@
 //! `ur3e.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
-use dexhal::math::single::{self, CANDIDATES};
+use dexhal::math::single;
 use dexhal::math::{ArmModel, ChainJoint, IkKind, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{generated_dynamics, generated_kinematics, ik_solver};
@@ -62,17 +62,9 @@ pub fn nominal_chain() -> KinematicChain<DOF> {
 /// Ur3e (6-DOF) model marker.
 pub struct Ur3e;
 
-/// Raw closed-form candidates for `target`, padded to [`CANDIDATES`].
-fn raw_candidates(target: &Pose, policy: TolerancePolicy) -> ([[f64; DOF]; CANDIDATES], usize) {
-    let mut raw = [[0.0; DOF]; 8];
-    let n = ik_solver::solve_algebraic(target, &mut raw, policy);
-    let mut out = [[0.0; DOF]; CANDIDATES];
-    out[..n].copy_from_slice(&raw[..n]);
-    (out, n)
-}
-
 impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
     const NAME: &'static str = "ur3e";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
         Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
         Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
@@ -122,13 +114,15 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
         policy: TolerancePolicy,
         refinement_max_iters: usize,
     ) -> Option<[f64; DOF]> {
-        single::six_dof_one::<Ur3e, MAX_SOLUTIONS>(
+        // Raw closed-form candidates: polishing and acceptance belong to
+        // `six_dof_one`, so candidates must not be pre-filtered by `solve`.
+        single::six_dof_one::<Self, MAX_SOLUTIONS>(
             target,
             q_seed,
             kind,
             policy,
             refinement_max_iters,
-            || raw_candidates(target, policy),
+            || ik_solver::raw_candidates(target, policy),
         )
     }
 
@@ -161,7 +155,6 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dexhal::math::single::within_max_joint_step;
     use dexhal::math::DEFAULT_TOLERANCE_POLICY;
 
     /// Deterministic joint vectors inside the joint limits.
@@ -215,6 +208,18 @@ mod tests {
     }
 
     #[test]
+    fn flange_one_fast_closes_and_respects_limits() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Ur3e::flange_fk(&q);
+            let got = Ur3e::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable in-limit target has a solution");
+            assert!((Ur3e::flange_fk(&got) - target).norm() < 1e-5);
+            assert!(dexhal::math::postprocess::within_limits(&got, &Ur3e::JOINT_LIMITS));
+        }
+    }
+
+    #[test]
     fn flange_one_near_matches_nearest_of_full_set() {
         let policy = DEFAULT_TOLERANCE_POLICY;
         for k in 0..16 {
@@ -225,7 +230,10 @@ mod tests {
                 let single = Ur3e::flange_one(&target, &seed, IkKind::Near, policy, 15);
                 let full = Ur3e::flange_all(&target, Some(&seed), true, true, policy, 15);
                 // Near returns the nearest solution that passes the per-joint step gate.
-                let expected = full.iter().flatten().find(|b| within_max_joint_step(b, &seed));
+                let expected = full
+                    .iter()
+                    .flatten()
+                    .find(|b| dexhal::math::single::within_max_joint_step(b, &seed));
                 match (single, expected) {
                     (Some(a), Some(b)) => {
                         assert!((Ur3e::flange_fk(&a) - target).norm() < 1e-5);
@@ -238,18 +246,6 @@ mod tests {
                     _ => panic!("single/full disagree on existence: {single:?} vs {expected:?}"),
                 }
             }
-        }
-    }
-
-    #[test]
-    fn flange_one_fast_closes_and_respects_limits() {
-        for k in 0..16 {
-            let q = sample(k);
-            let target = Ur3e::flange_fk(&q);
-            let got = Ur3e::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
-                .expect("a reachable in-limit target has a solution");
-            assert!((Ur3e::flange_fk(&got) - target).norm() < 1e-5);
-            assert!(dexhal::math::postprocess::within_limits(&got, &Ur3e::JOINT_LIMITS));
         }
     }
 

@@ -94,6 +94,13 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
     /// refuses to answer dynamics queries.
     const HAS_DYNAMICS: bool = false;
 
+    /// The 7-DOF redundant (lock) joint that `flange_one` holds or samples;
+    /// `None` for non-redundant arms. [`crate::math::arm::Arm::ik_one`] keeps
+    /// it fixed while polishing a [`IkKind::Near`] solution onto a calibrated
+    /// chain, and bounds its step from the seed by
+    /// [`IK_LOCK_MAX_STEP`](crate::math::single::IK_LOCK_MAX_STEP).
+    const LOCKED_JOINT: Option<usize> = None;
+
     /// Forward kinematics of the flange (base → end-effector link).
     fn flange_fk(q: &[f64; DOF]) -> Pose;
 
