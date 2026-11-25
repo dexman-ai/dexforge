@@ -55,7 +55,28 @@ ROBOT_MODE_RUNNING = 7.0  # UR convention
 _ARMS = {
     "ur5": ("dexforge_ur", "ur5", [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]),
     "ur3e": ("dexforge_ur", "ur3e", [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]),
+    # SO-ARM101: five joints (the gripper jaw is not simulated); ready pose, tool pointing forward
+    "so101": ("dexforge_lerobot", "so101", [0.0, -0.3, 0.5, -0.2, 0.0]),
 }
+
+# PD natural frequency (rad/s) of the tracking controller, per arm; 30 unless listed.
+_DEFAULT_WN = {"so101": 20.0}
+
+# Arms whose tracking controller uses the full mass matrix (computed torque) instead of its diagonal.
+# Diagonal-mass gains ignore the inertial coupling between joints, which is mild for the UR arms at
+# their 500 Hz but is not for the light SO-101 at 100 Hz: with them 8 of 30 random workspace targets
+# never settled at 8 rad/s (5 of 30 even at 4 rad/s), while computed torque settled all of them at
+# every natural frequency tried up to 30 rad/s (tools/tests/test_sim_so101.py keeps a regression).
+_FULL_MASS_CONTROL = {"so101"}
+
+# (position m, orientation rad) a Cartesian command may miss by and still be executed, per arm. Only
+# arms that cannot reach every pose need it: the five-joint SO-101 reaches a 5-D subset of SE(3), so a
+# pose from a camera, a teleop device or a typed command is almost never exactly reachable. The sim then
+# moves to the nearest reachable configuration (``ik_project``) and reports what it reached in
+# ``tcp_pose``; a command that misses by more is rejected like an unreachable one. These numbers are a
+# simulation default, not a property of the hardware. Arms not listed (the UR arms reach every pose in
+# their workspace) keep the exact behaviour.
+_DEFAULT_IK_TOLERANCE = {"so101": (0.005, 0.1)}
 
 # command mode -> the target field it needs (finite), for the modes this sim executes
 _MODE_TARGET = {"joint_pos": "target_q", "joint_vel": "target_qd", "cartesian_pose": "target_pose"}
@@ -69,10 +90,12 @@ class SimDriver:
         arm: str = "ur5",
         *,
         realtime: bool = False,
-        wn: float = 30.0,
+        wn: Optional[float] = None,
         zeta: float = 1.0,
         ik_max_joint_step: Optional[float] = None,
         q0: Optional[np.ndarray] = None,
+        ik_tolerance="default",
+        full_mass: Optional[bool] = None,
     ) -> None:
         if arm not in _ARMS:
             raise ValueError(f"unknown arm {arm!r}; supported: {sorted(_ARMS)}")
@@ -81,7 +104,8 @@ class SimDriver:
         self._math = getattr(self._mod, arm)
         self.arm = arm
         self.realtime = realtime
-        self._wn, self._zeta = wn, zeta
+        self._wn, self._zeta = (_DEFAULT_WN.get(arm, 30.0) if wn is None else wn), zeta
+        self._full_mass = (arm in _FULL_MASS_CONTROL) if full_mass is None else bool(full_mass)
 
         self._manifest: Dict = self._math.manifest()
         m = self._manifest
@@ -98,6 +122,15 @@ class SimDriver:
         if not (np.isfinite(self._amax[: self.dof]).all() and (self._amax[: self.dof] > 0).all()):
             raise ValueError(f"manifest acceleration_limits must be finite and positive, got {self._amax[: self.dof]}")
         self._effort = np.array(m["effort_limits"])
+        # (position m, orientation rad), or None for the exact behaviour
+        tol = _DEFAULT_IK_TOLERANCE.get(arm) if ik_tolerance == "default" else ik_tolerance
+        if tol is not None:
+            tol = (float(tol[0]), float(tol[1]))
+            if not (all(np.isfinite(tol)) and min(tol) >= 0.0):
+                raise ValueError(f"ik_tolerance must be two finite non-negative numbers, got {tol}")
+            if not hasattr(self._math, "ik_project"):
+                raise ValueError(f"{arm} has no nearest-reachable IK (ik_project); ik_tolerance must be None")
+        self._ik_tol = tol
         self._ik_step = (
             self._math.ik_default_max_joint_step() if ik_max_joint_step is None else float(ik_max_joint_step)
         )
@@ -118,6 +151,11 @@ class SimDriver:
     @property
     def data(self) -> "mujoco.MjData":
         return self._data
+
+    @property
+    def ik_tolerance(self):
+        """(position m, orientation rad) a Cartesian command may miss by, or ``None`` for exact only."""
+        return self._ik_tol
 
     @property
     def threaded(self) -> bool:
@@ -284,9 +322,12 @@ class SimDriver:
             self._advance(np.zeros(self.dof))
 
         g = np.array(self._math.gravity(q.tolist()))
-        m_diag = np.diag(np.array(self._math.mass_matrix(q.tolist())))
+        mass = np.array(self._math.mass_matrix(q.tolist()))
         e, ed = self._q_ref - q, self._qd_ref - qd
-        tau = g + m_diag * (self._wn**2 * e + 2.0 * self._zeta * self._wn * ed)
+        accel = self._wn**2 * e + 2.0 * self._zeta * self._wn * ed
+        # diagonal-mass gains (the UR arms), or computed torque with the full mass matrix, which
+        # decouples the joints so the gains do not depend on the configuration's inertial coupling
+        tau = g + (mass @ accel if self._full_mass else np.diag(mass) * accel)
         tau = np.clip(tau, -self._effort, self._effort)
         d.ctrl[: self.dof] = tau
         with self.physics_lock:
@@ -361,9 +402,17 @@ class SimDriver:
         T = np.eye(4)
         T[:3, :3] = R.from_quat(pose[3:7]).as_matrix()
         T[:3, 3] = pose[:3]
-        if not self._math.solve(T.tolist(), respect_limits=True):
-            return FAULT_IK_NO_SOLUTION
-        return FAULT_IK_STEP_TOO_LARGE
+        if self._math.solve(T.tolist(), respect_limits=True):
+            return FAULT_IK_STEP_TOO_LARGE  # reachable exactly, but only on a branch too far from here
+        if self._ik_tol is not None:
+            nearest = self._math.ik_project(pose.tolist(), seed)
+            if nearest is not None:
+                q, dp, da = nearest
+                if dp <= self._ik_tol[0] and da <= self._ik_tol[1]:
+                    if np.abs(np.array(q) - np.array(seed)).max() > self._ik_step:
+                        return FAULT_IK_STEP_TOO_LARGE
+                    return np.array(q)
+        return FAULT_IK_NO_SOLUTION
 
     def _make_state(self) -> np.ndarray:
         buf = np.full(self._manifest["state_len"], np.nan)

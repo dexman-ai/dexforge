@@ -21,3 +21,4 @@ The kinematic and inertial models in `repos/*/rust/src/drivers/*/*.urdf` derive 
 | `piper` | piper_ros (agilexrobotics) | MIT |
 | `rizon4`, `rizon10` | flexiv_description (flexivrobotics) | Apache-2.0 |
 | `xarm7` | xArm-Developer/xarm_ros (UFACTORY, Copyright 2018) | BSD-3-Clause |
+| `so101`, `so101_6r` | SO-ARM100 (TheRobotStudio), `Simulation/SO101/so101_new_calib.urdf`; meshes in `tools/meshes/so101/` | Apache-2.0 |

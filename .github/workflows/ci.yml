@@ -27,6 +27,7 @@ jobs:
           - dexforge-ufactory
           - dexforge-flexiv
           - dexforge-unitree
+          - dexforge-lerobot
     steps:
       - uses: actions/checkout@v4
 

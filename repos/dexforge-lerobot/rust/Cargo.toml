@@ -1,0 +1,25 @@
+[package]
+name = "dexforge-lerobot-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Lerobot arm drivers for dexhal."
+license = "BSD-3-Clause"
+
+[lib]
+name = "dexforge_lerobot_core"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+# Host I/O (sockets, vendor SDKs) in `drivers/<arm>/driver.rs`.
+std = []
+
+[dependencies]
+dexhal = { path = "../../../dexhal" }
+libm = "0.2"
+
+[dependencies.nalgebra]
+version = "0.33"
+default-features = false
+features = ["libm"]

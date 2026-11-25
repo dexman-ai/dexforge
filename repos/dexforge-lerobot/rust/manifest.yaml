@@ -1,0 +1,48 @@
+# Manifest of the five-joint SO-ARM101 (`So101`, vendor "lerobot").
+#
+# Loaded by `So101Driver::new()` through `ArmManifest::from_text::<So101, 5, 16>`.
+#
+# PROVENANCE OF THE VALUES (read before using on hardware):
+#   * limits.velocity / limits.effort: the URDF <limit> tags (so101_new_calib.urdf, from the
+#     CAD export). They are placeholders, NOT Feetech STS3215 ratings; replace them from the
+#     servo data sheet / measured values before commanding a real arm.
+#   * control_freq_hz, latency.*, limits.acceleration: ASSUMED simulation defaults. LeRobot
+#     publishes no controller rate or latency for the SO-101; its client loop rate is set by the
+#     user's script. Adjust them to your setup.
+#   * control_modes: what this driver accepts. The servos natively execute joint position
+#     targets; joint_vel and cartesian_pose are realised on the host (integrating the velocity,
+#     and the generated IK `Arm::ik_nearest`) before joint positions are sent.
+
+driver: so101                 # must equal So101::NAME
+version: "0.4"
+control_freq_hz: 100          # ASSUMED
+control_modes: [joint_pos, joint_vel, cartesian_pose]
+realtime: false
+
+latency:
+  state_staleness_cycles: 1   # ASSUMED
+  command_dispatch_cycles: 1  # ASSUMED
+
+limits:
+  velocity: [10.0, 10.0, 10.0, 10.0, 10.0]       # rad/s  (URDF <limit velocity>, CAD placeholder)
+  acceleration: [20.0, 20.0, 20.0, 20.0, 20.0]   # rad/s^2 (ASSUMED)
+  effort: [10.0, 10.0, 10.0, 10.0, 10.0]         # N*m    (URDF <limit effort>, CAD placeholder)
+
+has_static_inertials: true
+
+sensing:
+  torque: false
+  wrench: false
+  gripper: false              # the jaw is a separate actuator and is not part of this arm
+
+native:
+  cartesian_impedance: false
+  cartesian_admittance: false
+  joint_impedance: false
+  contact_detection: false
+  reflexes: false
+  payload: false
+  tcp_offset: false
+  gravity_compensation: false
+  realtime_mode_switch: false
+  nullspace_posture: false

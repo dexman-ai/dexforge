@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dexforge-sim-bindings-lerobot"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Generated SO-ARM101 math (IK, FK, dynamics, manifest, buffer layouts) for the MuJoCo simulator."
+
+[tool.maturin]
+module-name = "dexforge_lerobot"

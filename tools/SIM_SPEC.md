@@ -210,6 +210,25 @@ poses, not what a robot client sends.
 - **Arms:** UR5 first. Piper next, after deciding whether its MJCF is generated
   from our new-revision URDF or Menagerie's old-revision model is patched.
   Rizon stays kinematic-only (no inertials).
+- **SO-ARM101** (`--arm so101`, vendor crate `repos/dexforge-lerobot`, bindings `tools/sim_bindings_lerobot`,
+  Python module `dexforge_lerobot`): a *five-joint* arm (the gripper jaw is folded into the end link and not
+  simulated). Differences from the UR arms, all deliberate:
+  - **DOF 5.** Its closed-form IK comes from a 6R embedding (the arm plus a zero-offset virtual joint, see the
+    crate README). The arm reaches only a 5-D subset of poses, so a Cartesian command is executed on the exact
+    solution when there is one, and otherwise on the *nearest reachable configuration* (`ik_project`) provided it
+    misses the commanded pose by no more than `SimDriver(ik_tolerance=(position m, orientation rad))`, default
+    (5 mm, 0.1 rad) for this arm (`sim_driver._DEFAULT_IK_TOLERANCE`; a simulation default, not a hardware
+    property). A command that misses by more raises `FAULT_IK_NO_SOLUTION` and holds, as before. `ik_tolerance=None`
+    restores exact-only behaviour. The achieved pose is in `tcp_pose`; the sim does not fault for a miss that is
+    within tolerance. The UR arms are unaffected (they reach every pose in their workspace).
+  - **100 Hz manifest** (assumed, not a measured controller rate). Tracking uses computed torque with the full mass
+    matrix (`sim_driver._FULL_MASS_CONTROL`) at 20 rad/s (`_DEFAULT_WN`). The UR arms' diagonal-mass PD does not work
+    here: with it 8 of 30 random workspace targets never settled at 8 rad/s (5 of 30 even at 4), because it ignores the
+    coupling between joints. Computed torque settled all 30 at every frequency tried up to 30 rad/s.
+  - **Manifest limits are placeholders**: velocity / effort are the CAD export's 10 rad/s and 10 N*m, not STS3215
+    ratings, and acceleration is an assumed 20 rad/s^2.
+  - Meshes: one decimated STL per link from SO-ARM100 (Apache-2.0), `tools/meshes/so101/`.
+  Tests: `tools/tests/test_sim_so101.py` (bindings, generated dynamics vs MuJoCo, SimDriver).
 
 ## Open questions
 

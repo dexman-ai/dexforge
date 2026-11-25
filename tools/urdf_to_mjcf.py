@@ -38,6 +38,7 @@ REPO = Path(__file__).resolve().parents[1]
 ARMS = {
     "ur5": (REPO / "repos/dexforge-ur/rust/src/drivers/ur5/ur5.urdf", "ee_link"),
     "ur3e": (REPO / "repos/dexforge-ur/rust/src/drivers/ur3e/ur3e.urdf", "ee_link"),
+    "so101": (REPO / "repos/dexforge-lerobot/rust/src/so101/so101.urdf", "gripper_frame_link"),
 }
 # Same value as dexhal's STANDARD_GRAVITY (the Arm model) and the bindings' default;
 # a test checks they agree.

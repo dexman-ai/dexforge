@@ -75,6 +75,7 @@ def demo(c: Client) -> int:
         [-0.5, 0.2, 0.2, -0.3, 0.3, -0.3],
         [0.0, -0.3, 0.4, 0.2, 0.0, 0.0],
     ]
+    deltas = [d[:n] for d in deltas]  # arms with fewer than 6 joints use the leading joints
     failures = 0
     for i, dq in enumerate(deltas, 1):
         goal = q0 + np.array(dq)
@@ -93,13 +94,14 @@ def demo(c: Client) -> int:
     return failures
 
 
-HELP = """commands (angles in radians unless noted):
+HELP = """commands (angles in radians unless noted; N = number of joints):
   state                       joints, TCP pose, fault code
-  joint q1 q2 q3 q4 q5 q6     joint-position command
-  jointdeg q1 ... q6          same, in degrees
-  nudge i delta               move joint i (1-6) by delta radians
+  joint q1 ... qN             joint-position command
+  jointdeg q1 ... qN          same, in degrees
+  nudge i delta               move joint i (1..N) by delta radians
   pose x y z qx qy qz qw      cartesian command (generated IK, current branch)
-  move dx dy dz               move the TCP by (dx, dy, dz) metres, keeping orientation
+  move dx dy dz               move the TCP by (dx, dy, dz) metres, keeping orientation (an arm with fewer than
+                              6 joints goes to the nearest reachable pose within its tolerance, else rejected)
   home                        back to the start pose
   clear                       clear a latched fault
   help | quit"""
@@ -233,14 +235,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     return 1 if failures else 0
 
 
+# arm -> (look-at point, distance, azimuth, elevation) of the render camera
+_CAMERA = {
+    "default": ([0.0, 0.0, 0.4], 2.2, 135, -20),
+    "so101": ([0.15, 0.0, 0.12], 0.9, 135, -20),  # a ~40 cm arm
+}
+
+
 def _render(drv: S.SimDriver, out: Path) -> None:
     import mujoco
     from PIL import Image
 
     r = mujoco.Renderer(drv.model, height=480, width=640)
     cam = mujoco.MjvCamera()
-    cam.lookat[:] = [0.0, 0.0, 0.4]
-    cam.distance, cam.azimuth, cam.elevation = 2.2, 135, -20
+    lookat, cam.distance, cam.azimuth, cam.elevation = _CAMERA.get(drv.arm, _CAMERA["default"])
+    cam.lookat[:] = lookat
     with drv.physics_lock:
         r.update_scene(drv.data, cam)
     try:
