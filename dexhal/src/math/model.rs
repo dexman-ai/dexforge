@@ -7,7 +7,7 @@
 //! lives in the driver crate; this module only fixes their shape.
 //!
 //! ```
-//! use dexhal::math::model::{ArmModel, Pose};
+//! use dexhal::math::model::{ArmModel, IkKind, Pose};
 //! use dexhal::math::tolerances::TolerancePolicy;
 //!
 //! /// Zero-sized marker for one arm, as found in a driver's `arm.rs`.
@@ -24,9 +24,8 @@
 //!         [[0.0; 7]; 6] // driver: generated_kinematics::jacobian(q)
 //!     }
 //!
-//!     fn flange_solve(
+//!     fn flange_all(
 //!         _target: &Pose,
-//!         _max_solutions: Option<usize>,
 //!         _q_seed: Option<&[f64; 7]>,
 //!         _respect_limits: bool,
 //!         _allow_refinement: bool,
@@ -34,6 +33,16 @@
 //!         _refinement_max_iters: usize,
 //!     ) -> [Option<[f64; 7]>; 1] {
 //!         [None] // driver: ik_solver::solve(..)
+//!     }
+//!
+//!     fn flange_one(
+//!         _target: &Pose,
+//!         _q_seed: &[f64; 7],
+//!         _kind: IkKind,
+//!         _policy: TolerancePolicy,
+//!         _refinement_max_iters: usize,
+//!     ) -> Option<[f64; 7]> {
+//!         None // driver: single::seven_dof_one::<Self, 1>(..)
 //!     }
 //! }
 //!
@@ -51,6 +60,20 @@ use crate::math::tolerances::TolerancePolicy;
 
 /// A 4×4 homogeneous SE(3) pose, matching the per-arm `fk` / `solve` type.
 pub type Pose = SMatrix<f64, 4, 4>;
+
+/// Search strategy for the single-solution entry point ([`ArmModel::flange_one`]).
+///
+/// * `Fast` (default): seeded refinement first, enumeration only as fallback.
+///   Lower latency; the result is a root near the seed but not guaranteed to be
+///   the nearest one.
+/// * `Near`: enumerate and refine candidates nearest-to-seed first. Slower;
+///   the nearest accepted candidate is returned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IkKind {
+    #[default]
+    Fast,
+    Near,
+}
 
 /// One arm's generated model: a zero-sized marker type per arm.
 ///
@@ -71,6 +94,13 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
     /// refuses to answer dynamics queries.
     const HAS_DYNAMICS: bool = false;
 
+    /// The 7-DOF redundant (lock) joint that `flange_one` holds or samples;
+    /// `None` for non-redundant arms. [`crate::math::arm::Arm::ik_one`] keeps
+    /// it fixed while polishing a [`IkKind::Near`] solution onto a calibrated
+    /// chain, and bounds its step from the seed by
+    /// [`IK_LOCK_MAX_STEP`](crate::math::single::IK_LOCK_MAX_STEP).
+    const LOCKED_JOINT: Option<usize> = None;
+
     /// Forward kinematics of the flange (base → end-effector link).
     fn flange_fk(q: &[f64; DOF]) -> Pose;
 
@@ -78,26 +108,37 @@ pub trait ArmModel<const DOF: usize, const MAX: usize> {
     /// base frame.
     fn flange_jacobian(q: &[f64; DOF]) -> [[f64; DOF]; 6];
 
-    /// The driver's inverse kinematics for a flange target.
+    /// Every inverse-kinematics solution for a flange target (`ik_all`).
     ///
-    /// The driver owns the whole solve: the closed form, FK verification
+    /// The driver owns the whole enumeration: the closed form, FK verification
     /// against `policy.subproblem_numerical`, optional refinement,
-    /// de-duplication, joint limits and ordering. dexhal relies on two
-    /// properties of the result:
-    ///
-    /// * with `q_seed`, solutions are ordered nearest-first (wrap-to-π joint
-    ///   distance), so the first filled slot is the branch closest to the seed;
-    /// * with `respect_limits`, every solution lies inside the arm's limits.
+    /// de-duplication, joint limits and ordering. It never exits early.
+    /// With `q_seed`, solutions are ordered nearest-first (wrap-to-π joint
+    /// distance); without one, the driver's order is kept. With
+    /// `respect_limits`, every solution lies inside the arm's limits.
     #[allow(clippy::too_many_arguments)]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
         policy: TolerancePolicy,
         refinement_max_iters: usize,
     ) -> [Option<[f64; DOF]>; MAX];
+
+    /// One inverse-kinematics solution for a flange target (`ik_one`).
+    ///
+    /// Returns as soon as an accepted solution is found. `kind` selects the
+    /// strategy (see [`IkKind`]). The result is within the joint limits and
+    /// closes to `policy.subproblem_numerical`. Drivers implement this with
+    /// the shared helpers in [`crate::math::single`].
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]>;
 
     /// Gravity torque `G(q)` of the arm's own links for a base-frame `gravity`.
     #[inline]

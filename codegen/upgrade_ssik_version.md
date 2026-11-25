@@ -103,7 +103,7 @@ python codegen/ssik_artifact.py inspect /tmp/upgrade/<arm>_ik.py --arm <arm>
 - **Solver algorithm or algebraic block change:**
   - Retranslate `ik_solver.rs` with a coding agent following [`codegen/new_driver.md`](new_driver.md) (Steps 3–4) and [`codegen/translate_ssik_artifact.md`](translate_ssik_artifact.md).
 - **Upstream `ssik` test suite changes (`tests/test_prebuilt_*.py`, `_hypothesis_strategies.py`):**
-  - If `ssik` modified its shared prebuilt sanity/fuzz tests (e.g., non-singular `q*` sampling filters, `tight_policy` + `allow_refinement` checks, or FK residual ceilings) or added new common prebuilt contract tests, port those changes into [`codegen/templates/arm/arm.rs.tmpl`](templates/arm/arm.rs.tmpl) (see `flange_solve_closes_on_fk_targets` and `ssik_non_singular_roundtrip_and_tight_policy_suite`) and per-arm `ik_solver.rs` test modules, then regenerate `arm.rs` across all arms (`python codegen/scaffold.py ... --only arm.rs`).
+  - If `ssik` modified its shared prebuilt sanity/fuzz tests (e.g., non-singular `q*` sampling filters, `tight_policy` + `allow_refinement` checks, or FK residual ceilings) or added new common prebuilt contract tests, port those changes into [`codegen/templates/arm/arm.rs.tmpl`](templates/arm/arm.rs.tmpl) (see `flange_all_closes_on_fk_targets` and `ssik_non_singular_roundtrip_and_tight_policy_suite`) and per-arm `ik_solver.rs` test modules, then regenerate `arm.rs` across all arms (`python codegen/scaffold.py ... --only arm.rs`).
 
 ---
 

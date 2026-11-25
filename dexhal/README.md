@@ -88,19 +88,30 @@ arm.set_gravity([0.0, 0.0, -9.80665])?;           // base frame; wall / ceiling 
 let pose = arm.fk(&q);                            // base -> TCP
 let jac = arm.jacobian(&q);                       // [Jv; Jw] at the TCP, base axes
 let jac_tool = arm.jacobian_tool(&q);             // same, TCP axes
-let all = arm.ik(&target, None, None, true, true, TolerancePolicy::DEFAULT, 15);
-let q_next = arm.ik_nearest(&target, &q, TolerancePolicy::DEFAULT);
+let all = arm.ik_all(&target, None, true, true, TolerancePolicy::DEFAULT, 15);
+let q_next = arm.ik_one(&target, &q, IkKind::Fast, TolerancePolicy::DEFAULT); // servo IK
 let dynamics = arm.dynamics(&q, &qd);             // M, C·qd, G incl. payload
 let tau = arm.inverse_dynamics(&q, &qd, &qdd);    // incl. payload
 ```
 
 Setters validate their input and leave the arm unchanged on error.
 
-**Inverse kinematics.** `ik` retargets the TCP and returns the driver's
-solutions. `ik_nearest` is the servo form: it asks the driver for the one
-solution nearest the seed, moves each joint to the 2π turn nearest the seed
-when the limits allow, and returns `None` if any joint would still lie more
-than `ik_max_joint_step` (default π/2, `set_ik_max_joint_step`) from the seed.
+**Inverse kinematics.** `ik_all` retargets the TCP and returns every solution
+the driver finds, with no early exit; with a seed they are sorted nearest first.
+`ik_one` returns one solution and exits early. `IkKind::Fast` (default, and
+what the servo contract uses) runs a seeded refinement first and may return a
+non-nearest root; `IkKind::Near` prefers the closest candidate the driver can
+produce, at higher cost (exact for 6-DOF, approximate by stage order for
+7-DOF).
+`ik_all` copies as many solutions as the output buffer holds (the nearest
+ones when seeded); size it to the arm's maximum to receive them all.
+`ik_one` moves each joint to the 2π turn nearest the seed when the limits
+allow, and discards every proposed solution (checked after polishing) with
+a joint more than `IK_DEFAULT_MAX_JOINT_STEP` (π/2) from the seed, or (7-DOF)
+a lock joint more than `IK_LOCK_MAX_STEP` (π/8) from the seed,
+trying the next candidate or stage instead. If none passes it returns
+`None`. `set_ik_max_joint_step` can tighten the bound per arm, but not
+loosen it past π/2.
 Near a singularity or a joint limit the nearest remaining solution is on
 another branch; the bound turns that into "no solution" instead of a jump.
 
@@ -139,12 +150,14 @@ files contain, keep full precision.
 What changes once a calibration is installed, and what it costs:
 
 - **FK / Jacobian** come from the chain: one fixed `DOF` loop.
-- **`ik`** takes the driver's full nominal solution set, polishes each
-  solution onto the calibrated chain with at most `CHAIN_IK_MAX_ITERS` (12)
-  damped Newton steps, re-verifies it against the caller's
-  `policy.subproblem_numerical`, re-applies the limits, de-duplicates and then
-  truncates to `max_solutions`.
-- **`ik_nearest`** polishes only the one solution the driver returned.
+- **`ik_all`** polishes every nominal solution onto the calibrated chain,
+  re-verifies and de-duplicates them, then re-sorts them nearest-first to the
+  seed when one is given (the polish moves each solution, so the nominal
+  order may not survive it). Nothing is truncated.
+- **`ik_one`** polishes only the one solution the driver returned, holding the
+  7-DOF lock joint (`ArmModel::LOCKED_JOINT`) fixed for `Near`; the result is
+  rejected if the lock joint moved more than π/8 from the seed (any other
+  joint, π/2).
 - **Dynamics** of the arm's own links stay nominal; payload terms use the
   calibrated flange.
 - **Uncalibrated arms** take the generated path and pay nothing.

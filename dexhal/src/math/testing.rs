@@ -9,7 +9,7 @@
 use core::f64::consts::{FRAC_PI_2, PI};
 
 use crate::math::chain::{apply_dh_deltas, DhConvention, DhRow, KinematicChain};
-use crate::math::model::{ArmModel, Pose};
+use crate::math::model::{ArmModel, IkKind, Pose};
 use crate::math::postprocess::{within_limits, JointLimit};
 use crate::math::ssik_core::wrap_to_pi;
 use crate::math::tolerances::TolerancePolicy;
@@ -88,9 +88,8 @@ impl ArmModel<6, 1> for SixR {
     /// seed, as principal values, honouring the limits and the tolerance.
     /// Being a bounded Newton polish it gives up close to a singularity,
     /// where a real closed-form solver would not.
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; 6]>,
         respect_limits: bool,
         _allow_refinement: bool,
@@ -98,9 +97,7 @@ impl ArmModel<6, 1> for SixR {
         _refinement_max_iters: usize,
     ) -> [Option<[f64; 6]>; 1] {
         let mut q = q_seed.copied().unwrap_or([0.0; 6]);
-        if max_solutions == Some(0)
-            || nominal_chain().refine_ik(target, &mut q) > policy.subproblem_numerical
-        {
+        if nominal_chain().refine_ik(target, &mut q) > policy.subproblem_numerical {
             return [None];
         }
         let q = q.map(wrap_to_pi);
@@ -108,6 +105,16 @@ impl ArmModel<6, 1> for SixR {
             return [None];
         }
         [Some(q)]
+    }
+
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; 6],
+        _kind: IkKind,
+        policy: TolerancePolicy,
+        _refinement_max_iters: usize,
+    ) -> Option<[f64; 6]> {
+        Self::flange_all(target, Some(q_seed), true, true, policy, 0)[0]
     }
 
     // Recognisable placeholder dynamics: G = g_z, M = 2·I, C qd = qd.

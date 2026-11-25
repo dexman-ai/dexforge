@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use dexhal::math::ssik_core::wrap_to_pi;
-use dexhal::math::{dls_ik, within_limits, Arm, ArmModel, Pose, TolerancePolicy, Transform, DLS_FK_ATOL, DLS_MAX_ITERS};
+use dexhal::math::{dls_ik, within_limits, Arm, ArmModel, IkKind, Pose, TolerancePolicy, Transform, DLS_FK_ATOL, DLS_MAX_ITERS};
 
 const WARMUP: usize = 200;
 const IK_CALLS: usize = 2_000;
@@ -110,22 +110,22 @@ fn to_transform(p: &Pose) -> Transform {
 struct Timings {
     ik_all: f64,
     ik_all_worst: f64,
-    ik_nearest: f64,
-    ik_nearest_worst: f64,
+    ik_one: f64,
+    ik_one_worst: f64,
     dls: f64,
     dls_worst: f64,
     dynamics: f64,
     inverse_dynamics: f64,
     ik_hits: usize,
-    nearest_hits: usize,
+    one_hits: usize,
     dls_hits: usize,
 }
 
-/// Times `ik_all`, `ik_nearest`, `dls_ik`, `dynamics` and `inverse_dynamics` for
+/// Times `ik_all`, `ik_one` (`IkKind::Fast`), `dls_ik`, `dynamics` and `inverse_dynamics` for
 /// arm `A` and prints one
-/// `PERF | name | DOF | ik_all | ik_nearest | dls_ik | dyn | inv_dyn | ik_hit% | nearest_hit% | dls_hit% |` line (µs).
-/// `ik_nearest` and `dls_ik` are seeded from the same jittered tracking
-/// configuration and both use the production acceptance checks. The solver cells
+/// `PERF | name | DOF | ik_all | ik_one | dls_ik | dyn | inv_dyn | ik_hit% | one_hit% | dls_hit% |` line (µs).
+/// `ik_all`, `ik_one` and `dls_ik` are seeded from the same jittered tracking
+/// configuration and use the production acceptance checks. The solver cells
 /// read `mean (max)`, where max is the [`worst_avg_us`] average.
 #[allow(dead_code)] // called by the OEM perf wrappers
 pub fn measure<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize>(name: &str) {
@@ -135,14 +135,14 @@ pub fn measure<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize>(name: 
         "PERF | {name} | {DOF} | {:.2} ({:.2}) | {:.2} ({:.2}) | {:.2} ({:.2}) | {:.2} | {:.2} | {:.1} | {:.1} | {:.1} |",
         t.ik_all,
         t.ik_all_worst,
-        t.ik_nearest,
-        t.ik_nearest_worst,
+        t.ik_one,
+        t.ik_one_worst,
         t.dls,
         t.dls_worst,
         t.dynamics,
         t.inverse_dynamics,
         pct(t.ik_hits),
-        pct(t.nearest_hits),
+        pct(t.one_hits),
         pct(t.dls_hits)
     );
 }
@@ -201,12 +201,12 @@ fn run<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize>(name: &str) ->
     // Solve rates over the timed targets. Misses are reported, not asserted:
     // random in-limit poses are not guaranteed reachable under the solver's limits.
     let mut ik_hits = 0;
-    let mut nearest_hits = 0;
+    let mut one_hits = 0;
     let mut dls_hits = 0;
     for (seed, pose) in seeds.iter().zip(&poses).take(IK_CALLS) {
-        let all = arm.ik(pose, None, None, true, true, policy, REFINEMENT_ITERS);
+        let all = arm.ik_all(pose, Some(seed), true, true, policy, REFINEMENT_ITERS);
         ik_hits += all.iter().any(Option::is_some) as usize;
-        nearest_hits += arm.ik_nearest(pose, seed, policy).is_some() as usize;
+        one_hits += arm.ik_one(pose, seed, IkKind::Fast, policy).is_some() as usize;
         dls_hits += dls_nearest(&arm, pose, seed).is_some() as usize;
     }
     for i in 0..DYN_CALLS {
@@ -214,16 +214,16 @@ fn run<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize>(name: &str) ->
     }
 
     let ik_all = mean_us(IK_CALLS, |i| {
-        black_box(arm.ik(&poses[i], None, None, true, true, policy, REFINEMENT_ITERS));
+        black_box(arm.ik_all(&poses[i], Some(&seeds[i]), true, true, policy, REFINEMENT_ITERS));
     });
     let ik_all_worst = worst_avg_us(IK_CALLS, |i| {
-        black_box(arm.ik(&poses[i], None, None, true, true, policy, REFINEMENT_ITERS));
+        black_box(arm.ik_all(&poses[i], Some(&seeds[i]), true, true, policy, REFINEMENT_ITERS));
     });
-    let ik_nearest = mean_us(IK_CALLS, |i| {
-        black_box(arm.ik_nearest(&poses[i], &seeds[i], policy));
+    let ik_one = mean_us(IK_CALLS, |i| {
+        black_box(arm.ik_one(&poses[i], &seeds[i], IkKind::Fast, policy));
     });
-    let ik_nearest_worst = worst_avg_us(IK_CALLS, |i| {
-        black_box(arm.ik_nearest(&poses[i], &seeds[i], policy));
+    let ik_one_worst = worst_avg_us(IK_CALLS, |i| {
+        black_box(arm.ik_one(&poses[i], &seeds[i], IkKind::Fast, policy));
     });
     let dls = mean_us(IK_CALLS, |i| {
         black_box(dls_nearest(&arm, &poses[i], &seeds[i]));
@@ -241,21 +241,21 @@ fn run<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize>(name: &str) ->
     Timings {
         ik_all,
         ik_all_worst,
-        ik_nearest,
-        ik_nearest_worst,
+        ik_one,
+        ik_one_worst,
         dls,
         dls_worst,
         dynamics,
         inverse_dynamics,
         ik_hits,
-        nearest_hits,
+        one_hits,
         dls_hits,
     }
 }
 
 
 /// [`dls_ik`] refinement of the arm's TCP pose, starting from `seed`, accepted
-/// with the same checks as production `Arm::ik_nearest`: the residual gate
+/// with the same checks as production `Arm::ik_one`: the residual gate
 /// (`DLS_FK_ATOL`, equal to the policy's numerical tolerance), the seed-relative
 /// 2π wrap, the per-joint step limit and the joint limits.
 fn dls_nearest<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize>(

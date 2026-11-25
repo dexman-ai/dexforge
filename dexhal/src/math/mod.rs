@@ -8,12 +8,16 @@
 
 pub mod arm;
 pub mod chain;
+pub mod closed_form;
 pub mod contract;
 pub mod identify;
+pub mod jointlock;
 pub mod kinematics;
 pub mod model;
 pub mod payload;
 pub mod postprocess;
+pub mod raghavan_roth;
+pub mod single;
 pub mod spatial;
 pub mod ssik_core;
 pub mod tolerances;

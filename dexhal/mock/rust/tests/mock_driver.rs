@@ -1,7 +1,7 @@
 use dexforge_mock_core::{MockArm, MockDriver, MANIFEST};
 use dexhal::math::{
     pose_to_xyz_quat, ActiveMode, Arm, ArmDriver, ArmError, ArmModel, CoreCommand, CoreState,
-    TolerancePolicy,
+    IkKind, TolerancePolicy,
 };
 
 fn zero_latency() -> &'static str {
@@ -187,24 +187,24 @@ fn ik_polishes_the_seed_onto_the_target() {
     let seed = [0.35, -0.65, 1.05, 0.25, -0.45, 0.85];
     let target = MockArm::flange_fk(&goal);
     let policy = TolerancePolicy::DEFAULT;
-    let [Some(q)] = MockArm::flange_solve(&target, None, Some(&seed), true, true, policy, 0) else {
+    let [Some(q)] = MockArm::flange_all(&target, Some(&seed), true, true, policy, 0) else {
         panic!("a nearby seed reaches the target");
     };
     assert!((MockArm::flange_fk(&q) - target).norm() < 1e-9);
     for i in 0..6 {
         assert!((q[i] - goal[i]).abs() < 1e-6, "joint {i}: {}", q[i]);
     }
-    assert_eq!(
-        MockArm::flange_solve(&target, Some(0), Some(&seed), true, true, policy, 0),
-        [None]
-    );
+    let one = MockArm::flange_one(&target, &seed, IkKind::Fast, policy, 0).unwrap();
+    assert!((one[0] - goal[0]).abs() < 1e-6);
 
-    // `Arm::ik_nearest` keeps its continuity bound on top of the polish.
+    // `Arm::ik_one` keeps its continuity bound on top of the polish.
     let arm = Arm::<MockArm, 6, 1>::new();
-    assert!(arm.ik_nearest(&target, &seed, policy).is_some());
+    assert!(arm.ik_one(&target, &seed, IkKind::Fast, policy).is_some());
     let mut unreachable = target;
     unreachable[(0, 3)] = 10.0;
-    assert!(arm.ik_nearest(&unreachable, &seed, policy).is_none());
+    assert!(arm
+        .ik_one(&unreachable, &seed, IkKind::Fast, policy)
+        .is_none());
 }
 
 #[test]

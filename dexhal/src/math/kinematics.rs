@@ -32,7 +32,6 @@ use super::ssik_core::mat3_mul;
 
 use crate::math::ssik_core::{add3, mat3_transpose, mat3_vec, neg3};
 
-
 // ---------------------------------------------------------------------------
 // 4×4 homogeneous-matrix utilities
 // ---------------------------------------------------------------------------
@@ -292,7 +291,7 @@ pub const LM_BACKTRACK_MAX: usize = 12;
 /// # Examples
 ///
 /// ```ignore
-/// // 6-DOF arm (same as calling lm_refine6 directly)
+/// // 6-DOF arm (generic; `lm_refine6` is the analytic-Jacobian 6-DOF entry point)
 /// lm_refine::<6, _>(&q6, |q| residual12(q, &target), max_iters, 1e-10);
 ///
 /// // 7-DOF arm — all seven joints are refined simultaneously
@@ -513,26 +512,29 @@ where
     (q, rn)
 }
 
-/// Bounded Levenberg-Marquardt polish for a **6-DOF** joint vector.
+/// Bounded Levenberg-Marquardt polish for a **6-DOF** joint vector with an
+/// analytic Jacobian (no finite differences).
 ///
-/// This is a convenience wrapper around [`lm_refine::<6, _>`] preserved for
-/// backward compatibility with the UR5 and Piper drivers.
+/// `residual_fn(q)` must return `[vec(R(q) − R_t); t(q) − t_t]`, and
+/// `jac_fn(q)` its `12×6` Jacobian as columns (see [`residual_columns`]).
 ///
-/// `residual_fn(q)` must return `[vec(R(q) − R_t); t(q) − t_t]`.
-///
-/// Returns `Some(q_refined)` when the FK residual falls within `fk_atol`,
+/// Returns `Some(q_refined)` when the final residual falls within `fk_atol`,
 /// or `None` if the iteration budget is exhausted without convergence.
 #[inline]
-pub fn lm_refine6<F>(
+pub fn lm_refine6<F, J>(
     q_in: &[f64; 6],
     residual_fn: F,
+    jac_fn: J,
     max_iters: usize,
     fk_atol: f64,
 ) -> Option<[f64; 6]>
 where
     F: Fn(&[f64; 6]) -> [f64; 12],
+    J: Fn(&[f64; 6]) -> [[f64; 12]; 6],
 {
-    lm_refine::<6, F>(q_in, residual_fn, max_iters, fk_atol)
+    const FREE: [usize; 6] = [0, 1, 2, 3, 4, 5];
+    let q = lm_refine_masked_analytic::<6, 6, _, _>(q_in, &FREE, &residual_fn, &jac_fn, max_iters);
+    (norm12(&residual_fn(&q)) <= fk_atol).then_some(q)
 }
 
 // ---------------------------------------------------------------------------
@@ -718,11 +720,26 @@ mod tests {
             let (c, s) = (libm::cos(a), libm::sin(a));
             [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
         };
-        let t0 = Transform { r: rz(q[0]), t: [0.0, 0.0, 0.0] };
-        let l0 = Transform { r: IDENTITY.r, t: [1.0, 0.0, 0.0] };
-        let t1 = Transform { r: ry(q[1]), t: [0.0, 0.0, 0.0] };
-        let l1 = Transform { r: IDENTITY.r, t: [1.0, 0.0, 0.0] };
-        let t2 = Transform { r: ry(q[2]), t: [0.0, 0.0, 0.0] };
+        let t0 = Transform {
+            r: rz(q[0]),
+            t: [0.0, 0.0, 0.0],
+        };
+        let l0 = Transform {
+            r: IDENTITY.r,
+            t: [1.0, 0.0, 0.0],
+        };
+        let t1 = Transform {
+            r: ry(q[1]),
+            t: [0.0, 0.0, 0.0],
+        };
+        let l1 = Transform {
+            r: IDENTITY.r,
+            t: [1.0, 0.0, 0.0],
+        };
+        let t2 = Transform {
+            r: ry(q[2]),
+            t: [0.0, 0.0, 0.0],
+        };
         compose(&compose(&compose(&compose(&t0, &l0), &t1), &l1), &t2)
     }
 
@@ -948,8 +965,7 @@ mod tests {
 
         let full = lm_refine::<2, _>(&q_init, residual_fn, DLS_MAX_ITERS, DLS_FK_ATOL)
             .expect("lm_refine should converge");
-        let masked =
-            lm_refine_masked::<2, 2, _>(&q_init, &[0, 1], residual_fn, DLS_MAX_ITERS);
+        let masked = lm_refine_masked::<2, 2, _>(&q_init, &[0, 1], residual_fn, DLS_MAX_ITERS);
         assert_eq!(full, masked, "full and all-free masked refine diverged");
     }
 }

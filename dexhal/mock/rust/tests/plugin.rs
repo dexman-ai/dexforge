@@ -5,8 +5,8 @@ mod common;
 use common::dexnext;
 use dexforge_mock_core::{dexhal_plugin_entry, MockArm, MockDriver};
 use dexhal::math::{
-    ActiveMode, Applied, Arm, ArmDriver, ArmError, ArmMath, CoreCommand, CoreState, ModelError,
-    WrenchFrame, MAX_DOF,
+    ActiveMode, Applied, Arm, ArmDriver, ArmError, ArmMath, CoreCommand, CoreState, IkKind,
+    ModelError, WrenchFrame, MAX_DOF,
 };
 use dexhal_plugin::{LoadedDriver, Plugin, PluginError};
 
@@ -145,14 +145,24 @@ fn math_matches_the_direct_model() {
     );
     let pose = math.forward_kinematics(&q).unwrap();
     assert_eq!(
-        math.inverse_kinematics(&pose, &q),
-        ArmMath::inverse_kinematics(&direct, &pose, &q)
+        math.ik_one(&pose, &q, IkKind::Near),
+        ArmMath::ik_one(&direct, &pose, &q, IkKind::Near)
+    );
+    assert_eq!(
+        math.ik_one(&pose, &q, IkKind::Fast),
+        ArmMath::ik_one(&direct, &pose, &q, IkKind::Fast)
     );
     let (mut via_plugin, mut via_direct) = ([[0.0; MAX_DOF]; 4], [[0.0; MAX_DOF]; 4]);
-    let n = math.inverse_kinematics_all(&pose, &mut via_plugin);
-    let m = ArmMath::inverse_kinematics_all(&direct, &pose, &mut via_direct);
+    let n = math.ik_all(&pose, Some(&q), &mut via_plugin);
+    let m = ArmMath::ik_all(&direct, &pose, Some(&q), &mut via_direct);
     assert_eq!(n, m);
+    assert!(n >= 1);
     assert_eq!(via_plugin[..n], via_direct[..m]);
+    // A shorter buffer receives the nearest solutions that fit.
+    let mut short = [[f64::NAN; MAX_DOF]; 1];
+    assert_eq!(math.ik_all(&pose, Some(&q), &mut short), 1);
+    assert_eq!(short[0], via_direct[0]);
+    assert_eq!(math.ik_all(&pose, Some(&q), &mut []), 0);
     let (a, b) = (
         math.dynamics_padded(&q, &qd),
         direct.dynamics_padded(&q, &qd),

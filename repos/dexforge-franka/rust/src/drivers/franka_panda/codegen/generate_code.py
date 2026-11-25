@@ -65,6 +65,7 @@ def main():
     out.append(
         "/// Locked-joint sample schedule (np.linspace over joint-4 range, 16, endpoint excluded)."
     )
+    out.append("#[allow(clippy::approx_constant)] // linspace over the URDF range (6.2832, not TAU).")
     out.append("pub const LOCK_SAMPLES: [f64; 16] = [")
     out.append("    " + ", ".join(f(x) for x in LOCK_SAMPLES) + ",")
     out.append("];")

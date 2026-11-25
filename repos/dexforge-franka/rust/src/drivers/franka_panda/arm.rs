@@ -4,7 +4,8 @@
 //! `franka_panda.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
-use dexhal::math::{ArmModel, ChainJoint, JointLimit, KinematicChain, Pose, TolerancePolicy};
+use dexhal::math::single;
+use dexhal::math::{ArmModel, ChainJoint, IkKind, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{generated_dynamics, generated_kinematics, ik_solver};
 
@@ -65,6 +66,7 @@ pub struct FrankaPanda;
 
 impl ArmModel<DOF, MAX_SOLUTIONS> for FrankaPanda {
     const NAME: &'static str = "franka_panda";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
         Some((-2.8973, 2.8973)),
         Some((-1.7628, 1.7628)),
@@ -75,6 +77,7 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for FrankaPanda {
         Some((-2.8973, 2.8973)),
     ];
     const HAS_DYNAMICS: bool = true;
+    const LOCKED_JOINT: Option<usize> = Some(ik_solver::LOCKED_JOINT);
 
     #[inline]
     fn flange_fk(q: &[f64; DOF]) -> Pose {
@@ -88,9 +91,8 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for FrankaPanda {
     }
 
     #[inline]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -99,12 +101,32 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for FrankaPanda {
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
         ik_solver::solve(
             target,
-            max_solutions,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
+        )
+    }
+
+    #[inline]
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]> {
+        single::seven_dof_one::<Self, MAX_SOLUTIONS>(
+            target,
+            q_seed,
+            kind,
+            policy,
+            refinement_max_iters,
+            ik_solver::LOCKED_JOINT,
+            &ik_solver::LOCK_SAMPLES,
+            |v| ik_solver::lock_sample_solutions(target, v, policy),
         )
     }
 
@@ -169,13 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn flange_solve_closes_on_fk_targets() {
+    fn flange_all_closes_on_fk_targets() {
         for k in 0..16 {
             let q = sample(k);
             let target = FrankaPanda::flange_fk(&q);
-            let sols = FrankaPanda::flange_solve(
+            let sols = FrankaPanda::flange_all(
                 &target,
-                None,
                 Some(&q),
                 true,
                 false,
@@ -186,6 +207,24 @@ mod tests {
             assert!((FrankaPanda::flange_fk(&first) - target).norm() < 1e-5);
             for sol in sols.iter().flatten() {
                 assert!((FrankaPanda::flange_fk(sol) - target).norm() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn flange_one_closes_and_near_returns_seed_configuration() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = FrankaPanda::flange_fk(&q);
+            let fast = FrankaPanda::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable target has a single solution");
+            assert!((FrankaPanda::flange_fk(&fast) - target).norm() < 1e-5);
+            assert!(dexhal::math::postprocess::within_limits(&fast, &FrankaPanda::JOINT_LIMITS));
+            let near = FrankaPanda::flange_one(&target, &q, IkKind::Near, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("the seed is itself a root");
+            assert!((FrankaPanda::flange_fk(&near) - target).norm() < 1e-5);
+            for i in 0..DOF {
+                assert!(libm::fabs(near[i] - q[i]) < 1e-5, "Near drifted from seed at joint {i}");
             }
         }
     }
@@ -225,9 +264,8 @@ mod tests {
             }
             let target = FrankaPanda::flange_fk(&q);
 
-            let sols = FrankaPanda::flange_solve(
+            let sols = FrankaPanda::flange_all(
                 &target,
-                None,
                 None,
                 false,
                 false,
@@ -244,9 +282,8 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = FrankaPanda::flange_solve(
+                let tight_sols = FrankaPanda::flange_all(
                     &target,
-                    None,
                     None,
                     false,
                     true,

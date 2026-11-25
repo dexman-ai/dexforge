@@ -4,7 +4,8 @@
 //! `rizon10.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
-use dexhal::math::{ArmModel, ChainJoint, JointLimit, KinematicChain, Pose, TolerancePolicy};
+use dexhal::math::single;
+use dexhal::math::{ArmModel, ChainJoint, IkKind, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{generated_dynamics, generated_kinematics, ik_solver};
 
@@ -65,6 +66,7 @@ pub struct Rizon10;
 
 impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon10 {
     const NAME: &'static str = "rizon10";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
         Some((-2.8798, 2.8798)),
         Some((-2.7576, 2.7576)),
@@ -75,6 +77,7 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon10 {
         Some((-3.0543, 3.0543)),
     ];
     const HAS_DYNAMICS: bool = true;
+    const LOCKED_JOINT: Option<usize> = Some(ik_solver::LOCKED_JOINT);
 
     #[inline]
     fn flange_fk(q: &[f64; DOF]) -> Pose {
@@ -88,9 +91,8 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon10 {
     }
 
     #[inline]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -99,12 +101,32 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Rizon10 {
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
         ik_solver::solve(
             target,
-            max_solutions,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
+        )
+    }
+
+    #[inline]
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]> {
+        single::seven_dof_one::<Self, MAX_SOLUTIONS>(
+            target,
+            q_seed,
+            kind,
+            policy,
+            refinement_max_iters,
+            ik_solver::LOCKED_JOINT,
+            &ik_solver::LOCK_SAMPLES,
+            |v| ik_solver::lock_sample_solutions(target, v, policy),
         )
     }
 
@@ -169,13 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn flange_solve_closes_on_fk_targets() {
+    fn flange_all_closes_on_fk_targets() {
         for k in 0..16 {
             let q = sample(k);
             let target = Rizon10::flange_fk(&q);
-            let sols = Rizon10::flange_solve(
+            let sols = Rizon10::flange_all(
                 &target,
-                None,
                 Some(&q),
                 true,
                 false,
@@ -186,6 +207,24 @@ mod tests {
             assert!((Rizon10::flange_fk(&first) - target).norm() < 1e-5);
             for sol in sols.iter().flatten() {
                 assert!((Rizon10::flange_fk(sol) - target).norm() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn flange_one_closes_and_near_returns_seed_configuration() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Rizon10::flange_fk(&q);
+            let fast = Rizon10::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable target has a single solution");
+            assert!((Rizon10::flange_fk(&fast) - target).norm() < 1e-5);
+            assert!(dexhal::math::postprocess::within_limits(&fast, &Rizon10::JOINT_LIMITS));
+            let near = Rizon10::flange_one(&target, &q, IkKind::Near, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("the seed is itself a root");
+            assert!((Rizon10::flange_fk(&near) - target).norm() < 1e-5);
+            for i in 0..DOF {
+                assert!(libm::fabs(near[i] - q[i]) < 1e-5, "Near drifted from seed at joint {i}");
             }
         }
     }
@@ -225,9 +264,8 @@ mod tests {
             }
             let target = Rizon10::flange_fk(&q);
 
-            let sols = Rizon10::flange_solve(
+            let sols = Rizon10::flange_all(
                 &target,
-                None,
                 None,
                 false,
                 false,
@@ -244,9 +282,8 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = Rizon10::flange_solve(
+                let tight_sols = Rizon10::flange_all(
                     &target,
-                    None,
                     None,
                     false,
                     true,

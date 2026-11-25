@@ -27,6 +27,46 @@ def test_render_requires_every_placeholder():
         S.render("{{missing}}", {})
 
 
+def test_render_sections():
+    tmpl = "a\n{{#on}}\nkeep {{x}}\n{{/on}}\n    {{#off}}\ndrop\n    {{/off}}\nb\n"
+    assert S.render(tmpl, {"on": True, "off": False, "x": 1}) == "a\nkeep 1\nb\n"
+    with pytest.raises(KeyError):
+        S.render("{{#missing}}\nx\n{{/missing}}\n", {})
+
+
+# Every in-repo arm: (oem, arm). Their `arm.rs` must be exactly the template output.
+_IN_REPO_ARMS = [
+    ("ur", "ur5"),
+    ("ur", "ur3e"),
+    ("unitree", "z1"),
+    ("agilex", "piper"),
+    ("franka", "franka_panda"),
+    ("ufactory", "xarm7"),
+    ("flexiv", "rizon4"),
+    ("flexiv", "rizon10"),
+]
+
+
+@pytest.mark.parametrize("oem, arm", _IN_REPO_ARMS)
+def test_in_repo_arm_rs_matches_template(oem, arm):
+    lay = S.make_layout(_REPO / "repos", oem, arm)
+    if not lay.artifact.is_file() or not lay.urdf.is_file():
+        pytest.skip(f"{arm} artifact / URDF not available")
+    info = S.inspect_artifact(lay.artifact, arm)
+    generated = S.generate_arm_rs(info, lay.artifact, S.urdf_has_dynamics(lay.urdf, info.base_link, info.ee_link))
+    current = (lay.driver_dir / "arm.rs").read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert current == generated, f"{arm}/arm.rs drifted from codegen/templates/arm/arm.rs.tmpl; rerun scaffold --only arm.rs"
+    if info.dof == 6:
+        assert "|| ik_solver::raw_candidates(target, policy)" in generated
+        assert "LOCKED_JOINT" not in generated
+    else:
+        assert "|v| ik_solver::lock_sample_solutions(target, v, policy)" in generated
+        # `Arm::ik_one` needs the lock joint to hold it during a calibrated polish.
+        assert "const LOCKED_JOINT: Option<usize> = Some(ik_solver::LOCKED_JOINT);" in generated
+    # flange_one must take unfiltered candidates, never the FK-gated `solve` output.
+    assert generated.count("ik_solver::solve(") == 1
+
+
 @pytest.mark.parametrize(
     "value, literal",
     [(1.0, "1.0"), (-0.425, "-0.425"), (6.123233995736766e-17, "6.123233995736766e-17"), (3, "3.0")],
@@ -81,10 +121,12 @@ def test_scaffold_arm_rs_implements_arm_model(ur5_scaffold):
     assert "pub const DOF: usize = 6;" in arm
     assert "pub const MAX_SOLUTIONS: usize = 16;" in arm
     assert "const HAS_DYNAMICS: bool = true;" in arm
-    for hook in ("flange_fk", "flange_jacobian", "flange_solve", "flange_gravity",
+    for hook in ("flange_fk", "flange_jacobian", "flange_all", "flange_one", "flange_gravity",
                  "flange_mass_matrix", "flange_coriolis", "flange_inverse_dynamics"):
         assert f"fn {hook}(" in arm
     assert "use super::{generated_dynamics, generated_kinematics, ik_solver};" in arm
+    assert "single::six_dof_one::<Self, MAX_SOLUTIONS>(" in arm
+    assert "seven_dof_one" not in arm
     assert len(re.findall(r"^        Some\(\(", arm, re.M)) == 6
 
 

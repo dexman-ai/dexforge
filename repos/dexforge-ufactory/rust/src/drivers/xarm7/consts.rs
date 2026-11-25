@@ -6,6 +6,7 @@
 // AXES7 / TL7 / TR7_* are the full 7R chain used for FK closure verification.
 
 /// Locked-joint sample schedule (np.linspace over joint-4 range, 16, endpoint excluded).
+#[allow(clippy::approx_constant)] // linspace over the URDF range (6.2832, not TAU).
 pub const LOCK_SAMPLES: [f64; 16] = [
     -6.2832, -5.4978, -4.7124, -3.927, -3.1416, -2.3562, -1.5708000000000002, -0.7854000000000001, 0.0, 0.7854000000000001, 1.5708000000000002, 2.3562000000000003, 3.1415999999999995, 3.9270000000000005, 4.7124, 5.497800000000001,
 ];

@@ -5,29 +5,28 @@
 //! own `ur_description`; solver `ikgeo.three_parallel`, tier 0), into a deterministic,
 //! `#![no_std]`, zero-allocation Rust implementation.
 //!
-//! The closed form is: subproblem **SP6** for the coupled wrist/shoulder angle
-//! pair `(q1, q5)`, followed by the inlined `SP1 + SP3 + SP1` chain for the
-//! remaining joints. SP6 reduces to intersecting two conics, which produces a
-//! quartic solved through the companion-matrix eigenvalue routine in
-//! [`crate::math::ssik_core`].
+//! The closed form (SP6 for `(q1, q5)`, then `SP1 + SP3 + SP1`) is shared with
+//! the other UR arms in [`crate::drivers::ur_common`]; this module only supplies
+//! the baked UR5e geometry literals as a [`Model`].
 //!
 //! ## Equivalence to the Python reference
 //!
 //! [`solve`] mirrors `ur5_ik.solve` with the same argument list:
 //! `max_solutions`, `q_seed`, `respect_limits`, `allow_refinement`, `policy`,
-//! and `refinement_max_iters`. The algebraic solution set is FK-verified to
-//! [`TolerancePolicy::subproblem_numerical`] and de-duplicated modulo `2*pi`.
+//! and `refinement_max_iters`. The algebraic solution set goes through the
+//! shared 6-DOF post-process [`dexhal::math::closed_form::finish6`]: FK-verified
+//! to [`TolerancePolicy::subproblem_numerical`] and de-duplicated modulo `2*pi`.
 //!
 //! [`fk`] mirrors `ur5_ik.fk` (alias of `_fk`): product-of-exponentials forward
 //! kinematics using the baked chain constants.
 
 use nalgebra::SMatrix;
 
-use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff};
-use dexhal::math::ssik_core::{sp6_solve, wrap_to_pi};
+use crate::drivers::ur_common::{self, Model, MAX_CANDIDATES};
+use dexhal::math::single::CANDIDATES;
 pub use dexhal::math::tolerances::TolerancePolicy;
 
-use core::f64::consts::PI;
+use super::arm::{Ur5, MAX_SOLUTIONS};
 
 #[cfg(test)]
 extern crate std;
@@ -45,25 +44,31 @@ pub const BASE_LINK: &str = "base_link";
 /// End-effector link name in the URDF.
 pub const EE_LINK: &str = "ee_link";
 
-// --- algebraic-block degeneracy constants from ur5_ik.py ---
-const TWO_PI: f64 = 2.0 * PI;
-
-/// Joint angle limits (lo, hi) in radians — baked from `_JOINT_LIMITS` in
-/// the Python artifact.  Used by [`solve`] when `respect_limits = true`.
-const JOINT_LIMITS: [(f64, f64); 6] = [
-    (-6.283185307179586, 6.283185307179586),
-    (-6.283185307179586, 6.283185307179586),
-    (-3.141592653589793, 3.141592653589793),
-    (-6.283185307179586, 6.283185307179586),
-    (-6.283185307179586, 6.283185307179586),
-    (-6.283185307179586, 6.283185307179586),
-];
+/// Geometry literals of `ur5_ik.py`'s `_solve_algebraic`, verbatim.
+const MODEL: Model = Model {
+    d1: 0.1625,
+    d4: 0.1333,
+    d5: 0.0997,
+    d6: 0.0996,
+    neg_p5_y: 0.0996,
+    a2: 0.425,
+    a3: 0.3922,
+    dinr_c10: 6.09874105975382e-18,
+    dinr_cy: 6.10486429374955e-18,
+    q3_r_sq: 0.0277838892250000_f64,
+    q3_rhs0: 0.176107365,
+    q3_phi0: -2.08115015714358e-17,
+    q2_c0: 8.16227091631711e-18,
+    q2_c1: 4.99794947572064e-34,
+    q2_c2: 2.40153237312796e-17,
+    q2_c3: 2.60237444818813e-17,
+};
 
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Inverse kinematics — mirrors `ur5_ik.solve`.
+/// Inverse kinematics — mirrors `ur5_ik.solve`; every solution (`ik_all`).
 ///
 /// # Arguments
 ///
@@ -74,8 +79,8 @@ const JOINT_LIMITS: [(f64, f64); 6] = [
 ///   from the seed (closest first). Has no effect on *which* solutions are
 ///   returned.
 /// * `respect_limits` — when `true`, solutions outside the baked URDF joint
-///   limits are dropped (after a `±2π` wrap-into-limits attempt). Pass
-///   `false` for the raw geometric set.
+///   limits (`Ur5::JOINT_LIMITS`) are dropped (after a `±2π`
+///   wrap-into-limits attempt). Pass `false` for the raw geometric set.
 /// * `allow_refinement` — when `true`, algebraic candidates that exceed
 ///   `policy.subproblem_numerical` are polished with a bounded Levenberg-Marquardt step.
 ///   For the UR5 (tier-0 arm) this is rarely needed; default `false`.
@@ -83,6 +88,9 @@ const JOINT_LIMITS: [(f64, f64); 6] = [
 ///   [`TolerancePolicy::DEFAULT`] for the Python defaults.
 /// * `refinement_max_iters` — maximum LM iterations when
 ///   `allow_refinement = true`.
+///
+/// Always enumerates the full set; a single seeded solution is
+/// `Ur5::flange_one` (`dexhal::math::single::six_dof_one`).
 ///
 /// Returns up to 16 candidate joint vectors `[q1, .., q6]` in radians;
 /// unused slots are [`None`].
@@ -94,350 +102,38 @@ pub fn solve(
     allow_refinement: bool,
     policy: TolerancePolicy,
     refinement_max_iters: usize,
-) -> [Option<[f64; 6]>; 16] {
-    let fk_atol = policy.subproblem_numerical;
-    let dedup_atol = policy.subproblem_dedup;
-
-    let mut solutions: [Option<[f64; 6]>; 16] = [None; 16];
-    let mut solution_count = 0usize;
-
-    // Raw algebraic candidates (stack array, at most 8 for the UR5).
-    let mut cands = [[0.0f64; 6]; 8];
-    let cand_count = solve_algebraic(t, &mut cands, policy);
-
-    for ci in 0..cand_count {
-        let q = cands[ci];
-        // Reject non-finite candidates (mirrors np.isfinite filter).
-        if !q.iter().all(|v| v.is_finite()) {
-            continue;
-        }
-        // FK closure check.
-        let residual = fk_residual(&q, t);
-        let accepted_q: [f64; 6];
-        if residual <= fk_atol {
-            accepted_q = q;
-        } else if allow_refinement {
-            // Newton polish for near-miss candidates, mirroring Python's
-            // `allow_refinement` path (lm_refine via _spatial_jacobian).
-            match refine6(&q, t, refinement_max_iters, fk_atol) {
-                Some(refined) => {
-                    accepted_q = refined;
-                }
-                None => continue,
-            }
-        } else {
-            continue;
-        }
-
-        // Wrap-to-pi de-duplication against accepted solutions.
-        let mut dup = false;
-        for s in solutions.iter().take(solution_count) {
-            if let Some(existing) = s {
-                if q_close_wrap(&accepted_q, existing, dedup_atol) {
-                    dup = true;
-                    break;
-                }
-            }
-        }
-        if dup {
-            continue;
-        }
-        if solution_count < 16 {
-            solutions[solution_count] = Some(accepted_q);
-            solution_count += 1;
-        }
-    }
-
-    // Post-processing (mirrors Python's _ps_wrap_to_limits + _ps_respect_limits).
-    if respect_limits {
-        let mut filtered: [Option<[f64; 6]>; 16] = [None; 16];
-        let mut count = 0usize;
-        for sol in solutions.iter().take(solution_count).flatten() {
-            let q = wrap_to_limits(sol);
-            if in_limits(&q) && count < 16 {
-                filtered[count] = Some(q);
-                count += 1;
-            }
-        }
-        solutions = filtered;
-        solution_count = count;
-    }
-
-    // Sort by seed distance (mirrors Python's _ps_nearest_to_seed).
-    if let Some(seed) = q_seed {
-        // Insertion sort on the first `solution_count` slots.
-        for i in 1..solution_count {
-            let mut j = i;
-            while j > 0 {
-                let prev = solutions[j - 1].unwrap();
-                let curr = solutions[j].unwrap();
-                if seed_dist(&prev, seed) > seed_dist(&curr, seed) {
-                    solutions.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Truncate to max_solutions (mirrors Python's `solutions[:max_solutions]`).
-    if let Some(max) = max_solutions {
-        let cap = max.min(solution_count);
-        for i in cap..solution_count {
-            solutions[i] = None;
-        }
-    }
-
-    solutions
+) -> [Option<[f64; 6]>; MAX_SOLUTIONS] {
+    ur_common::solve::<Ur5, MAX_SOLUTIONS>(
+        &MODEL,
+        t,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        policy,
+        refinement_max_iters,
+    )
 }
-
-/// `true` if joint vectors `a` and `b` agree (mod `2*pi`) within `tol` per axis.
-fn q_close_wrap(a: &[f64; 6], b: &[f64; 6], tol: f64) -> bool {
-    for i in 0..6 {
-        if libm::fabs(wrap_to_pi(a[i] - b[i])) > tol {
-            return false;
-        }
-    }
-    true
-}
-
-/// Try `q[i] ± 2π` per joint to bring the vector into `JOINT_LIMITS`.
-/// Mirrors Python's `_ps_wrap_to_limits`.
-fn wrap_to_limits(q: &[f64; 6]) -> [f64; 6] {
-    let mut out = *q;
-    for i in 0..6 {
-        let (lo, hi) = JOINT_LIMITS[i];
-        if out[i] < lo {
-            let wrapped = out[i] + TWO_PI;
-            if wrapped <= hi {
-                out[i] = wrapped;
-            }
-        } else if out[i] > hi {
-            let wrapped = out[i] - TWO_PI;
-            if wrapped >= lo {
-                out[i] = wrapped;
-            }
-        }
-    }
-    out
-}
-
-/// `true` if every joint is within its URDF limit.
-fn in_limits(q: &[f64; 6]) -> bool {
-    for i in 0..6 {
-        let (lo, hi) = JOINT_LIMITS[i];
-        if q[i] < lo || q[i] > hi {
-            return false;
-        }
-    }
-    true
-}
-
-/// Squared wrap-to-π distance between `q` and `seed`. Used for seed sorting.
-fn seed_dist(q: &[f64; 6], seed: &[f64; 6]) -> f64 {
-    let mut s = 0.0;
-    for i in 0..6 {
-        let d = wrap_to_pi(q[i] - seed[i]);
-        s += d * d;
-    }
-    s
-}
-
-// ---------------------------------------------------------------------------
-// Levenberg-Marquardt refinement (for `allow_refinement = true`)
-// ---------------------------------------------------------------------------
-
-/// 12-vector pose residual `[vec(R(q) − R_t); t(q) − t_t]` for the UR5.
-fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
-    let tf = fk(q);
-    let mut r = [0.0f64; 12];
-    let mut k = 0usize;
-    for i in 0..3 {
-        for j in 0..3 {
-            r[k] = tf[(i, j)] - target[(i, j)];
-            k += 1;
-        }
-    }
-    for i in 0..3 {
-        r[9 + i] = tf[(i, 3)] - target[(i, 3)];
-    }
-    r
-}
-
-/// Levenberg-Marquardt polish of a 6-DOF UR5 configuration onto the exact
-/// pose root. Mirrors the Python `_lm_refine` path used when
-/// `allow_refinement = True`. Returns `Some(q_refined)` if the FK residual
-/// converges within `fk_atol`, otherwise `None`.
-fn refine6(
-    q_in: &[f64; 6],
-    target: &SMatrix<f64, 4, 4>,
-    max_iters: usize,
-    fk_atol: f64,
-) -> Option<[f64; 6]> {
-    lm_refine6(q_in, |q| pose_residual12(q, target), max_iters, fk_atol)
-}
-
-// ---------------------------------------------------------------------------
-// Algebraic candidate generation (port of `_solve_algebraic`)
-// ---------------------------------------------------------------------------
 
 /// Fills `out` with the raw algebraic IK candidates and returns the count.
-fn solve_algebraic(
+pub(crate) fn solve_algebraic(
     t: &SMatrix<f64, 4, 4>,
-    out: &mut [[f64; 6]; 8],
+    out: &mut [[f64; 6]; MAX_CANDIDATES],
     policy: TolerancePolicy,
 ) -> usize {
-    let r_00 = t[(0, 0)];
-    let r_01 = t[(0, 1)];
-    let r_02 = t[(0, 2)];
-    let r_10 = t[(1, 0)];
-    let r_11 = t[(1, 1)];
-    let r_12 = t[(1, 2)];
-    let r_20 = t[(2, 0)];
-    let r_21 = t[(2, 1)];
-    let r_22 = t[(2, 2)];
-    let p_x = t[(0, 3)];
-    let p_y = t[(1, 3)];
-    let p_z = t[(2, 3)];
-
-    let mut count = 0usize;
-
-    // T_target-derived SP6 inputs.
-    let p_16_x = p_x;
-    let p_16_y = p_y;
-    let p_16_z = p_z - 0.1625;
-    let r_06_axes5_x = -2.15550654822876e-33*r_00 - 2.46519032881566e-32*r_01 + 1.0*r_02;
-    let r_06_axes5_y = -2.15550654822876e-33*r_10 - 2.46519032881566e-32*r_11 + 1.0*r_12;
-    let r_06_axes5_z = -2.15550654822876e-33*r_20 - 2.46519032881566e-32*r_21 + 1.0*r_22;
-
-    const H_SP_0: [f64; 3] = [0.0, -1.0, 6.123233995736766e-17];
-    const K_SP_0: [f64; 3] = [-0.0, -0.0, -1.0];
-    const K_SP_1: [f64; 3] = [0.0, -1.2246467991473532e-16, -1.0];
-    const NEG_P_5: [f64; 3] = [-0.0, 0.0996, -1.3877787807814457e-17];
-    const NEG_AXES_5: [f64; 3] = [-1.2246467991473532e-16, 1.0, -1.8369701987210297e-16];
-
-    let p_16 = [p_16_x, p_16_y, p_16_z];
-    let r_06_axes5 = [r_06_axes5_x, r_06_axes5_y, r_06_axes5_z];
-    let h_sp = [H_SP_0, H_SP_0, H_SP_0, H_SP_0];
-    let k_sp = [K_SP_0, K_SP_1, K_SP_0, K_SP_1];
-    let p_sp = [p_16, NEG_P_5, r_06_axes5, NEG_AXES_5];
-
-    let mut theta15 = [(0.0f64, 0.0f64); 4];
-    let n15 = sp6_solve(&h_sp, &k_sp, &p_sp, 0.1333, 0.0, policy.subproblem_numerical, policy.subproblem_degeneracy, &mut theta15);
-
-    for si in 0..n15 {
-        let (q1, q5) = theta15[si];
-
-        // NOTE: the literal constants below are the machine-generated symbolic
-        // coefficients emitted by `ssik build`, copied verbatim from `ur5_ik.py`
-        // (mechanically translated; most are rounding residue of cos(pi/2)).
-        // SP1 for theta14 = q1+q2+q3+q4 (sum of parallel-axis rotations).
-        let th14_x0 = libm::sin(q5);
-        let th14_x1 = libm::cos(q5);
-        let th14_x2 = -1.0*th14_x0 + 1.22464679914735e-16*th14_x1;
-        let th14_x3 = -2.15550654822876e-33*r_20 - 2.46519032881566e-32*r_21 + 1.0*r_22;
-        let th14_x4 = 1.22464679914735e-16*r_00 + 1.0*r_01 + 1.83697019872103e-16*r_02;
-        let th14_x5 = libm::sin(q1);
-        let th14_x6 = 1.83697019872103e-16*th14_x5;
-        let th14_x7 = th14_x4*th14_x6;
-        let th14_x8 = 1.22464679914735e-16*r_00 + 1.83697019872103e-16*r_01 - 1.0*r_02;
-        let th14_x9 = th14_x5*th14_x8;
-        let th14_x10 = 1.0*r_00 - 1.22464679914735e-16*r_01 + 1.22464679914735e-16*r_02;
-        let th14_x11 = 1.22464679914735e-16*th14_x5;
-        let th14_x12 = th14_x10*th14_x11;
-        let th14_x13 = 1.22464679914735e-16*r_10 + 1.0*r_11 + 1.83697019872103e-16*r_12;
-        let th14_x14 = libm::cos(q1);
-        let th14_x15 = 1.83697019872103e-16*th14_x14;
-        let th14_x16 = th14_x13*th14_x15;
-        let th14_x17 = 1.22464679914735e-16*r_10 + 1.83697019872103e-16*r_11 - 1.0*r_12;
-        let th14_x18 = th14_x14*th14_x17;
-        let th14_x19 = 1.0*r_10 - 1.22464679914735e-16*r_11 + 1.22464679914735e-16*r_12;
-        let th14_x20 = 1.22464679914735e-16*th14_x14;
-        let th14_x21 = th14_x19*th14_x20;
-        let th14_x22 = -th14_x12 + th14_x16 - th14_x18 + th14_x21 - th14_x7 + th14_x9;
-        let th14_x23 = th14_x10*th14_x20 + th14_x11*th14_x19 + th14_x13*th14_x6 - th14_x14*th14_x8 + th14_x15*th14_x4 - th14_x17*th14_x5;
-        let th14_x24 = 1.22464679914735e-16*th14_x0 + 1.0*th14_x1;
-        let theta14 = libm::atan2(th14_x2*th14_x3 + th14_x22*(-6.12323399573677e-17*th14_x0 + 7.49879891330929e-33*th14_x1) + th14_x23*(-7.49879891330929e-33*th14_x0 - 6.12323399573677e-17*th14_x1 - 6.12323399573676e-17), th14_x2*th14_x23 + th14_x22*(7.49879891330929e-33 - th14_x24) + th14_x3*(1.49975978266186e-32*th14_x0 + 1.22464679914735e-16*th14_x1 + 6.12323399573676e-17) - (th14_x24 - 3.74939945665464e-33)*(-1.31986709741476e-49*r_20 - 1.50949372273656e-48*r_21 + 6.12323399573677e-17*r_22 + th14_x12 - th14_x16 + th14_x18 - th14_x21 + th14_x7 - th14_x9));
-        // SP1 for q6 (wrist roll-2): closed-form atan2.
-        let q6_x0 = libm::cos(q5);
-        let q6_x1 = 1.0*r_00 - 1.22464679914735e-16*r_01 + 1.22464679914735e-16*r_02;
-        let q6_x2 = libm::sin(q1);
-        let q6_x3 = 1.0*q6_x2;
-        let q6_x4 = 1.0*r_10 - 1.22464679914735e-16*r_11 + 1.22464679914735e-16*r_12;
-        let q6_x5 = libm::cos(q1);
-        let q6_x6 = 1.0*q6_x5;
-        let q6_x7 = q6_x1*q6_x3 - q6_x4*q6_x6 + 6.12323399573677e-17*r_20 - 7.49879891330929e-33*r_21 + 7.49879891330929e-33*r_22;
-        let q6_x8 = libm::sin(q5);
-        let q6_x9 = 1.0*q6_x8;
-        let q6_x10 = 1.22464679914735e-16*q6_x0;
-        let q6_x11 = 1.22464679914735e-16*r_00 + 1.0*r_01 + 1.83697019872103e-16*r_02;
-        let q6_x12 = 1.22464679914735e-16*r_10 + 1.0*r_11 + 1.83697019872103e-16*r_12;
-        let q6_x13 = q6_x11*q6_x3 - q6_x12*q6_x6 + 7.49879891330929e-33*r_20 + 6.12323399573677e-17*r_21 + 1.12481983699639e-32*r_22;
-        let q6_x14 = 6.12323399573677e-17*r_22;
-        let q6_x15 = 1.22464679914735e-16*r_00 + 1.83697019872103e-16*r_01 - 1.0*r_02;
-        let q6_x16 = q6_x6*(1.22464679914735e-16*r_10 + 1.83697019872103e-16*r_11 - 1.0*r_12);
-        let q6_x17 = -q6_x14 + q6_x15*q6_x3 - q6_x16 + 7.49879891330929e-33*r_20 + 1.12481983699639e-32*r_21;
-        let q6_x18 = 1.0*q6_x0;
-        let q6 = libm::atan2(q6_x13*(q6_x10 - q6_x9 + 9.18338008663387e-49) + q6_x17*(1.49975978266186e-32*q6_x0 - 1.83697019872103e-16*q6_x8 - 7.49879891330929e-33) + q6_x7*(-6.12323399573676e-17*q6_x0 - 6.12323399573677e-17), q6_x13*(q6_x10 - 6.12323399573677e-17) + q6_x17*(-q6_x18 - 7.49879891330929e-33) + q6_x7*q6_x9 - (-q6_x18 - 1.22464679914735e-16*q6_x8 + 3.74939945665464e-33)*(-1.22464679914735e-16*q6_x1*q6_x2 - 1.83697019872103e-16*q6_x11*q6_x2 + 1.83697019872103e-16*q6_x12*q6_x5 - q6_x14 + 1.0*q6_x15*q6_x2 - q6_x16 + 1.22464679914735e-16*q6_x4*q6_x5 - 9.05148142787587e-51*r_20 + 1.3684555315672e-48*r_21));
-        // d_inner = r_01.T @ p_16 - p[1] - r_14 @ r_45 @ p[5] - r_14 @ p[4]
-        let dinr_x0 = libm::sin(theta14);
-        let dinr_x1 = libm::cos(q1);
-        let dinr_x2 = 1.0*libm::sin(q1);
-        let dinr_x3 = libm::cos(theta14);
-        let dinr_x4 = libm::sin(q5);
-        let dinr_x5 = 0.0996*dinr_x4;
-        let dinr_x6 = libm::cos(q5);
-        let dinr_x7 = 1.22464679914735e-16 - 1.22464679914735e-16*dinr_x6;
-        let dinr_x8 = 0.0996*dinr_x7;
-        let dinr_x9 = 1.0*dinr_x6 + 1.49975978266186e-32;
-        let dinr_x10 = 6.09874105975382e-18*dinr_x0;
-        let dinr_x11 = 6.12323399573677e-17*dinr_x3 - 6.12323399573677e-17;
-        let d_inner_x = -dinr_x0*dinr_x8 - 0.0997*dinr_x0 + dinr_x1*p_x - dinr_x10*dinr_x9 + dinr_x2*p_y + dinr_x3*dinr_x5;
-        let d_inner_y = dinr_x1*p_y + dinr_x10*dinr_x4 + dinr_x11*dinr_x8 - dinr_x2*p_x + 6.10486429374955e-18*dinr_x3 + 0.0996*dinr_x6 - 6.10486429374955e-18;
-        let d_inner_z = dinr_x0*dinr_x5 - 1.38777878078145e-17*dinr_x11*dinr_x7 + 0.0996*dinr_x11*dinr_x9 + 0.0997*dinr_x3 + dinr_x8*(1.0*dinr_x3 + 3.74939945665464e-33) + 1.0*p_z - 0.1625;
-        let d_elbow = libm::sqrt(d_inner_x*d_inner_x + d_inner_y*d_inner_y + d_inner_z*d_inner_z);
-        // SP3 for q3 (elbow): reduces to SP4 with d_elbow target.
-        let q3_r_sq = 0.0277838892250000_f64;
-        let q3_rhs = 0.176107365 - 0.5 * d_elbow * d_elbow;
-        let q3_phi = -2.08115015714358e-17 + PI;
-        let theta_q3_plus;
-        let theta_q3_minus;
-        if q3_r_sq < policy.axis_parallel * policy.axis_parallel {
-            theta_q3_plus = 0.0;
-            theta_q3_minus = 0.0;
-        } else {
-            let q3_r = libm::sqrt(q3_r_sq);
-            if libm::fabs(q3_rhs) > q3_r + policy.subproblem_feasibility {
-                let p = if q3_rhs > 0.0 { q3_phi } else { q3_phi + PI };
-                theta_q3_plus = p;
-                theta_q3_minus = p;
-            } else {
-                let clipped = (q3_rhs / q3_r).clamp(-1.0, 1.0);
-                let delta = libm::acos(clipped);
-                theta_q3_plus = q3_phi + delta;
-                theta_q3_minus = q3_phi - delta;
-            }
-        }
-                // LS fallback: theta = phi (or phi + pi if rhs < 0)
-        for q3 in [theta_q3_plus, theta_q3_minus] {
-            // SP1 for q2 (shoulder pitch): closed-form atan2.
-            let q2_x0 = libm::sin(q3);
-            let q2_x1 = libm::cos(q3);
-            let q2_x2 = 0.3922*q2_x0 + 8.16227091631711e-18*q2_x1;
-            let q2_x3 = 8.16227091631711e-18*q2_x0 - 0.3922*q2_x1 - 0.425;
-            let q2 = libm::atan2(d_inner_x*q2_x2 + d_inner_y*(4.99794947572064e-34*q2_x0 - 2.40153237312796e-17*q2_x1 - 2.60237444818813e-17) + d_inner_z*q2_x3, d_inner_x*q2_x3 + d_inner_y*(-2.40153237312796e-17*q2_x0 - 0.1333) + d_inner_z*(8.16227091631711e-18 - q2_x2) - (0.1333 - 4.99794947572064e-34*q2_x1)*(-1.0*d_inner_y + 6.12323399573677e-17*d_inner_z));
-            let q4 = libm::remainder(theta14 - q2 - q3, TWO_PI);
-            if count < 8 {
-                out[count] = [q1, q2, q3, q4, q5, q6];
-                count += 1;
-            }
-        }
-    }
-
-    count
+    ur_common::solve_algebraic(&MODEL, t, out, policy)
 }
 
+/// Raw (unfiltered, unpolished) closed-form IK candidates for `t`, padded to
+/// [`CANDIDATES`]. The standard candidate source of `ArmModel::flange_one`:
+/// refinement and acceptance are left to [`dexhal::math::single::six_dof_one`].
+pub fn raw_candidates(t: &SMatrix<f64, 4, 4>, policy: TolerancePolicy) -> ([[f64; 6]; CANDIDATES], usize) {
+    let mut raw = [[0.0; 6]; MAX_CANDIDATES];
+    let n = solve_algebraic(t, &mut raw, policy);
+    let mut out = [[0.0; 6]; CANDIDATES];
+    out[..n].copy_from_slice(&raw[..n]);
+    (out, n)
+}
 
 // ---------------------------------------------------------------------------
 // Forward kinematics (for FK closure verification)
@@ -461,11 +157,6 @@ pub fn fk(q: &[f64; 6]) -> SMatrix<f64, 4, 4> {
     out
 }
 
-/// Frobenius-norm residual between FK(q) and the target pose.
-fn fk_residual(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> f64 {
-    mat4_frob_diff(&fk(q), target)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -473,6 +164,11 @@ fn fk_residual(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexhal::math::closed_form::refine6;
+    use dexhal::math::kinematics::mat4_frob_diff;
+    use dexhal::math::postprocess::wrap_distance;
+    use dexhal::math::single::within_max_joint_step;
+    use dexhal::math::{ArmModel, IkKind};
     use nalgebra::SMatrix;
     use std::vec::Vec;
 
@@ -501,6 +197,44 @@ mod tests {
     /// the UR5e (q5 = 0), where the solver returns only one shoulder branch (see
     /// `wrist_singularity_still_solves`), so round-trip tests use this instead.
     const REF_Q: [f64; 6] = [0.3, -1.0, 1.2, -0.5, 0.8, 0.2];
+
+    #[test]
+    fn refine6_recovers_a_perturbed_configuration() {
+        let q_true = [0.4, -1.1, 0.9, -1.3, 0.7, 0.2];
+        let target = fk(&q_true);
+        let seed = [0.45, -1.05, 0.85, -1.35, 0.65, 0.25];
+        let q = refine6::<Ur5, MAX_SOLUTIONS>(&seed, &target, 30, TolerancePolicy::DEFAULT.subproblem_numerical)
+            .expect("refine6 should converge from a nearby seed");
+        assert!(mat4_frob_diff(&fk(&q), &target) <= TolerancePolicy::DEFAULT.subproblem_numerical);
+    }
+
+    #[test]
+    fn flange_one_near_matches_first_seeded_solution() {
+        let policy = TolerancePolicy::DEFAULT;
+        let configs = [REF_Q, [0.4, -1.1, 0.9, -1.3, 0.7, 0.2], [-0.7, -0.6, 1.8, 0.4, -1.2, 1.0]];
+        let offsets = [-0.4, -0.1, 0.05, 0.3];
+        for q_true in configs {
+            let t = fk(&q_true);
+            for off in offsets {
+                let seed = [
+                    q_true[0] + off,
+                    q_true[1] - off,
+                    q_true[2] + off,
+                    q_true[3] - off,
+                    q_true[4] + off,
+                    q_true[5] - off,
+                ];
+                let single = Ur5::flange_one(&t, &seed, IkKind::Near, policy, 15);
+                let full = solve(&t, None, Some(&seed), true, true, policy, 15);
+                let full = full.iter().flatten().find(|b| within_max_joint_step(b, &seed)).copied();
+                match (single, full) {
+                    (Some(a), Some(b)) => assert!(q_eq_mod(&a, &b, 1e-9), "single {a:?} != full {b:?}"),
+                    (None, None) => {}
+                    _ => panic!("single/full disagree on existence: {single:?} vs {full:?}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn fk_home_pose() {
@@ -597,10 +331,10 @@ mod tests {
         let solutions: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
         if solutions.len() > 1 {
             // First solution must be the closest to seed.
-            let d0 = seed_dist(&solutions[0], &zero);
+            let d0 = wrap_distance(&solutions[0], &zero);
             for s in &solutions[1..] {
                 assert!(
-                    d0 <= seed_dist(s, &zero) + 1e-12,
+                    d0 <= wrap_distance(s, &zero) + 1e-12,
                     "q_seed sort: first solution is not the nearest to seed"
                 );
             }

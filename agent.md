@@ -100,7 +100,7 @@ Run tests: `cargo test`
 - **2×2 matrix helpers**: `mat2_ata`, `vec2_mat2`
 - **Pose residual norm**: `norm12` (Frobenius-norm of residual transformation)
 - **Rigid-transform type**: `Transform` struct, `IDENTITY`, `compose`, `se3_inv`, `frob_diff`
-- **Generic Levenberg-Marquardt refinement**: `lm_refine<const DOF, F>` (const-generic over degrees of freedom); `lm_refine6` is backward-compat wrapper
+- **Generic Levenberg-Marquardt refinement**: `lm_refine<const DOF, F>` (const-generic over degrees of freedom); `lm_refine6` is the analytic-Jacobian 6-DOF wrapper (takes a Jacobian closure)
 
 **Constraint**: Refinement loop has hardcoded maximum iterations (`LM_MAX_ITERS = 15`), initial/final damping factors, and convergence threshold.
 

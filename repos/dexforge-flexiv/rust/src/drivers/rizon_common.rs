@@ -24,21 +24,20 @@
 //! 2. Evaluate the per-sample `(P_sin, P_cos, P_one, Q)` matrices with
 //!    `build_pq[s]`, eliminate `q0, q1` through the left null space of `Q`, run
 //!    the Weierstrass substitution, and extract the real `tan(q/2)` roots and
-//!    kernels via the bounded `24×24` companion eigenvalue solve
-//!    ([`rr_real_roots`]).
+//!    kernels via the bounded `24×24` companion eigenvalue solve — all through
+//!    the shared [`solve_6r`].
 //! 3. Back-substitute each root to the six sub-chain joints, map DH→POE, and
 //!    pad the locked angle back in at index 2
 //!    (`full = [sub0, sub1, q_lock, sub2, sub3, sub4, sub5]`).
 //!
 //! The collected candidates are FK-verified against the full 7R chain
-//! ([`fk`]'s closure `< subproblem_numerical`), de-duplicated modulo `2π`, and — when
-//! `allow_refinement` is set — polished by a bounded Levenberg-Marquardt step
-//! that holds the locked joint fixed ([`refine7`]).
+//! ([`fk`]'s closure `< subproblem_numerical`), de-duplicated modulo `2π`, and —
+//! when `allow_refinement` is set — polished by the analytic masked
+//! Levenberg-Marquardt step ([`refine`]) that holds the locked joint fixed.
 //!
-//! A seeded solve holds the locked joint at the seed's value instead: the seed
-//! and every sweep solution, with that joint set to the seed's, are polished
-//! on the other six joints ([`seed_locked`]), and the verified results replace
-//! the sweep (which remains the fallback when none closes).
+//! [`solve`] always enumerates the full sweep. Single solutions are produced by
+//! the shared [`crate::math::single::seven_dof_one`] helper, which draws its
+//! per-sample candidates from [`sample_candidates`].
 //!
 //! ## Deterministic-execution note
 //!
@@ -54,36 +53,40 @@
 //! After deduplication with the generic math utilities, the code in this module
 //! is exclusively Rizon-specific and cannot be generalized:
 //!
-//! * **Raghavan-Roth back-substitution** ([`back_substitute`], [`ratio_from`],
-//!   [`embed_e`]) — DH-based 6R solution recovery specific to the RR elimination
-//!   scheme. The RR kernels themselves (`rr_real_roots`, etc.) are in
-//!   [`crate::math::ssik_core`].
-//! * **DH-based FK** ([`fk`], [`dh_matrix`]) — product-of-exponentials FK using
+//! * **DH-based FK** ([`fk`]) — product-of-exponentials FK using
 //!   the per-arm Model's axes and transforms. Cannot be moved to kinematics
 //!   because it depends on per-arm geometry stored in the Model.
-//! * **Joint-masked LM refinement** ([`refine7`]) — thin wrapper that builds the
-//!   free-joint index set (all DOF except the locked joint) and delegates to the
-//!   shared [`crate::math::kinematics::lm_refine_masked`] loop. The masking
-//!   strategy is specific to the `jointlock.seven_r` redundancy resolution; the
-//!   shared loop refines exactly the supplied free joints.
-//! * **Model-aware limit helpers** ([`wrap_to_limits7`], [`in_limits7`]) —
-//!   operate on the per-arm Model's joint_limits array.
-//! * **Sample-level solver** ([`solve_sample`], [`pad_locked`]) — orchestrates
-//!   the per-sample RR solve and result padding specific to the jointlock sweep.
+//! * **Joint-masked LM refinement** ([`refine`]) — builds the free-joint index
+//!   set (all DOF except the locked joint) and delegates to the shared analytic
+//!   [`crate::math::kinematics::lm_refine_masked_analytic`] loop. The masking
+//!   strategy is specific to the `jointlock.seven_r` redundancy resolution.
+//! * **Sample-level solver** ([`solve_sample`], [`pad_locked`]) — selects the
+//!   per-sample [`RrChain`] and pads the locked angle back in.
 //!
 //! Generic utilities that were previously duplicated here have been moved to:
 //! * [`crate::math::kinematics`]: `norm12`, LM constants, and the shared LM
-//!   loops (`lm_refine`, `lm_refine_masked`)
-//! * [`crate::math::postprocess`]: `q_close`, `dedup_solutions`, `wrap_distance`
+//!   loops (`lm_refine`, `lm_refine_masked`, `lm_refine_masked_analytic`)
+//! * [`crate::math::postprocess`]: `dedup_solutions`, `wrap_to_limits`,
+//!   `respect_limits`, `nearest_to_seed` (on `A::JOINT_LIMITS`)
+//! * [`dexhal::math::raghavan_roth`]: the whole 6R Raghavan-Roth candidate
+//!   route (`solve_6r`, `back_substitute`, `ratio_from`, `embed_e`,
+//!   `dh_matrix`, `W_TRIG_TO_X`, the ratio tables, matrix conversions)
+//! * [`dexhal::math::closed_form`]: `pose_residual`, `rotation_of`
 
-use nalgebra::{SMatrix, SVector};
+use nalgebra::SMatrix;
 
-use dexhal::math::kinematics::{lm_refine_masked, mat4_frob_diff, mat4_mul, rot_homogeneous};
-use dexhal::math::postprocess::{dedup_solutions, q_close, wrap_distance};
-use dexhal::math::ssik_core::{rr_left_null_space, rr_pseudo_inverse, rr_real_roots};
+use dexhal::math::closed_form::{pose_residual, rotation_of};
+use dexhal::math::kinematics::{
+    lm_refine_masked_analytic, mat4_frob_diff, mat4_mul, residual_columns, rot_homogeneous,
+};
+use dexhal::math::postprocess::{
+    dedup_solutions, nearest_to_seed, respect_limits as filter_limits, wrap_to_limits,
+};
+pub use dexhal::math::raghavan_roth::PqBuilder;
+use dexhal::math::raghavan_roth::{solve_6r, RrChain};
 pub use dexhal::math::tolerances::TolerancePolicy;
+use dexhal::math::ArmModel;
 
-use core::f64::consts::PI;
 
 /// Degrees of freedom of every Rizon arm.
 pub const DOF: usize = 7;
@@ -104,23 +107,6 @@ const CAND_CAP: usize = N_SAMPLES * INNER_MAX;
 /// the output array is sized to [`CAND_CAP`].
 pub const MAX_SOLUTIONS: usize = CAND_CAP;
 
-const TWO_PI: f64 = 2.0 * PI;
-
-/// Signature of a per-sample Raghavan-Roth `(P_sin, P_cos, P_one, Q)` builder.
-pub type PqBuilder = fn(
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-) -> ([[f64; 9]; 14], [[f64; 9]; 14], [[f64; 9]; 14], [[f64; 8]; 14]);
 
 /// Per-arm baked geometry and per-sample Raghavan-Roth derivation data.
 ///
@@ -161,105 +147,41 @@ pub struct Model {
     pub t_lefts7: &'static [[[f64; 4]; 4]; 7],
     /// Full 7R per-joint `T_right` (row-major 4×4).
     pub t_rights7: &'static [[[f64; 4]; 4]; 7],
-    /// Joint angle limits `(lo, hi)` in radians.
-    pub joint_limits: &'static [(f64, f64); 7],
 }
-
-// ---------------------------------------------------------------------------
-// Ratio candidates (Manocha-Canny IV-C robust selection) — arm-independent.
-// ---------------------------------------------------------------------------
-
-/// Ratio candidates for `x_left[0]`.
-const X0_RATIOS: [(usize, usize); 7] = [(5, 8), (2, 5), (11, 2), (4, 7), (10, 1), (3, 6), (9, 0)];
-/// Ratio candidates for `x_left[1]`.
-const X1_RATIOS: [(usize, usize); 5] = [(7, 8), (6, 7), (1, 2), (4, 5), (10, 11)];
-
-/// Weierstrass trig→`x` basis transform (arm-independent).
-const W_TRIG_TO_X: [[f64; 9]; 9] = [
-    [0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, -2.0, 0.0, 2.0, 0.0, 0.0, 0.0],
-    [0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0],
-    [1.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0],
-    [0.0, 0.0, 0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0],
-    [-1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
-    [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0],
-    [-1.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0],
-    [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
-];
 
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Inverse kinematics for a Rizon arm described by `model`.
+/// Every inverse-kinematics solution of a Rizon arm described by `model`.
 ///
-/// Mirrors `rizon{4,10}_ik.solve` with the same argument list. Returns up to
-/// [`MAX_SOLUTIONS`] candidate joint vectors `[q1, .., q7]` in radians; unused
-/// slots are [`None`].
-#[allow(clippy::too_many_arguments)]
-pub fn solve(
+/// Enumerates the full sweep (every lock sample, every 6R candidate) without
+/// early exit. Returns up to [`MAX_SOLUTIONS`] joint vectors in radians; unused
+/// slots are [`None`]. With `q_seed`, solutions are ordered nearest-first.
+pub fn solve<A: ArmModel<DOF, MAX_SOLUTIONS>>(
     model: &Model,
     t: &SMatrix<f64, 4, 4>,
-    max_solutions: Option<usize>,
     q_seed: Option<&[f64; 7]>,
     respect_limits: bool,
     allow_refinement: bool,
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    let fk_atol = policy.subproblem_numerical;
-    let dedup_atol = policy.subproblem_dedup;
-
-    let mut solutions: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
-
-    // Determine lock-sample traversal order. With a seed, visit samples whose
-    // locked angle is nearest the seed's locked joint first (mirrors the Python
-    // `q_seed` reordering of the sample schedule).
-    let mut sample_order: [usize; N_SAMPLES] = [0; N_SAMPLES];
-    for (i, slot) in sample_order.iter_mut().enumerate() {
-        *slot = i;
-    }
-    if let Some(seed) = q_seed {
-        let sl = seed[model.lock_idx];
-        for i in 1..N_SAMPLES {
-            let mut j = i;
-            while j > 0 {
-                let da = libm::fabs(model.lock_samples[sample_order[j - 1]] - sl);
-                let db = libm::fabs(model.lock_samples[sample_order[j]] - sl);
-                if da > db {
-                    sample_order.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Joint-lock sweep: collect 7R candidates with their full-chain FK residual.
     let mut cand_q = [[0.0f64; 7]; CAND_CAP];
     let mut cand_res = [0.0f64; CAND_CAP];
     let mut n_cand = 0usize;
-
     let mut inner = [[0.0f64; 6]; INNER_MAX];
 
-    // Seeded early exit: the first lock sample (nearest-first) whose candidates
-    // yield a seed-locked solution ends the sweep.
-    let mut early: Option<([[f64; 7]; CAND_CAP], usize)> = None;
-
-    for &sample in sample_order.iter() {
+    for sample in 0..N_SAMPLES {
         let q_lock = model.lock_samples[sample];
         let n_inner = solve_sample(model, sample, t, &mut inner);
-        let cand_start = n_cand;
         for sub in inner.iter().take(n_inner) {
-            // Pad the locked angle back in at `lock_idx` (no chain reversal):
-            // full = [sub0, sub1, q_lock, sub2, sub3, sub4, sub5] for lock_idx 2.
             let full = pad_locked(model.lock_idx, sub, q_lock);
             if !full.iter().all(|v| v.is_finite()) {
                 continue;
             }
             let residual = fk_residual(model, &full, t);
-            if residual > fk_atol {
+            if residual > policy.subproblem_numerical {
                 continue;
             }
             if n_cand < CAND_CAP {
@@ -268,100 +190,62 @@ pub fn solve(
                 n_cand += 1;
             }
         }
-
-        if let Some(seed) = q_seed {
-            let m = n_cand - cand_start;
-            if m > 0 {
-                let mut sub = [[0.0f64; 7]; CAND_CAP];
-                sub[..m].copy_from_slice(&cand_q[cand_start..n_cand]);
-                let k = seed_locked(model, seed, t, &mut sub, m, respect_limits, policy);
-                if k > 0 {
-                    early = Some((sub, k));
-                    break;
-                }
-            }
-        }
     }
 
     // De-duplicate modulo 2π, keeping the lower-residual representative.
     let mut d_q = [[0.0f64; 7]; CAND_CAP];
     let mut d_res = [0.0f64; CAND_CAP];
-    let mut n_d = dedup_solutions(&cand_q, &cand_res, n_cand, &mut d_q, &mut d_res, dedup_atol);
+    let n_d = dedup_solutions(
+        &cand_q,
+        &cand_res,
+        n_cand,
+        &mut d_q,
+        &mut d_res,
+        policy.subproblem_dedup,
+    );
 
-    // Seeded solve: keep the locked joint at the seed's value instead of the
-    // nearest lock sample, so tracking never moves it without TCP motion. An
-    // early hit from the sweep above is already seed-locked.
-    let seeded = match (q_seed, early) {
-        (_, Some((eq, en))) => {
-            d_q = eq;
-            n_d = en;
-            true
-        }
-        (Some(seed), None) => {
-            let n = seed_locked(model, seed, t, &mut d_q, n_d, respect_limits, policy);
-            if n > 0 {
-                n_d = n;
-            }
-            n > 0
-        }
-        (None, None) => false,
-    };
-
-    let mut sol_count = 0usize;
-    for i in 0..n_d {
-        if sol_count >= MAX_SOLUTIONS {
-            break;
-        }
-        let q = if allow_refinement && !seeded {
-            refine7(model, &d_q[i], t, refinement_max_iters)
+    let mut sols = [[0.0f64; 7]; MAX_SOLUTIONS];
+    for (slot, q) in sols.iter_mut().zip(d_q.iter()).take(n_d) {
+        *slot = if allow_refinement {
+            refine::<A>(model, q, t, refinement_max_iters)
         } else {
-            d_q[i]
+            *q
         };
-        solutions[sol_count] = Some(q);
-        sol_count += 1;
     }
-
-    // Post-processing (mirrors Python's _ps_wrap_to_limits + _ps_respect_limits).
+    let mut count = n_d;
     if respect_limits {
-        let mut filtered: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
-        let mut count = 0usize;
-        for sol in solutions.iter().take(sol_count).flatten() {
-            let q = wrap_to_limits7(model, sol);
-            if in_limits7(model, &q) && count < MAX_SOLUTIONS {
-                filtered[count] = Some(q);
-                count += 1;
-            }
-        }
-        solutions = filtered;
-        sol_count = count;
+        wrap_to_limits(&mut sols, count, &A::JOINT_LIMITS);
+        count = filter_limits(&mut sols, count, &A::JOINT_LIMITS);
     }
-
-    // Sort by seed distance (mirrors Python's _ps_nearest_to_seed).
     if let Some(seed) = q_seed {
-        for i in 1..sol_count {
-            let mut j = i;
-            while j > 0 {
-                if let (Some(prev), Some(curr)) = (solutions[j - 1], solutions[j]) {
-                    if wrap_distance(&prev, seed) > wrap_distance(&curr, seed) {
-                        solutions.swap(j - 1, j);
-                        j -= 1;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
+        nearest_to_seed(&mut sols, count, seed);
     }
 
-    // Truncate to max_solutions (mirrors Python's `solutions[:max_solutions]`).
-    if let Some(max) = max_solutions {
-        let cap = max.min(sol_count);
-        solutions[cap..sol_count].fill(None);
+    let mut solutions: [Option<[f64; 7]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
+    for (o, q) in solutions.iter_mut().zip(sols.iter()).take(count) {
+        *o = Some(*q);
     }
-
     solutions
+}
+
+/// Raw 7R candidates of the lock sample equal to `lock_value` (one 6R solve,
+/// not FK-verified), with the lock joint at `lock_value`. Empty when
+/// `lock_value` is not one of `model.lock_samples`.
+pub fn sample_candidates(
+    model: &Model,
+    lock_value: f64,
+    t: &SMatrix<f64, 4, 4>,
+) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
+    let mut out = [None; MAX_SOLUTIONS];
+    let Some(sample) = model.lock_samples.iter().position(|&s| s == lock_value) else {
+        return out;
+    };
+    let mut inner = [[0.0f64; 6]; INNER_MAX];
+    let n = solve_sample(model, sample, t, &mut inner);
+    for (slot, sub) in out.iter_mut().zip(inner.iter().take(n)) {
+        *slot = Some(pad_locked(model.lock_idx, sub, lock_value));
+    }
+    out
 }
 
 /// Pad the six sub-chain joints with the locked angle at `lock_idx`.
@@ -394,191 +278,21 @@ fn solve_sample(
     t: &SMatrix<f64, 4, 4>,
     out: &mut [[f64; 6]; INNER_MAX],
 ) -> usize {
-    let t_pre_inv = mat4(&model.t_pre_inv[sample]);
-    let t_post_inv = mat4(&model.t_post_inv[sample]);
-    let t_dh = t_pre_inv * t * t_post_inv;
-
-    let (p_sin_a, p_cos_a, p_one_a, q_a) = (model.build_pq[sample])(
-        t_dh[(0, 0)],
-        t_dh[(0, 1)],
-        t_dh[(0, 2)],
-        t_dh[(0, 3)],
-        t_dh[(1, 0)],
-        t_dh[(1, 1)],
-        t_dh[(1, 2)],
-        t_dh[(1, 3)],
-        t_dh[(2, 0)],
-        t_dh[(2, 1)],
-        t_dh[(2, 2)],
-        t_dh[(2, 3)],
-    );
-
-    let p_sin = mat14x9(&p_sin_a);
-    let p_cos = mat14x9(&p_cos_a);
-    let p_one = mat14x9(&p_one_a);
-    let q_mat = mat14x8(&q_a);
-
-    // Eliminate q_0, q_1 through the left null space of Q.
-    let nt = rr_left_null_space(&q_mat).transpose(); // 6x14
-    let e_sin = nt * p_sin;
-    let e_cos = nt * p_cos;
-    let e_one = nt * p_one;
-
-    // Weierstrass half-angle substitution into the polynomial basis.
-    let w = mat9x9(&W_TRIG_TO_X);
-    let e_quad = (e_one - e_cos) * w;
-    let e_lin = (e_sin * 2.0) * w;
-    let e_const = (e_one + e_cos) * w;
-
-    // Doubled 12x12 matrix polynomial.
-    let m_quad = embed_e(&e_quad);
-    let m_lin = embed_e(&e_lin);
-    let m_const = embed_e(&e_const);
-
-    // Real tan(q/2) roots + kernels via the 24x24 companion eigenvalue route.
-    let mut roots = [0.0f64; 24];
-    let mut vecs = [[0.0f64; 12]; 24];
+    let chain = RrChain {
+        dh_alpha: &model.dh_alpha[sample],
+        dh_a: &model.dh_a[sample],
+        dh_d: &model.dh_d[sample],
+        dh_theta_offset: &model.dh_theta_offset[sample],
+        t_pre_inv: &model.t_pre_inv[sample],
+        t_post_inv: &model.t_post_inv[sample],
+        linearity_joint: model.linearity_joint[sample],
+        left_bilinear: model.left_bilinear[sample],
+        right_bilinear: model.right_bilinear[sample],
+        drop_joint: model.drop_joint[sample],
+        build_pq: model.build_pq[sample],
+    };
     let mut cond = 0.0f64;
-    let n_roots = rr_real_roots(&m_quad, &m_lin, &m_const, &mut roots, &mut vecs, &mut cond);
-
-    let q_pinv = rr_pseudo_inverse(&q_mat);
-
-    let mut count = 0usize;
-    for r in 0..n_roots {
-        if count >= INNER_MAX {
-            break;
-        }
-        if let Some(q_dh) = back_substitute(
-            model, sample, roots[r], &vecs[r], &p_sin, &p_cos, &p_one, &q_pinv, &t_dh,
-        ) {
-            let mut q = [0.0f64; 6];
-            for i in 0..6 {
-                q[i] = q_dh[i] - model.dh_theta_offset[sample][i];
-            }
-            out[count] = q;
-            count += 1;
-        }
-    }
-    count
-}
-
-/// Embed a 6x9 `E` into the 12x12 doubled block structure for `M`.
-fn embed_e(e: &SMatrix<f64, 6, 9>) -> SMatrix<f64, 12, 12> {
-    let mut m = SMatrix::<f64, 12, 12>::zeros();
-    m.fixed_view_mut::<6, 9>(0, 0).copy_from(e);
-    let shift = e.fixed_view::<6, 6>(0, 3).into_owned();
-    m.fixed_view_mut::<6, 6>(6, 0).copy_from(&shift);
-    let wrap = e.fixed_view::<6, 3>(0, 0).into_owned();
-    m.fixed_view_mut::<6, 3>(6, 9).copy_from(&wrap);
-    m
-}
-
-/// Pick `v_12[num] / v_12[den]` using the pair whose denominator has the
-/// largest magnitude. Returns `None` if the chosen denominator is ~0.
-fn ratio_from(v12: &[f64; 12], candidates: &[(usize, usize)]) -> Option<f64> {
-    let mut best = candidates[0];
-    let mut best_den = libm::fabs(v12[best.1]);
-    for &(num, den) in &candidates[1..] {
-        let mag = libm::fabs(v12[den]);
-        if mag > best_den {
-            best_den = mag;
-            best = (num, den);
-        }
-    }
-    if libm::fabs(v12[best.1]) < 1e-12 {
-        return None;
-    }
-    Some(v12[best.0] / v12[best.1])
-}
-
-/// Branch-level back-substitution — port of
-/// `_raghavan_roth._back_substitute_inner` with the per-sample RR metadata.
-#[allow(clippy::too_many_arguments)]
-fn back_substitute(
-    model: &Model,
-    sample: usize,
-    x_lin: f64,
-    v12: &[f64; 12],
-    p_sin: &SMatrix<f64, 14, 9>,
-    p_cos: &SMatrix<f64, 14, 9>,
-    p_one: &SMatrix<f64, 14, 9>,
-    q_pinv: &SMatrix<f64, 8, 14>,
-    t_dh: &SMatrix<f64, 4, 4>,
-) -> Option<[f64; 6]> {
-    let q_lin = 2.0 * libm::atan(x_lin);
-
-    let x_l0 = ratio_from(v12, &X0_RATIOS)?;
-    let x_l1 = ratio_from(v12, &X1_RATIOS)?;
-
-    let q_l0 = 2.0 * libm::atan(x_l0);
-    let q_l1 = 2.0 * libm::atan(x_l1);
-
-    let (s_lin, c_lin) = (libm::sin(q_lin), libm::cos(q_lin));
-    let (s_l0, c_l0) = (libm::sin(q_l0), libm::cos(q_l0));
-    let (s_l1, c_l1) = (libm::sin(q_l1), libm::cos(q_l1));
-
-    let v_left = SVector::<f64, 9>::from_column_slice(&[
-        s_l0 * s_l1,
-        s_l0 * c_l1,
-        c_l0 * s_l1,
-        c_l0 * c_l1,
-        s_l0,
-        c_l0,
-        s_l1,
-        c_l1,
-        1.0,
-    ]);
-    let p_eff = p_sin * s_lin + p_cos * c_lin + p_one; // 14x9
-    let rhs = p_eff * v_left; // 14
-    let v_right = q_pinv * rhs; // 8
-
-    let q_r0 = libm::atan2(v_right[4], v_right[5]);
-    let q_r1 = libm::atan2(v_right[6], v_right[7]);
-
-    let linearity = model.linearity_joint[sample];
-    let (lb0, lb1) = model.left_bilinear[sample];
-    let (rb0, rb1) = model.right_bilinear[sample];
-    let drop = model.drop_joint[sample];
-
-    let mut q = [0.0f64; 6];
-    q[linearity] = q_lin;
-    q[lb0] = q_l0;
-    q[lb1] = q_l1;
-    q[rb0] = q_r0;
-    q[rb1] = q_r1;
-
-    // Recover the dropped joint from the FK residual.
-    let alpha = &model.dh_alpha[sample];
-    let a = &model.dh_a[sample];
-    let d = &model.dh_d[sample];
-    let mut chain_before = SMatrix::<f64, 4, 4>::identity();
-    for i in 0..drop {
-        chain_before *= dh_matrix(q[i], alpha[i], a[i], d[i]);
-    }
-    let mut chain_after = SMatrix::<f64, 4, 4>::identity();
-    for i in (drop + 1)..6 {
-        chain_after *= dh_matrix(q[i], alpha[i], a[i], d[i]);
-    }
-    let before_inv = chain_before.try_inverse()?;
-    let after_inv = chain_after.try_inverse()?;
-    let a_drop_residual = before_inv * t_dh * after_inv;
-    q[drop] = libm::atan2(a_drop_residual[(1, 0)], a_drop_residual[(0, 0)]);
-
-    if q.iter().all(|v| v.is_finite()) {
-        Some(q)
-    } else {
-        None
-    }
-}
-
-/// Numeric DH transform matrix — mirrors `_raghavan_roth._dh_matrix_num`.
-fn dh_matrix(theta: f64, alpha: f64, a: f64, d: f64) -> SMatrix<f64, 4, 4> {
-    let (st, ct) = (libm::sin(theta), libm::cos(theta));
-    let (sa, ca) = (libm::sin(alpha), libm::cos(alpha));
-    SMatrix::<f64, 4, 4>::from_row_slice(&[
-        ct, -st * ca, st * sa, a * ct, st, ct * ca, -ct * sa, a * st, 0.0, sa, ca, d, 0.0, 0.0,
-        0.0, 1.0,
-    ])
+    solve_6r(&chain, t, out, &mut cond)
 }
 
 // ---------------------------------------------------------------------------
@@ -616,148 +330,22 @@ fn fk_residual(model: &Model, q: &[f64; 7], target: &SMatrix<f64, 4, 4>) -> f64 
 // Levenberg-Marquardt refinement (holds the locked joint fixed)
 // ---------------------------------------------------------------------------
 
-/// 12-vector pose residual `[vec(R(q) − R_t); t(q) − t_t]` of the full 7R FK.
-fn residual12(model: &Model, q: &[f64; 7], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
-    let tf = fk(model, q);
-    let mut r = [0.0f64; 12];
-    let mut k = 0usize;
-    for i in 0..3 {
-        for j in 0..3 {
-            r[k] = tf[(i, j)] - target[(i, j)];
-            k += 1;
-        }
-    }
-    for i in 0..3 {
-        r[9 + i] = tf[(i, 3)] - target[(i, 3)];
-    }
-    r
-}
-
-/// Levenberg-Marquardt polish of a 7R configuration, **holding the locked joint
-/// fixed**. Refining only the six free joints targets the isolated 6R root and
-/// keeps the redundant 7R from drifting along its self-motion manifold.
-///
-/// **Rizon-specific rationale**: the locked joint (`model.lock_idx`) must be
-/// masked out during refinement — a constraint specific to the
-/// `jointlock.seven_r` redundancy resolution strategy. This is expressed by
-/// passing the free-joint index set to the shared joint-masked LM loop
-/// [`crate::math::kinematics::lm_refine_masked`]; the locked joint is simply
-/// the index absent from that set.
-fn refine7(
+/// Analytic Levenberg-Marquardt polish of a 7R configuration, **holding the
+/// locked joint fixed** at its value in `q_in`. Refining only the six free
+/// joints targets the isolated 6R root and keeps the redundant 7R from drifting
+/// along its self-motion manifold.
+fn refine<A: ArmModel<DOF, MAX_SOLUTIONS>>(
     model: &Model,
     q_in: &[f64; 7],
     target: &SMatrix<f64, 4, 4>,
     max_iters: usize,
 ) -> [f64; 7] {
-    // Free joints = all but the locked one.
-    let mut free = [0usize; 6];
-    let mut fi = 0usize;
-    for i in 0..7 {
-        if i != model.lock_idx {
-            free[fi] = i;
-            fi += 1;
-        }
-    }
-
-    lm_refine_masked::<7, 6, _>(q_in, &free, |q| residual12(model, q, target), max_iters)
-}
-
-// ---------------------------------------------------------------------------
-// De-duplication and post-processing helpers
-// ---------------------------------------------------------------------------
-
-/// LM iteration ceiling of the seed-locked polish (it stops on convergence).
-const SEED_LOCK_ITERS: usize = 100;
-
-/// Seed-locked solutions of a seeded solve, written over `sols[..]`.
-///
-/// Starts from the seed and from each of the `n` sweep solutions in `sols`,
-/// with the locked joint set to the seed's value, and polishes the six other
-/// joints with [`refine7`] (which holds that joint). Keeps the FK-verified,
-/// de-duplicated (and, with `respect_limits`, in-limit) results. Returns their
-/// count; on `0`, `sols` is left untouched and the caller keeps the sweep.
-fn seed_locked(
-    model: &Model,
-    seed: &[f64; 7],
-    target: &SMatrix<f64, 4, 4>,
-    sols: &mut [[f64; 7]; CAND_CAP],
-    n: usize,
-    respect_limits: bool,
-    policy: TolerancePolicy,
-) -> usize {
-    let mut out = [[0.0f64; 7]; CAND_CAP];
-    let mut count = 0usize;
-    for k in 0..=n {
-        let mut start = if k == 0 { *seed } else { sols[k - 1] };
-        start[model.lock_idx] = seed[model.lock_idx];
-        let q = refine7(model, &start, target, SEED_LOCK_ITERS);
-        if !q.iter().all(|v| v.is_finite())
-            || fk_residual(model, &q, target) > policy.subproblem_numerical
-            || (respect_limits && !in_limits7(model, &wrap_to_limits7(model, &q)))
-            || out[..count]
-                .iter()
-                .any(|s| q_close::<7>(&q, s, policy.subproblem_dedup))
-        {
-            continue;
-        }
-        if count < CAND_CAP {
-            out[count] = q;
-            count += 1;
-        }
-    }
-    if count > 0 {
-        *sols = out;
-    }
-    count
-}
-
-/// Try `q[i] ± 2π` per joint to bring the vector into the model's joint limits.
-fn wrap_to_limits7(model: &Model, q: &[f64; 7]) -> [f64; 7] {
-    let mut out = *q;
-    for i in 0..7 {
-        let (lo, hi) = model.joint_limits[i];
-        if out[i] < lo {
-            let wrapped = out[i] + TWO_PI;
-            if wrapped <= hi {
-                out[i] = wrapped;
-            }
-        } else if out[i] > hi {
-            let wrapped = out[i] - TWO_PI;
-            if wrapped >= lo {
-                out[i] = wrapped;
-            }
-        }
-    }
-    out
-}
-
-/// `true` if every joint is within its URDF limit.
-fn in_limits7(model: &Model, q: &[f64; 7]) -> bool {
-    for i in 0..7 {
-        let (lo, hi) = model.joint_limits[i];
-        if q[i] < lo || q[i] > hi {
-            return false;
-        }
-    }
-    true
-}
-
-// ---------------------------------------------------------------------------
-// Small fixed-size array → nalgebra conversions
-// ---------------------------------------------------------------------------
-
-fn mat4(a: &[[f64; 4]; 4]) -> SMatrix<f64, 4, 4> {
-    SMatrix::<f64, 4, 4>::from_fn(|i, j| a[i][j])
-}
-
-fn mat9x9(a: &[[f64; 9]; 9]) -> SMatrix<f64, 9, 9> {
-    SMatrix::<f64, 9, 9>::from_fn(|i, j| a[i][j])
-}
-
-fn mat14x9(a: &[[f64; 9]; 14]) -> SMatrix<f64, 14, 9> {
-    SMatrix::<f64, 14, 9>::from_fn(|i, j| a[i][j])
-}
-
-fn mat14x8(a: &[[f64; 8]; 14]) -> SMatrix<f64, 14, 8> {
-    SMatrix::<f64, 14, 8>::from_fn(|i, j| a[i][j])
+    let free: [usize; 6] = core::array::from_fn(|i| if i < model.lock_idx { i } else { i + 1 });
+    lm_refine_masked_analytic::<7, 6, _, _>(
+        q_in,
+        &free,
+        |q| pose_residual(&A::flange_fk(q), target),
+        |q| residual_columns(&rotation_of(&A::flange_fk(q)), &A::flange_jacobian(q)),
+        max_iters,
+    )
 }

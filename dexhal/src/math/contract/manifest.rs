@@ -6,14 +6,16 @@
 //!
 //! ```
 //! # use dexhal::math::contract::{control_mode, ArmManifest};
-//! # use dexhal::math::model::{ArmModel, Pose};
+//! # use dexhal::math::model::{ArmModel, IkKind, Pose};
 //! # use dexhal::math::tolerances::TolerancePolicy;
 //! # struct Demo;
 //! # impl ArmModel<2, 1> for Demo {
 //! #     fn flange_fk(_q: &[f64; 2]) -> Pose { Pose::identity() }
 //! #     fn flange_jacobian(_q: &[f64; 2]) -> [[f64; 2]; 6] { [[0.0; 2]; 6] }
-//! #     fn flange_solve(_t: &Pose, _m: Option<usize>, _s: Option<&[f64; 2]>, _l: bool, _r: bool,
+//! #     fn flange_all(_t: &Pose, _s: Option<&[f64; 2]>, _l: bool, _r: bool,
 //! #         _p: TolerancePolicy, _i: usize) -> [Option<[f64; 2]>; 1] { [None] }
+//! #     fn flange_one(_t: &Pose, _s: &[f64; 2], _k: IkKind, _p: TolerancePolicy,
+//! #         _i: usize) -> Option<[f64; 2]> { None }
 //! # }
 //! // In a driver: include_str!("../manifest.yaml")
 //! static MANIFEST: &str = "
@@ -1324,7 +1326,10 @@ limits:
             kind("limits:\n  cartesian_acceleration: [1, -2]\n"),
             (2, Model(ModelError::NonPositive))
         );
-        assert_eq!(kind("native:\n  joint_admittance: false\n"), (2, UnknownKey));
+        assert_eq!(
+            kind("native:\n  joint_admittance: false\n"),
+            (2, UnknownKey)
+        );
         assert_eq!(kind("sensing:\n  wrench_frame: world\n"), (2, InvalidValue));
         assert_eq!(
             kind("sensing:\n  torque_constants: [1, 1, 0, 1, 1, 1]\n"),
@@ -1385,7 +1390,7 @@ limits:
 
     #[test]
     fn inertials_flags_and_vendor_dynamics_override() {
-        use crate::math::model::Pose;
+        use crate::math::model::{IkKind, Pose};
         use crate::math::tolerances::TolerancePolicy;
         use ManifestErrorKind::*;
 
@@ -1399,9 +1404,8 @@ limits:
             fn flange_jacobian(_q: &[f64; 6]) -> [[f64; 6]; 6] {
                 [[0.0; 6]; 6]
             }
-            fn flange_solve(
+            fn flange_all(
                 _t: &Pose,
-                _m: Option<usize>,
                 _s: Option<&[f64; 6]>,
                 _l: bool,
                 _r: bool,
@@ -1409,6 +1413,15 @@ limits:
                 _i: usize,
             ) -> [Option<[f64; 6]>; 1] {
                 [None]
+            }
+            fn flange_one(
+                _t: &Pose,
+                _s: &[f64; 6],
+                _k: IkKind,
+                _p: TolerancePolicy,
+                _i: usize,
+            ) -> Option<[f64; 6]> {
+                None
             }
         }
 
@@ -1420,11 +1433,11 @@ limits:
         assert!(!m_no_dyn.has_impedance_dynamics());
         assert!(!m_no_dyn.has_residual_dynamics());
 
-        let err_static = ArmManifest::from_text::<NoDyn, 6, 1>("has_static_inertials: true\n")
-            .unwrap_err();
+        let err_static =
+            ArmManifest::from_text::<NoDyn, 6, 1>("has_static_inertials: true\n").unwrap_err();
         assert_eq!((err_static.line, err_static.kind), (1, InvalidValue));
-        let err_residual = ArmManifest::from_text::<NoDyn, 6, 1>("has_residual_inertials: true\n")
-            .unwrap_err();
+        let err_residual =
+            ArmManifest::from_text::<NoDyn, 6, 1>("has_residual_inertials: true\n").unwrap_err();
         assert_eq!((err_residual.line, err_residual.kind), (1, InvalidValue));
 
         // Item 57: has_residual_inertials defaults to has_static_inertials when omitted,

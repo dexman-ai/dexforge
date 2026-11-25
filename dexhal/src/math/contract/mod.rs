@@ -24,11 +24,11 @@ pub mod wire;
 pub use manifest::*;
 pub use wire::*;
 
-use crate::math::arm::{Arm, IK_NEAREST_REFINEMENT_ITERS, PoseResidual};
+use crate::math::arm::{Arm, PoseResidual, IK_ONE_REFINEMENT_ITERS};
 use crate::math::chain::{
     pose_from_xyz_quat, pose_to_xyz_quat, ChainJoint, KinematicChain, ModelError,
 };
-use crate::math::model::{ArmModel, Pose};
+use crate::math::model::{ArmModel, IkKind, Pose};
 use crate::math::payload::Payload;
 use crate::math::tolerances::TolerancePolicy;
 
@@ -236,19 +236,27 @@ pub trait ArmMath: Send {
     /// singularity.
     fn jacobian_pseudo_inverse(&self, q: &[f64; MAX_DOF]) -> Option<[[f64; 6]; MAX_DOF]>;
 
-    /// Joint vector reaching `target_pose` on the branch of `q_seed`
-    /// ([`Arm::ik_nearest`], including its continuity bound).
-    fn inverse_kinematics(
+    /// One joint vector reaching `target_pose`, early-exiting ([`Arm::ik_one`]
+    /// with its continuity bound). `kind` is [`IkKind::Fast`] or
+    /// [`IkKind::Near`] (closest to `q_seed`).
+    fn ik_one(
         &self,
         target_pose: &[f64; 7],
         q_seed: &[f64; MAX_DOF],
+        kind: IkKind,
     ) -> Option<[f64; MAX_DOF]>;
 
-    /// Up to `out.len()` joint solutions reaching `target_pose`, with no seed
-    /// ranking: the caller selects among them (for example by end-effector
-    /// orientation). Writes them to the front of `out` and returns how many
-    /// were written (0 if unreachable). Order is the driver's.
-    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [[f64; MAX_DOF]]) -> usize;
+    /// Every joint solution reaching `target_pose` ([`Arm::ik_all`]), sorted
+    /// nearest-first to `q_seed` when given. Writes them to the front of `out`
+    /// and returns how many were written (0 if unreachable). A buffer shorter
+    /// than the solution count receives the nearest `out.len()` solutions
+    /// (size it to the arm's maximum, `MAX`, to receive all of them).
+    fn ik_all(
+        &self,
+        target_pose: &[f64; 7],
+        q_seed: Option<&[f64; MAX_DOF]>,
+        out: &mut [[f64; MAX_DOF]],
+    ) -> usize;
 
     /// `M`, `C qd`, `G` including the payload.
     fn dynamics_padded(&self, q: &[f64; MAX_DOF], qd: &[f64; MAX_DOF]) -> Option<DynamicsState>;
@@ -295,7 +303,7 @@ pub trait ArmMath: Send {
     /// Return to the nominal kinematics.
     fn remove_calibration(&mut self);
 
-    /// Set the continuity bound (rad) of [`inverse_kinematics`](Self::inverse_kinematics).
+    /// Set the continuity bound (rad) of [`ik_one`](Self::ik_one).
     fn apply_ik_max_joint_step(&mut self, step: f64) -> Result<(), ModelError>;
 
     /// Free-space joint torque for this control tick, advancing the learned
@@ -368,32 +376,47 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmMath for Arm<
         Some(out)
     }
 
-    fn inverse_kinematics(
+    fn ik_one(
         &self,
         target_pose: &[f64; 7],
         q_seed: &[f64; MAX_DOF],
+        kind: IkKind,
     ) -> Option<[f64; MAX_DOF]> {
         let target = pose_from_xyz_quat(target_pose).ok()?;
-        let q = self.ik_nearest(&target, &unpad(q_seed)?, TolerancePolicy::DEFAULT)?;
+        let q = self.ik_one(&target, &unpad(q_seed)?, kind, TolerancePolicy::DEFAULT)?;
         Some(pad(&q))
     }
 
-    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [[f64; MAX_DOF]]) -> usize {
+    fn ik_all(
+        &self,
+        target_pose: &[f64; 7],
+        q_seed: Option<&[f64; MAX_DOF]>,
+        out: &mut [[f64; MAX_DOF]],
+    ) -> usize {
+        if out.is_empty() {
+            return 0;
+        }
         let Ok(target) = pose_from_xyz_quat(target_pose) else {
             return 0;
         };
-        let solutions = self.ik(
+        let seed = match q_seed {
+            Some(q) => match unpad::<DOF>(q) {
+                Some(s) => Some(s),
+                None => return 0,
+            },
+            None => None,
+        };
+        let solutions = self.ik_all(
             &target,
-            Some(out.len().min(MAX)),
-            None,
+            seed.as_ref(),
             true,
             true,
             TolerancePolicy::DEFAULT,
-            IK_NEAREST_REFINEMENT_ITERS,
+            IK_ONE_REFINEMENT_ITERS,
         );
         let mut n = 0;
-        for q in solutions.iter().flatten().take(out.len()) {
-            out[n] = pad(q);
+        for (slot, q) in out.iter_mut().zip(solutions.iter().flatten()) {
+            *slot = pad(q);
             n += 1;
         }
         n
@@ -501,7 +524,11 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> ArmMath for Arm<
         qd: &[f64; MAX_DOF],
         qdd: &[f64; MAX_DOF],
     ) -> Option<[f64; MAX_DOF]> {
-        Some(pad(&self.payload_torque(&unpad(q)?, &unpad(qd)?, &unpad(qdd)?)))
+        Some(pad(&self.payload_torque(
+            &unpad(q)?,
+            &unpad(qd)?,
+            &unpad(qdd)?,
+        )))
     }
 }
 
@@ -623,7 +650,7 @@ pub trait ArmDriver: Send {
     }
 
     /// Set the largest per-joint distance (rad) between the seed and the
-    /// result of [`inverse_kinematics`](Self::inverse_kinematics).
+    /// result of [`ik_one`](Self::ik_one).
     fn set_ik_max_joint_step(&mut self, step: f64) -> Result<(), ArmError> {
         Ok(self.arm_mut().apply_ik_max_joint_step(step)?)
     }
@@ -668,12 +695,22 @@ pub trait ArmDriver: Send {
         self.arm().jacobian_pseudo_inverse(q)
     }
 
-    fn inverse_kinematics(
+    fn ik_one(
         &self,
         target_pose: &[f64; 7],
         q_seed: &[f64; MAX_DOF],
+        kind: IkKind,
     ) -> Option<[f64; MAX_DOF]> {
-        self.arm().inverse_kinematics(target_pose, q_seed)
+        self.arm().ik_one(target_pose, q_seed, kind)
+    }
+
+    fn ik_all(
+        &self,
+        target_pose: &[f64; 7],
+        q_seed: Option<&[f64; MAX_DOF]>,
+        out: &mut [[f64; MAX_DOF]],
+    ) -> usize {
+        self.arm().ik_all(target_pose, q_seed, out)
     }
 
     fn dynamics(&self, q: &[f64; MAX_DOF], qd: &[f64; MAX_DOF]) -> Option<DynamicsState> {
@@ -834,7 +871,7 @@ mod tests {
             assert_eq!((math.dof(), math.is_calibrated()), (6, true));
 
             let pose = math.forward_kinematics(&q).unwrap();
-            let back = math.inverse_kinematics(&pose, &q).unwrap();
+            let back = math.ik_one(&pose, &q, IkKind::Near).unwrap();
             for i in 0..6 {
                 assert!((back[i] - q[i]).abs() < 1e-7, "joint {i}");
             }
@@ -1072,19 +1109,34 @@ mod tests {
 
         // Model source, no observer: the rigid-body inverse dynamics.
         let mut driver = fake_driver();
-        driver.arm.set_payload(Payload::new(1.0, [0.0, 0.0, 0.05])).unwrap();
+        driver
+            .arm
+            .set_payload(Payload::new(1.0, [0.0, 0.0, 0.05]))
+            .unwrap();
         let tau = driver.step_free_torque(&[], &q, &qd, &qdd, None).unwrap();
         assert_eq!(tau, driver.inverse_dynamics(&q, &qd, &qdd).unwrap());
         driver.reset_torque_observer();
 
         // Vendor source: M qdd + C qd + G from aux, plus the host payload.
         let mut vendor = fake_driver();
-        vendor.arm.set_payload(Payload::new(1.0, [0.0, 0.0, 0.05])).unwrap();
+        vendor
+            .arm
+            .set_payload(Payload::new(1.0, [0.0, 0.0, 0.05]))
+            .unwrap();
         vendor.manifest.dynamics_source = DynamicsSource::Vendor;
         vendor.manifest.aux = AuxSchema::from_slice(&[
-            AuxField { label: aux_dynamics::GRAVITY_TORQUE, size: 6 },
-            AuxField { label: aux_dynamics::CORIOLIS_TORQUE, size: 6 },
-            AuxField { label: aux_dynamics::MASS_MATRIX, size: 36 },
+            AuxField {
+                label: aux_dynamics::GRAVITY_TORQUE,
+                size: 6,
+            },
+            AuxField {
+                label: aux_dynamics::CORIOLIS_TORQUE,
+                size: 6,
+            },
+            AuxField {
+                label: aux_dynamics::MASS_MATRIX,
+                size: 36,
+            },
         ])
         .unwrap();
         let mut state = [0.0; CoreState::LEN + 48];
@@ -1097,16 +1149,22 @@ mod tests {
             }
         }
         let p = vendor.arm.payload_torque(&q6, &qd6, &qdd6);
-        let tau = vendor.step_free_torque(&state, &q, &qd, &qdd, None).unwrap();
+        let tau = vendor
+            .step_free_torque(&state, &q, &qd, &qdd, None)
+            .unwrap();
         for i in 0..6 {
             let expected = 3.0 * qdd6[i] + 0.5 + 1.0 + i as f64 + p[i];
             assert!((tau[i] - expected).abs() < 1e-12, "joint {i}");
         }
         assert_eq!(tau[6..], [0.0, 0.0]);
         vendor.manifest.native_payload = true;
-        let native = vendor.step_free_torque(&state, &q, &qd, &qdd, None).unwrap();
+        let native = vendor
+            .step_free_torque(&state, &q, &qd, &qdd, None)
+            .unwrap();
         assert!((native[0] - (3.0 * qdd6[0] + 1.5)).abs() < 1e-12);
-        assert!(vendor.step_free_torque(&state[..10], &q, &qd, &qdd, None).is_none());
+        assert!(vendor
+            .step_free_torque(&state[..10], &q, &qd, &qdd, None)
+            .is_none());
 
         // A learned observer overrides the vendor terms.
         let bytes = spec().leak(11);
@@ -1119,7 +1177,9 @@ mod tests {
         let first6 = |t: [f64; MAX_DOF]| -> [f64; 6] { t[..6].try_into().unwrap() };
         // 500 Hz: the observer warms up for four ticks.
         for k in 0..12 {
-            let tau = vendor.step_free_torque(&state, &q, &qd, &qdd, Some(&cmd)).map(first6);
+            let tau = vendor
+                .step_free_torque(&state, &q, &qd, &qdd, Some(&cmd))
+                .map(first6);
             let expected =
                 reference.step_free_torque(&q6, &qd6, &qdd6, Some(&q6.map(|v| v + 0.02)), 500);
             assert_eq!(tau.is_none(), k < 4, "tick {k}");
@@ -1128,10 +1188,15 @@ mod tests {
         vendor.reset_torque_observer();
         reference.reset_torque_observer();
         assert_eq!(vendor.step_free_torque(&state, &q, &qd, &qdd, None), None);
-        assert_eq!(reference.step_free_torque(&q6, &qd6, &qdd6, None, 500), None);
+        assert_eq!(
+            reference.step_free_torque(&q6, &qd6, &qdd6, None, 500),
+            None
+        );
         for _ in 0..4 {
             assert_eq!(
-                vendor.step_free_torque(&state, &q, &qd, &qdd, None).map(first6),
+                vendor
+                    .step_free_torque(&state, &q, &qd, &qdd, None)
+                    .map(first6),
                 reference.step_free_torque(&q6, &qd6, &qdd6, None, 500)
             );
         }

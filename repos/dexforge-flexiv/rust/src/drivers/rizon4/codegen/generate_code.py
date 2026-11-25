@@ -8,7 +8,7 @@ and emits:
 * ``src/drivers/<arm>/consts.rs`` — per-sample DH (alpha/a/d/theta_offset),
   ``T_PRE_INV`` / ``T_POST_INV`` bridges, RR back-substitution metadata
   (linearity / left- & right-bilinear / drop joint), plus the full 7R POE
-  chain (axes / T_left / T_right), joint limits and the home pose.
+  chain (axes / T_left / T_right) and the home pose (joint limits live in arm.rs).
 * ``src/drivers/<arm>/pq.rs`` — the 16 per-sample ``(P_sin, P_cos, P_one, Q)``
   builders (``sympy.cse``'d, reproduced bit-for-bit) and a function-pointer
   table indexed by lock sample.
@@ -56,7 +56,6 @@ def _emit_consts(arm: str) -> None:
     axes7 = [np.asarray(a, dtype=np.float64) for a in ref._JOINT_AXES]
     tl7 = [np.asarray(m, dtype=np.float64) for m in ref._JOINT_T_LEFTS]
     tr7 = [np.asarray(m, dtype=np.float64) for m in ref._JOINT_T_RIGHTS]
-    limits = ref._JOINT_LIMITS
     t_home = np.asarray(ref.T_HOME, dtype=np.float64)
 
     o: list[str] = []
@@ -139,12 +138,6 @@ def _emit_consts(arm: str) -> None:
     o.append("pub(crate) const T_RIGHTS7: [[[f64; 4]; 4]; 7] = [")
     for m in tr7:
         o.append("    " + cg.rmat4(m) + ",")
-    o.append("];")
-    o.append("")
-    o.append("/// Joint angle limits `(lo, hi)` in radians, baked from `_JOINT_LIMITS`.")
-    o.append("pub(crate) const JOINT_LIMITS: [(f64, f64); 7] = [")
-    for lo, hi in limits:
-        o.append(f"    ({cg.rfloat(lo)}, {cg.rfloat(hi)}),")
     o.append("];")
     o.append("")
     o.append("/// Home pose: FK at q = [0; 7] (row-major 4x4). Sanity-check vs the URDF.")

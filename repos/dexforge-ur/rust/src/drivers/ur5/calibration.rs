@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use crate::drivers::ur5::arm::{nominal_chain, Ur5};
     use crate::drivers::ur5::driver::Ur5Driver;
-    use dexhal::math::{ArmDriver, ArmModel, Pose, MAX_DOF};
+    use dexhal::math::{ArmDriver, ArmModel, IkKind, Pose, MAX_DOF};
 
     /// Shape of a real controller file: other sections, comments, and large
     /// cancelling `d` deltas on the parallel axes.
@@ -292,7 +292,7 @@ delta_d = [ 1, 1, 1, 1, 1, 1]
             let shift = (reference.fixed_view::<3, 1>(0, 3) - nominal.fixed_view::<3, 1>(0, 3)).norm();
             assert!(shift > 1e-6 && shift < 5e-3, "shift {shift}");
             // IK on the calibrated model closes on the calibrated target.
-            let sol = driver.arm().inverse_kinematics(&fk, &padded(&q)).unwrap();
+            let sol = driver.arm().ik_one(&fk, &padded(&q), IkKind::Fast).unwrap();
             let back = driver.arm().forward_kinematics(&sol).unwrap();
             assert!(back[..3].iter().zip(&fk[..3]).all(|(a, b)| (a - b).abs() < 1e-6));
         }

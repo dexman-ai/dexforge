@@ -10,7 +10,8 @@
 //! **Raghavan-Roth** kernel. The whole sweep is implemented by the shared
 //! [`crate::drivers::rizon_common`] solver; this module only supplies the baked
 //! [`Model`] built from the generated [`consts`] / [`pq`] tables and re-exports
-//! the public surface (`solve`, `fk`, [`TolerancePolicy`]).
+//! the standard public surface (`solve`, `LOCKED_JOINT`, `LOCK_SAMPLES`,
+//! `lock_sample_solutions`, `fk`, [`TolerancePolicy`]).
 //!
 //! See [`crate::drivers::rizon_common`] for the algorithm and the
 //! deterministic-execution note.
@@ -22,6 +23,7 @@ use crate::drivers::rizon_common::{self, Model};
 pub use crate::drivers::rizon_common::{DOF, MAX_SOLUTIONS};
 pub use dexhal::math::tolerances::TolerancePolicy;
 
+use super::arm::Rizon4;
 use super::consts;
 use super::pq;
 
@@ -66,14 +68,29 @@ const MODEL: Model = Model {
     axes7: &consts::AXES7,
     t_lefts7: &consts::T_LEFTS7,
     t_rights7: &consts::T_RIGHTS7,
-    joint_limits: &consts::JOINT_LIMITS,
 };
 
-/// Inverse kinematics — mirrors `rizon4_ik.solve`.
-///
-/// Returns up to [`MAX_SOLUTIONS`] candidate joint vectors `[q1, .., q7]` in
-/// radians; unused slots are [`None`].
-#[allow(clippy::too_many_arguments)]
+/// The joint the sweep locks.
+pub const LOCKED_JOINT: usize = consts::LOCK_IDX;
+
+/// Lock-joint sample values of the sweep, in sweep order.
+pub const LOCK_SAMPLES: [f64; rizon_common::N_SAMPLES] = consts::LOCK_SAMPLES;
+
+/// Raw 7R candidates with lock joint [`LOCKED_JOINT`] pinned to `lock_value` (one
+/// of [`LOCK_SAMPLES`]). Unknown values give no candidates. The standard sample
+/// source of [`dexhal::math::single::seven_dof_one`]; refinement and acceptance
+/// are left to it, so `_policy` is unused.
+pub fn lock_sample_solutions(
+    t: &SMatrix<f64, 4, 4>,
+    lock_value: f64,
+    _policy: TolerancePolicy,
+) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
+    rizon_common::sample_candidates(&MODEL, lock_value, t)
+}
+
+/// Every inverse-kinematics solution — mirrors `rizon4_ik.solve`, with the
+/// full-sweep semantics of `ArmModel::flange_all`. `max_solutions` caps the
+/// returned set (after limits and seed ordering).
 pub fn solve(
     t: &SMatrix<f64, 4, 4>,
     max_solutions: Option<usize>,
@@ -83,16 +100,19 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 7]>; MAX_SOLUTIONS] {
-    rizon_common::solve(
+    let mut sols = rizon_common::solve::<Rizon4>(
         &MODEL,
         t,
-        max_solutions,
         q_seed,
         respect_limits,
         allow_refinement,
         policy,
         refinement_max_iters,
-    )
+    );
+    if let Some(cap) = max_solutions {
+        sols.iter_mut().skip(cap).for_each(|s| *s = None);
+    }
+    sols
 }
 
 /// Forward kinematics — mirrors `rizon4_ik.fk`.
@@ -113,6 +133,7 @@ pub fn fk(q: &[f64; 7]) -> SMatrix<f64, 4, 4> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexhal::math::{ArmModel, IkKind};
     use std::vec::Vec;
 
     fn tf_from_row_major(a: &[f64; 16]) -> SMatrix<f64, 4, 4> {
@@ -179,7 +200,7 @@ mod tests {
         let mut case_idx = 0usize;
         for (tf_arr, expected, singular) in &cases {
             let tf = tf_from_row_major(tf_arr);
-            let sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
+            let sols = Rizon4::flange_all(&tf, None, false, false, TolerancePolicy::DEFAULT, 15);
             let got: Vec<[f64; 7]> = sols.iter().flatten().copied().collect();
 
             // Soundness: every returned solution closes the target pose.
@@ -244,8 +265,8 @@ mod tests {
     fn respect_limits_subset() {
         for (tf_arr, _expected, _singular) in test_data::cases().iter().take(64) {
             let tf = tf_from_row_major(tf_arr);
-            let raw = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
-            let lim = solve(&tf, None, None, true, false, TolerancePolicy::DEFAULT, 15);
+            let raw = Rizon4::flange_all(&tf, None, false, false, TolerancePolicy::DEFAULT, 15);
+            let lim = Rizon4::flange_all(&tf, None, true, false, TolerancePolicy::DEFAULT, 15);
             let n_raw = raw.iter().flatten().count();
             let n_lim = lim.iter().flatten().count();
             assert!(
@@ -254,7 +275,7 @@ mod tests {
             );
             for q in lim.iter().flatten() {
                 for i in 0..7 {
-                    let (lo, hi) = consts::JOINT_LIMITS[i];
+                    let (lo, hi) = Rizon4::JOINT_LIMITS[i].unwrap();
                     assert!(
                         q[i] >= lo - 1e-9 && q[i] <= hi + 1e-9,
                         "respect_limits returned out-of-range joint {i}: {}",
@@ -266,16 +287,14 @@ mod tests {
     }
 
     #[test]
-    fn max_solutions_cap() {
+    fn flange_one_closes_nearest_flange_all_solution() {
         let (tf_arr, _, _) = &test_data::cases()[0];
         let tf = tf_from_row_major(tf_arr);
-        let all_sols = solve(&tf, None, None, false, false, TolerancePolicy::DEFAULT, 15);
-        let n_all: usize = all_sols.iter().flatten().count();
-        if n_all > 1 {
-            let capped = solve(&tf, Some(1), None, false, false, TolerancePolicy::DEFAULT, 15);
-            let n_capped: usize = capped.iter().flatten().count();
-            assert_eq!(n_capped, 1, "max_solutions=1 should return exactly 1 solution");
-        }
+        let all = Rizon4::flange_all(&tf, None, true, false, TolerancePolicy::DEFAULT, 15);
+        let seed = all.iter().flatten().next().copied().expect("reference pose has solutions");
+        let one = Rizon4::flange_one(&tf, &seed, IkKind::Fast, TolerancePolicy::DEFAULT, 15)
+            .expect("flange_one finds a solution from a valid seed");
+        assert!(fk_residual(&one, &tf) <= FK_RESIDUAL_TOL);
     }
 
     /// Item 54: a seeded solve keeps the seed's locked joint 2 (off the sample
@@ -290,8 +309,8 @@ mod tests {
         }
         for step in 0..20 {
             let target = fk(&q);
-            let sols = solve(&target, Some(1), Some(&seed), true, true, TolerancePolicy::DEFAULT, 15);
-            let sol = sols[0].expect("seeded solve finds a solution");
+            let sol = Rizon4::flange_one(&target, &seed, IkKind::Near, TolerancePolicy::DEFAULT, 15)
+                .expect("seeded solve finds a solution");
             assert_eq!(sol[2], seed[2], "step {step}");
             assert!(fk_residual(&sol, &target) < 1e-9, "step {step}");
             let jump = sol.iter().zip(&seed).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);

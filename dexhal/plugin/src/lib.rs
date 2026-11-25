@@ -46,8 +46,8 @@ use core::ffi::c_void;
 
 use dexhal::math::{
     ArmError, ArmManifest, AuxField, AuxSchema, CalibrationData, ComplianceLimits,
-    ContractVersion, DynamicsSource, DynamicsState, ModelCapabilities, ModelError, WrenchFrame,
-    MAX_AUX_FIELDS, MAX_DOF,
+    ContractVersion, DynamicsSource, DynamicsState, IkKind, ModelCapabilities, ModelError,
+    WrenchFrame, MAX_AUX_FIELDS, MAX_DOF,
 };
 
 mod export;
@@ -58,7 +58,7 @@ pub use host::{LoadedDriver, LoadedMath, Plugin, PluginError};
 
 /// Version of [`PluginVTable`] and the types it passes. Bumped on any change
 /// to their layout.
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// Name of the entry point a driver library exports (an [`EntryFn`]).
 pub const ENTRY_SYMBOL: &str = "dexhal_plugin_entry";
@@ -224,6 +224,21 @@ const fn wrench_frame_from_code(code: u8) -> Option<WrenchFrame> {
         0 => Some(WrenchFrame::Base),
         1 => Some(WrenchFrame::Flange),
         2 => Some(WrenchFrame::Tcp),
+        _ => None,
+    }
+}
+
+const fn ik_kind_code(kind: IkKind) -> u8 {
+    match kind {
+        IkKind::Fast => 0,
+        IkKind::Near => 1,
+    }
+}
+
+const fn ik_kind_from_code(code: u8) -> Option<IkKind> {
+    match code {
+        0 => Some(IkKind::Fast),
+        1 => Some(IkKind::Near),
         _ => None,
     }
 }
@@ -606,17 +621,23 @@ pub struct PluginVTable {
         unsafe extern "C" fn(math: MathHandle, q: *const Q, out: *mut [Q; 6]) -> bool,
     pub math_jacobian_pseudo_inverse:
         unsafe extern "C" fn(math: MathHandle, q: *const Q, out: *mut [[f64; 6]; MAX_DOF]) -> bool,
-    pub math_inverse_kinematics: unsafe extern "C" fn(
+    /// `kind` is an `IkKind` code (0 = Fast, 1 = Near); an unknown code
+    /// returns `false`.
+    pub math_ik_one: unsafe extern "C" fn(
         math: MathHandle,
         target: *const [f64; 7],
         seed: *const Q,
+        kind: u8,
         out: *mut Q,
     ) -> bool,
-    /// Writes up to `cap` solutions to `out` (driver order, no seed ranking)
-    /// and the number written to `count`. Returns `false` on a panic.
-    pub math_inverse_kinematics_all: unsafe extern "C" fn(
+    /// Writes every solution to `out` (sorted nearest-first when `seed` is
+    /// non-null, otherwise driver order) and the number written to `count`.
+    /// A `cap` below the solution count writes the first `cap` solutions
+    /// (the nearest when seeded). Returns `false` on a panic.
+    pub math_ik_all: unsafe extern "C" fn(
         math: MathHandle,
         target: *const [f64; 7],
+        seed: *const Q,
         out: *mut Q,
         cap: usize,
         count: *mut usize,
@@ -744,7 +765,7 @@ mod tests {
     fn manifest_desc_round_trips_and_validates_dynamics_flags() {
         use dexhal::math::{
             aux_dynamics,
-            model::{ArmModel, Pose},
+            model::{ArmModel, IkKind, Pose},
             tolerances::TolerancePolicy,
             JointRatings,
         };
@@ -759,9 +780,8 @@ mod tests {
             fn flange_jacobian(_q: &[f64; 2]) -> [[f64; 2]; 6] {
                 [[0.0; 2]; 6]
             }
-            fn flange_solve(
+            fn flange_all(
                 _t: &Pose,
-                _m: Option<usize>,
                 _s: Option<&[f64; 2]>,
                 _l: bool,
                 _r: bool,
@@ -769,6 +789,15 @@ mod tests {
                 _i: usize,
             ) -> [Option<[f64; 2]>; 1] {
                 [None]
+            }
+            fn flange_one(
+                _t: &Pose,
+                _s: &[f64; 2],
+                _k: IkKind,
+                _p: TolerancePolicy,
+                _i: usize,
+            ) -> Option<[f64; 2]> {
+                None
             }
         }
 
