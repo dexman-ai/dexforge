@@ -27,15 +27,16 @@ priority within each group. Tags mark work that reaches outside dexhal:
 
 ## P0 — correctness of the hot path
 
-The kernel calls `inverse_kinematics` every control cycle and writes the result
+The kernel calls `ik_one` (`IkKind::Fast`) every control cycle and writes the result
 straight to `target_q`.
 
-1. Done: **Seeded calibrated IK.** `ik_nearest` asks the driver's solve for the
-   one solution nearest the seed and polishes only that. Was: Replace `ik_nearest`'s solve-and-polish-every-branch
+1. Done: **Seeded calibrated IK.** `ik_one` asks the driver for one
+   seeded solution and polishes only that. Was: Replace `ik_nearest`'s solve-and-polish-every-branch
    with: pick the nominal branch nearest the seed, then polish only that one on
    the calibrated chain.
-2. Done: **Continuity guard in `ik_nearest`.** `ik_max_joint_step` (default
-   π/2), settable on `Arm`, `ArmMath` and `ArmDriver`. Was: Return `None` (or a flagged result)
+2. Done: **Continuity guard in `ik_one`.** `ik_max_joint_step` (default
+   π/2, enforced per candidate after polishing; can only be tightened; the
+   7-DOF lock joint is further bounded by `IK_LOCK_MAX_STEP` = π/8), settable on `Arm`, `ArmMath` and `ArmDriver`. Was: Return `None` (or a flagged result)
    when the nearest solution is further from the seed than a configurable
    joint-step bound, instead of silently jumping branches.
 3. Done: **Calibrated `ik` fixes.** Polish before truncating to `max_solutions`,
@@ -209,8 +210,9 @@ straight to `target_q`.
     Manifests are done for every driver. Open: the four I/O methods are still
     `TODO(agent)` stubs; they need each vendor's SDK / protocol and hardware
     to test against.
-35. Done: **[dexzero] Kernel use of the continuity bound.** `inverse_kinematics`
-    returns `None` when the solution is more than π/2 from the seed; DexZero's
+35. Done: **[dexzero] Kernel use of the continuity bound.** `ik_one`
+    returns `None` when no solution is within π/2 per joint of the seed
+    (`IK_DEFAULT_MAX_JOINT_STEP`; 7-DOF lock joint π/8, checked on every candidate after polishing); DexZero's
     scrubber interpolates waypoints densely enough to stay inside the bound and
     falls back to a damped least-squares step (`compliance.md` §7).
 
@@ -491,7 +493,7 @@ Each item below originates from the gap analysis in `c:\code\dexzero\workitems.m
     (DexZero items 15, 19).
     - **Recommendation (based on DexZero requirements):**
       - When `q_seed: Some(seed)` is passed to a 7-DOF `solve()` (which is what
-        `Arm::ik_nearest` and `ArmDriver::inverse_kinematics` always do), compute
+        `Arm::ik_nearest` and `ArmDriver::inverse_kinematics` did then), compute
         the 6R sub-chain geometry online at the locked angle `q_lock = seed[LOCKED_JOINT]`
         first (or run the analytical 6R solve at `seed[LOCKED_JOINT]` followed by
         full 7-DOF damped least-squares / Levenberg-Marquardt polish with diagonal
@@ -502,7 +504,7 @@ Each item below originates from the gap analysis in `c:\code\dexzero\workitems.m
         `q_seed` when seeded, so that even if a grid sample is used as an initial
         guess, polishing converges onto a solution that preserves the seed's
         redundant posture rather than pinning the locked joint to the coarse grid.
-    - **Done:** a seeded solve polishes the seed and every sweep solution with the locked joint held at `seed[LOCKED_JOINT]` (`seed_locked`), keeps the FK-verified ones and falls back to the sweep only when none closes, in `franka_panda`, `xarm7`, `rizon4` and `rizon10` (test `seeded_solve_keeps_the_seed_locked_joint`). The codegen guides require the same for new joint-lock arms.
+    - **Done:** superseded by item 61. `ik_one` with `IkKind::Near` holds the locked joint at `seed[LOCKED_JOINT]` in every stage (seed-lock polish, then the two nearest samples re-polished at the seed value, then masked DLS from the seed); `IkKind::Fast` starts with full-joint DLS and may move it. `ik_all` always runs the full sweep. Shared by every joint-lock arm through `dexhal::math::single::seven_dof_one` (tests `seeded_solve_keeps_the_seed_locked_joint` in `rizon4` / `rizon10`, Near/Fast path tracking in each joint-lock crate's `rust/tests/ik_path.rs`, shared checks in `dexhal/conformance/ik_path.rs`).
 55. Done: **[dexhal] Null space under native Cartesian control (from `dexzero/workitems.md` G20).**
     For a redundant arm the contract neither declares what a native Cartesian
     impedance or admittance controller does with the null space nor lets the
@@ -613,9 +615,36 @@ Each item below originates from the gap analysis in `c:\code\dexzero\workitems.m
     `damped_least_squares`, `weighted_damped_least_squares`,
     `dynamically_consistent_pseudo_inverse`, `nullspace_project_torque`,
     `solve_mass_matrix`, and `payload_wrench_at_tcp`. IK stays
-    `ArmMath::inverse_kinematics` (the driver's closed-form solve with its
-    bounded polish); there is no generic DLS IK fallback in `dexhal`, so a
-    caller needing one for a model without a closed-form solver (`MockArm`)
-    builds it from `damped_least_squares`. `dexzero` (`sim` and `kernel`) now imports zero
+    `ArmMath::ik_one` / `ik_all` (the driver's closed-form solve with its
+    bounded polish, see item 61). `kinematics::dls_ik` is used internally by
+    the 7-DOF `Fast` stage; a caller needing a generic DLS IK for a model
+    without a closed-form solver (`MockArm`) builds it from
+    `damped_least_squares`. `dexzero` (`sim` and `kernel`) now imports zero
     `nalgebra` items and owns strictly time, trajectories, PD control laws, and
     safety state machines.
+61. Done: **[dexhal] [driver] [codegen] Unified IK entry points and shared IK code.**
+    - **API.** `Arm::ik_all(target, q_seed, ..)` returns every solution (no
+      early exit; joint-lock arms run the full sweep), sorted nearest-first to
+      the seed. `Arm::ik_one(target, q_seed, kind, policy)` returns one
+      solution and exits early; `kind: IkKind` is `Fast` (default) or `Near`.
+      6-DOF: `Fast` runs a seeded analytic `refine6` first and falls back to the
+      enumeration; `Near` ranks the enumeration by seed distance (nearest).
+      7-DOF: `Fast` = full-joint DLS, then seed-lock polish, then the two
+      nearest lock samples pinned to the sample value; `Near` = seed-lock
+      polish (20 iterations), then the two nearest samples with the lock at
+      the seed value, then masked DLS from the seed with the lock at the seed
+      value (150 iterations). Every stage returns its first accepted solution,
+      so 7-DOF `Near` is nearest only by stage order. The servo path
+      (`sim_driver.py`, README examples) uses `Fast`.
+    - **Contract / plugin.** `ArmMath::ik_one(.., kind)` / `ik_all(.., out)`;
+      plugin ABI 4 (`math_ik_one` with a `u8` kind code, `math_ik_all`). A
+      short `ik_all` buffer receives as many (nearest) solutions as fit.
+    - **Shared code.** `math::single` (`six_dof_one`, `seven_dof_one`),
+      `math::closed_form` (`finish6`, analytic `refine6`) for UR5 / UR3e / Z1 /
+      Piper, `math::jointlock` (spherical-inner joint-lock 7R) for xArm7 /
+      Franka, shared Raghavan–Roth helpers for Piper / Rizon, and
+      `dexforge-ur`'s `drivers/ur_common.rs` (UR5 / UR3e differ only in a
+      `Model` of geometry literals). No driver uses finite differences.
+    - **Perf.** `dexhal/perf/arm_timing.rs` reports mean, robust max (10
+      slowest seeds re-run 100× each) and hit rate for `ik_all`, `ik_one`
+      (`Fast`) and `dls_ik`; results in the root README.

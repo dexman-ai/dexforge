@@ -4,7 +4,8 @@
 //! `ur3e.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
-use dexhal::math::{ArmModel, ChainJoint, JointLimit, KinematicChain, Pose, TolerancePolicy};
+use dexhal::math::single::{self, CANDIDATES};
+use dexhal::math::{ArmModel, ChainJoint, IkKind, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{generated_dynamics, generated_kinematics, ik_solver};
 
@@ -61,15 +62,24 @@ pub fn nominal_chain() -> KinematicChain<DOF> {
 /// Ur3e (6-DOF) model marker.
 pub struct Ur3e;
 
+/// Raw closed-form candidates for `target`, padded to [`CANDIDATES`].
+fn raw_candidates(target: &Pose, policy: TolerancePolicy) -> ([[f64; DOF]; CANDIDATES], usize) {
+    let mut raw = [[0.0; DOF]; 8];
+    let n = ik_solver::solve_algebraic(target, &mut raw, policy);
+    let mut out = [[0.0; DOF]; CANDIDATES];
+    out[..n].copy_from_slice(&raw[..n]);
+    (out, n)
+}
+
 impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
     const NAME: &'static str = "ur3e";
     const JOINT_LIMITS: [JointLimit; DOF] = [
-        Some((-6.283185307179586, 6.283185307179586)),
-        Some((-6.283185307179586, 6.283185307179586)),
-        Some((-3.141592653589793, 3.141592653589793)),
-        Some((-6.283185307179586, 6.283185307179586)),
-        Some((-6.283185307179586, 6.283185307179586)),
-        Some((-6.283185307179586, 6.283185307179586)),
+        Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
+        Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
+        Some((-core::f64::consts::PI, core::f64::consts::PI)),
+        Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
+        Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
+        Some((-core::f64::consts::TAU, core::f64::consts::TAU)),
     ];
     const HAS_DYNAMICS: bool = true;
 
@@ -85,9 +95,8 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
     }
 
     #[inline]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -96,12 +105,30 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
         ik_solver::solve(
             target,
-            max_solutions,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
+        )
+    }
+
+    #[inline]
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]> {
+        single::six_dof_one::<Ur3e, MAX_SOLUTIONS>(
+            target,
+            q_seed,
+            kind,
+            policy,
+            refinement_max_iters,
+            || raw_candidates(target, policy),
         )
     }
 
@@ -134,6 +161,7 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Ur3e {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexhal::math::single::within_max_joint_step;
     use dexhal::math::DEFAULT_TOLERANCE_POLICY;
 
     /// Deterministic joint vectors inside the joint limits.
@@ -166,13 +194,12 @@ mod tests {
     }
 
     #[test]
-    fn flange_solve_closes_on_fk_targets() {
+    fn flange_all_closes_on_fk_targets() {
         for k in 0..16 {
             let q = sample(k);
             let target = Ur3e::flange_fk(&q);
-            let sols = Ur3e::flange_solve(
+            let sols = Ur3e::flange_all(
                 &target,
-                None,
                 Some(&q),
                 true,
                 false,
@@ -184,6 +211,45 @@ mod tests {
             for sol in sols.iter().flatten() {
                 assert!((Ur3e::flange_fk(sol) - target).norm() < 1e-5);
             }
+        }
+    }
+
+    #[test]
+    fn flange_one_near_matches_nearest_of_full_set() {
+        let policy = DEFAULT_TOLERANCE_POLICY;
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Ur3e::flange_fk(&q);
+            for off in [-0.4, -0.1, 0.05, 0.3] {
+                let seed: [f64; DOF] = core::array::from_fn(|i| q[i] + if i % 2 == 0 { off } else { -off });
+                let single = Ur3e::flange_one(&target, &seed, IkKind::Near, policy, 15);
+                let full = Ur3e::flange_all(&target, Some(&seed), true, true, policy, 15);
+                // Near returns the nearest solution that passes the per-joint step gate.
+                let expected = full.iter().flatten().find(|b| within_max_joint_step(b, &seed));
+                match (single, expected) {
+                    (Some(a), Some(b)) => {
+                        assert!((Ur3e::flange_fk(&a) - target).norm() < 1e-5);
+                        assert!(
+                            (0..DOF).all(|i| libm::fabs(libm::remainder(a[i] - b[i], core::f64::consts::TAU)) < 1e-2),
+                            "single {a:?} != nearest gated {b:?}"
+                        );
+                    }
+                    (None, None) => {}
+                    _ => panic!("single/full disagree on existence: {single:?} vs {expected:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flange_one_fast_closes_and_respects_limits() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Ur3e::flange_fk(&q);
+            let got = Ur3e::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable in-limit target has a solution");
+            assert!((Ur3e::flange_fk(&got) - target).norm() < 1e-5);
+            assert!(dexhal::math::postprocess::within_limits(&got, &Ur3e::JOINT_LIMITS));
         }
     }
 
@@ -222,9 +288,8 @@ mod tests {
             }
             let target = Ur3e::flange_fk(&q);
 
-            let sols = Ur3e::flange_solve(
+            let sols = Ur3e::flange_all(
                 &target,
-                None,
                 None,
                 false,
                 false,
@@ -241,9 +306,8 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = Ur3e::flange_solve(
+                let tight_sols = Ur3e::flange_all(
                     &target,
-                    None,
                     None,
                     false,
                     true,

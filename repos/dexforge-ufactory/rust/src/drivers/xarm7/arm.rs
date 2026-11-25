@@ -4,9 +4,11 @@
 //! `xarm7.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
+use dexhal::math::model::IkKind;
+use dexhal::math::single;
 use dexhal::math::{ArmModel, ChainJoint, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
-use super::{generated_dynamics, generated_kinematics, ik_solver};
+use super::{consts, generated_dynamics, generated_kinematics, ik_solver};
 
 /// Actuated joints, base → flange.
 pub const DOF: usize = 7;
@@ -65,6 +67,7 @@ pub struct Xarm7;
 
 impl ArmModel<DOF, MAX_SOLUTIONS> for Xarm7 {
     const NAME: &'static str = "xarm7";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
         Some((-6.2832, 6.2832)),
         Some((-2.059, 2.0944)),
@@ -88,9 +91,8 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Xarm7 {
     }
 
     #[inline]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -99,12 +101,32 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Xarm7 {
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
         ik_solver::solve(
             target,
-            max_solutions,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
+        )
+    }
+
+    #[inline]
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]> {
+        single::seven_dof_one::<Self, MAX_SOLUTIONS>(
+            target,
+            q_seed,
+            kind,
+            policy,
+            refinement_max_iters,
+            ik_solver::LOCKED_JOINT,
+            &consts::LOCK_SAMPLES,
+            |v| ik_solver::lock_sample_solutions(target, v, policy),
         )
     }
 
@@ -169,23 +191,32 @@ mod tests {
     }
 
     #[test]
-    fn flange_solve_closes_on_fk_targets() {
+    fn flange_all_closes_on_fk_targets() {
         for k in 0..16 {
             let q = sample(k);
             let target = Xarm7::flange_fk(&q);
-            let sols = Xarm7::flange_solve(
-                &target,
-                None,
-                Some(&q),
-                true,
-                false,
-                DEFAULT_TOLERANCE_POLICY,
-                15,
-            );
+            let sols = Xarm7::flange_all(&target, Some(&q), true, false, DEFAULT_TOLERANCE_POLICY, 15);
             let first = sols[0].expect("a reachable in-limit target has a solution");
             assert!((Xarm7::flange_fk(&first) - target).norm() < 1e-5);
             for sol in sols.iter().flatten() {
                 assert!((Xarm7::flange_fk(sol) - target).norm() < 1e-5);
+            }
+        }
+    }
+
+    #[test]
+    fn flange_one_closes_and_near_returns_seed_configuration() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Xarm7::flange_fk(&q);
+            let fast = Xarm7::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable target has a single solution");
+            assert!((Xarm7::flange_fk(&fast) - target).norm() < 1e-5);
+            let near = Xarm7::flange_one(&target, &q, IkKind::Near, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("the seed is itself a root");
+            assert!((Xarm7::flange_fk(&near) - target).norm() < 1e-5);
+            for i in 0..DOF {
+                assert!((near[i] - q[i]).abs() < 1e-5, "Near drifted from seed at joint {i}");
             }
         }
     }
@@ -225,15 +256,7 @@ mod tests {
             }
             let target = Xarm7::flange_fk(&q);
 
-            let sols = Xarm7::flange_solve(
-                &target,
-                None,
-                None,
-                false,
-                false,
-                DEFAULT_TOLERANCE_POLICY,
-                15,
-            );
+            let sols = Xarm7::flange_all(&target, None, false, false, DEFAULT_TOLERANCE_POLICY, 15);
             assert!(
                 sols.iter().any(Option::is_some),
                 "non-singular reachable pose returned no IK at q={q:?}"
@@ -244,15 +267,7 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = Xarm7::flange_solve(
-                    &target,
-                    None,
-                    None,
-                    false,
-                    true,
-                    tight_policy,
-                    15,
-                );
+                let tight_sols = Xarm7::flange_all(&target, None, false, true, tight_policy, 15);
                 assert!(
                     tight_sols.iter().any(Option::is_some),
                     "tight-policy pose returned no IK at q={q:?}"

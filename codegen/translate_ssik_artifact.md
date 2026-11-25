@@ -17,7 +17,7 @@ real-time control loop. Write the files directly with your file tools.
    (`crate::math::...`). Their algorithms and tests are valid; when copying,
    import the same items from `dexhal::math` instead (e.g.
    `use dexhal::math::ssik_core::{sp6_solve, wrap_to_pi};`,
-   `use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff};`).
+   `use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff, residual_columns};`).
 
 ## 2. The `dexhal::math` boundary (CRITICAL)
 
@@ -32,7 +32,8 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
   `lm_refine` or root-finding helpers, call the matching `dexhal::math`
   function (`ssik_core::sp6_solve`, `ssik_core::rr_real_roots`, and
   `kinematics::lm_refine_masked_analytic` fed by `kinematics::residual_columns`,
-  not the finite-difference `lm_refine6`/`lm_refine`). If a needed kernel is
+  not the finite-difference `lm_refine`/`lm_refine_masked`; `lm_refine6` is
+  analytic and takes a Jacobian closure). If a needed kernel is
   missing from `dexhal`, stop and report it instead of writing a local copy.
 - **No finite-difference Jacobians (CRITICAL).** Never write a finite-difference
   (FD) Jacobian in `ik_solver.rs`, including in refinement, `jac` helpers or
@@ -83,87 +84,133 @@ wrapping), `kinematics` (LM refinement, pose differences), `postprocess`
 
    FK and the Jacobian come from `generated_kinematics`; do not add another
    public FK (an internal chain FK used on the refinement hot path is fine).
+
+   **Entry points.** `solve(max_solutions = None, q_seed = Some(seed), ...)` is
+   `ik_all`: it returns every solution (up to `MAX_SOLUTIONS`), sorted
+   nearest-first by distance to the seed. It never early-exits, and joint-lock
+   arms run the full lock sweep. `ik_one(target, q_seed, kind, policy)` is the
+   single-solution path defined in items 7–8; it is the only caller that
+   early-exits or applies `Fast`/`Near`.
 4. **Domain guards.** Every `acos` / `asin` / `sqrt` argument that can leave its
    domain is checked against the `policy` tolerances and the branch is skipped
    (`continue`), never `NaN` or a panic.
 5. **Post-processing.** With `respect_limits`, drop solutions outside
    `JOINT_LIMITS`; with `q_seed`, order nearest-first; honour `max_solutions`.
-   Use the `dexhal::math::postprocess` helpers like the reference arm does.
-   Joint-lock (`jointlock.*`) solvers additionally hold the locked joint at
-   the seed's value on a seeded solve. Visit the lock samples nearest-first
-   (by wrap-to-pi distance of the sample to `q_seed[LOCKED_JOINT]`). After each
-   sample's candidates are collected, polish them with the reference arm's
-   `seed_locked` (locked joint set to the seed's value, seed also used as a
-   start). The first sample that yields a result ends the sweep. Polish the
-   seed itself only on the first `seed_locked` call: it is the same start for
-   every sample. When no sample closes, keep the sweep's post-processed result
-   without polishing the sweep solutions again (they already failed the same
-   deterministic polish).
-7. **7-DOF joint-lock `ik_nearest` flavors.** For every 7-DOF joint-lock arm
-   (categories 3–4), provide `Firm` and `Relaxed` flavors through an extra
-   `JointLockFlavor` argument on the generated seeded `ik_nearest` path. Both
-   flavors use three stages, accept a stage only with the checks below, and
-   hand off to the next stage when no candidate is accepted.
+   Use the shared dexhal helpers rather than per-arm copies: 6-DOF
+   closed-form solvers hand their raw candidates to
+   `dexhal::math::closed_form::finish6` (FK gate or analytic `refine6`, dedup
+   mod 2π, limits, seed sort, truncate); joint-lock solvers use
+   `dexhal::math::postprocess` (`dedup_solutions`, `wrap_to_limits`,
+   `within_limits`, `nearest_to_seed`). FK, Jacobian and limits come from the
+   arm's `ArmModel`; do not duplicate `JOINT_LIMITS` in `ik_solver.rs`. Code
+   shared by every arm of one solver family lives once: at OEM level in a
+   `drivers/<family>_common.rs` with a per-arm `Model` of constants
+   (`rizon_common.rs`, `ur_common.rs`), and across OEMs in dexhal
+   (`math::jointlock` for spherical-inner joint-lock 7R arms, shared
+   Raghavan–Roth helpers for general-6R inner solves). `solve` (`ik_all`) never
+   locks to the seed and never early-exits: joint-lock arms run the full lock
+   sweep and the seed only orders the result.
+7. **7-DOF joint-lock `ik_one` kinds.** For every 7-DOF joint-lock arm
+   (categories 3–4), `ik_one` takes `kind: IkKind` (`Fast` or `Near`, default
+   `Fast`) on the generated seeded path. Both kinds use three stages, accept a
+   stage only with the checks below, and hand off to the next stage when no
+   candidate is accepted. Stage 2 always uses only the two lock samples
+   bracketing the seed; it never runs a full lock sweep. The kinds do not
+   return the same set of solutions for 7-DOF, so do not document identical
+   coverage between them.
 
-   - **Firm:** preserve the locked joint at `q_seed[LOCKED_JOINT]` throughout
+   - **Near:** preserve the locked joint at `q_seed[LOCKED_JOINT]` throughout
      all stages. Stage 1 is the seed-first masked analytic LM polish (20
      iterations). Stage 2 tries the nearest lock samples bracketing the seed
      with the closed-form per-sample solve; use each sample to generate
      candidates, then set the locked joint to the seed value and polish only
      the other joints with `lm_refine_masked_analytic` (15 iterations). Stage 3
-     is analytic masked refinement from the seed (20 iterations), again with
-     the locked joint removed from the free set. Use
-     `lm_refine_masked_analytic` and apply the FK acceptance gate; never run
-     full-joint `dls_ik` in this flavor.
-   - **Relaxed:** Stage 1 runs `kinematics::dls_ik` from `q_seed` for 20
-     iterations with all joints free, allowing the redundant joint to move.
-     Stage 2 tries the nearest lock samples bracketing the seed with the
-     closed-form per-sample solve, snaps each candidate's locked joint to that
-     sample value, and polishes only the other joints with
-     `lm_refine_masked_analytic` (15 iterations). Stage 3 is the seed-first
-     masked analytic LM polish (20 iterations), locking the redundant joint
-     at its seed value.
+     is DLS from the seed with the locked joint held at the seed value: the
+     damped least-squares solve of `dls_ik`, restricted to the free joints
+     (`lm_refine_masked_analytic`) with the full `DLS_MAX_ITERS` (150)
+     budget, then the FK acceptance gate. It shares stage 1's damped core and
+     start, so it differs from stage 1 only by budget and rescues seeds that
+     converge slowly. Never run full-joint `dls_ik` in this kind.
+   - **Fast:** flips the order so DLS runs first. Stage 1 runs
+     `kinematics::dls_ik` from `q_seed` for 20 iterations with all joints free,
+     allowing the redundant joint to move. Stage 2 is the seed-first masked
+     analytic LM polish (20 iterations), locking the redundant joint at its seed
+     value. Stage 3 tries the two bracketing lock samples with the closed-form
+     per-sample solve, snaps each candidate's locked joint to that sample value
+     (not the seed), and polishes only the other joints with
+     `lm_refine_masked_analytic` (15 iterations).
 
    Use the analytic Jacobian (`residual_columns`); never finite differences.
-   Stage 2 drops candidates whose FK residual before polishing exceeds
-   `policy.subproblem_numerical`. Keep the accepted candidate nearest the seed
-   (`wrap_distance`) when a stage produces multiple candidates.
+   Candidates are filtered only after polishing (see **Acceptance**). **Early exit:**
+   every stage returns its first accepted solution. The sample stage visits
+   the nearer sample first and, within a sample, polishes candidates in order
+   of `wrap_distance` to the seed. `Near` is therefore nearest only
+   approximately, by stage order. Shared implementation:
+   `dexhal::math::single::seven_dof_one`.
+   Path-tracking tests (Near keeps the locked joint at the seed, Fast does not
+   jump) go in the crate's `rust/tests/ik_path.rs`, which calls the shared
+   `dexhal/conformance/ik_path.rs` (`track_path`). Do not put them in the
+   generated `arm.rs`, which `scaffold.py` overwrites.
 
-   **Acceptance:** reject non-finite output, unwrap each joint to the 2π turn
-   nearest the seed when that turn is within its limits, require the result to
+   **Acceptance:** every proposed solution (6-DOF and 7-DOF, every stage, both
+   kinds) is checked after polishing, never before. Reject non-finite output,
+   unwrap each joint to the 2π turn nearest the seed when that turn is within
+   its limits, reject the candidate if any joint is more than
+   `IK_DEFAULT_MAX_JOINT_STEP` (π/2) from the seed or, for 7-DOF, the lock
+   (redundant) joint is more than `single::IK_LOCK_MAX_STEP` (π/8) from the
+   seed, require the result to
    be within `JOINT_LIMITS`, and require FK residual ≤
-   `policy.subproblem_numerical` (`1e-5`). Do not hard-code a joint-step
-   threshold in the generated solver: the owning `Arm` applies its configured
-   `ik_max_joint_step` after the solver returns, including values set through
-   `Arm::set_ik_max_joint_step`.
+   `policy.subproblem_numerical` (`1e-5`). The lock bound limits how far the
+   redundant joint can jump in `Fast` (free in DLS, pinned to a sample in the
+   sample stage); `Near` holds it at the seed value. A rejected candidate does not end
+   the search; the next candidate or stage is tried. The gate lives in
+   `dexhal::math::single::accept`; do not reimplement it in the generated
+   solver. The owning `Arm` then applies its configured `ik_max_joint_step`,
+   which `Arm::set_ik_max_joint_step` can tighten below π/2 but not loosen.
+   Tests that compare `flange_one(Near)` against `flange_all` must expect the
+   nearest solution that passes `single::within_max_joint_step`, not simply
+   the nearest one.
 
    **Do not** add a FLOP budget or a capped variant. The speedup comes from the
-   seed-first firm polish and relaxed full-joint DLS handling common seeds,
-   while the sample stage avoids the full sweep.
+   seed-first polish in `Near` and the full-joint DLS start in `Fast`, while the
+   sample stage avoids the full sweep.
 
    **Historical measured reference (Rizon 4 and Rizon 10, 7-DOF, joint lock).**
-   These figures describe the pre-flavor staged baseline, not measurements of
-   the Firm and Relaxed variants above. Seeds drawn
+   These figures describe the pre-`ik_one` staged baseline, not measurements of
+   the `Fast` or `Near` kinds above. Seeds drawn
    from the perf harness (`dexhal/perf/arm_timing.rs`). Mean ≈ 9 µs for the
-   staged flavour, against ≈ 21 µs for production `ik_nearest` and ≈ 600 µs for
+   staged flavour, against ≈ 21 µs for production `ik_one` and ≈ 600 µs for
    the full `ik_all` sweep. On 10k seeds, 9989/10000 (Rizon 4) and 9990/10000
    (Rizon 10) solved. The unsolved seeds are all stage-3 joint-limit violations
    (11 and 10). Standalone `dls_ik` with the same acceptance solved 99.31% and
    99.41%. Use these numbers as a sanity check when a regenerated arm lands far
    off, not as a pass/fail bar.
-8. **6-DOF seeded early exit (closed-form arms).** For a 6-DOF closed-form
-   arm, `solve(max_solutions = Some(1), q_seed = Some(seed))` takes a
-   nearest-first early exit instead of the full sort. Rank the raw algebraic
-   candidates by `seed_dist` before refinement, then accept candidates in
-   rank order through the same FK / refine / joint-limit gate as the full
-   path. Return the first that passes. Skip dedup and the full sort on this
-   path; the first accepted candidate cannot be a duplicate. No lock and no
-   `Firm` / `Relaxed` flavors apply to 6-DOF arms. The ranking uses
-   pre-refinement distance, so equivalence with the full set holds on the
-   tested configurations but is not proven. Reference:
-   `repos/dexforge-ur/rust/src/drivers/ur5/ik_solver.rs` (`nearest_accepted`,
-   `accept_candidate`) and its `seeded_single_solution_matches_nearest_of_full_set`
-   test.
+8. **`ik_one` kinds for 6-DOF closed-form arms.** The same
+   `ik_one(target, q_seed, kind, policy)` entry point applies. There is no lock.
+   - **`Fast`:** first run a seeded `refine6(q_seed, target)` (analytic-Jacobian
+     LM). If the result passes the FK and joint-limit gate, return it. Otherwise
+     fall back to the closed-form enumeration. Faster convergence; the result is
+     a converged root that is not guaranteed to be the closest.
+   - **`Near`:** skip the refine-first shortcut. Enumerate the closed-form
+     candidates, refine and gate them, and return the one nearest the seed
+     (wrap-to-π distance). Slower; the result is the closest solution.
+
+   Both kinds return a solution whenever the target is reachable.
+
+   The `Near` path ranks the raw algebraic candidates by `seed_dist` before
+   refinement and accepts them in rank order, returning the first that passes.
+   Skip dedup and the full sort on this path; the first accepted candidate
+   cannot be a duplicate. The ranking uses pre-refinement distance, so
+   equivalence with the full set holds on the tested configurations but is
+   not proven. Reference: `dexhal::math::single::six_dof_one` (shared by every
+   6-DOF arm; the driver supplies only its raw candidates) and the
+   `flange_one_near_matches_nearest_of_full_set` test in each `arm.rs`.
+   **Piper (general 6R).** Enumeration is slow, so `Fast` matters most here:
+   the seeded `refine6` usually closes and the enumeration is skipped. The
+   result is the nearest converged LM root from the seed, not the global
+   nearest: on 2000 randomized in-limit poses with seeds perturbed by
+   ±0.05 rad, 0 solutions were lost and 18 (0.9%) differed from the full-set
+   nearest. `Near` on Piper is the full enumeration ranked by seed distance.
 
 ## 5. Tests
 

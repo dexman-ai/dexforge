@@ -104,25 +104,25 @@ and `nominal_chain()`. Existing files are kept unless `--force`; use
    Respect joint limits when asked, order nearest-first when `q_seed` is given,
    guard every `acos`/`asin`/`sqrt` domain edge, and include the reference arm's
    IK tests against `test_data.rs` (`#[cfg(test)] #[path = "test_data.rs"] mod test_data;`).
-   Joint-lock 7-DOF arms (categories 3–4) must hold the locked joint at the
-   seed's value on a seeded solve. Copy the reference arm's seeded early exit:
-   visit lock samples nearest-first to `q_seed[LOCKED_JOINT]`, polish each
-   sample's candidates with `seed_locked` as they are collected, and stop at the
-   first sample that closes. Polish the seed itself only once (first
-   `seed_locked` call). If no sample closes, return the full sweep's result
-   without re-polishing it. Copy
-   the reference arm's `seeded_solve_keeps_the_seed_locked_joint` test too.
-   For 7-DOF joint-lock arms, `ik_nearest` must provide the `Firm` and
-   `Relaxed` flavors (selected by an extra `JointLockFlavor` argument) described
-   in [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 7.
-   Firm keeps the redundant joint at the seed value in all three stages;
-   Relaxed tries full-joint DLS first and then the sampled-lock state. Leave
-   the configurable joint-step continuity check to the owning `Arm`; do not
-   hard-code the default π/2 bound in the generated solver. Do not generate a
-   capped or FLOP-budgeted `ik_nearest`. For 6-DOF closed-form arms, use the
-   nearest-first single-solution early exit in
-   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 8 (no lock,
-   no flavors).
+   `solve` is `ik_all`: it returns every solution, never early-exits and never
+   locks to the seed (joint-lock arms run the full sweep; the seed only orders
+   the result). Reuse the shared post-process (`closed_form::finish6` for 6-DOF
+   closed-form arms, `math::jointlock` for spherical-inner joint-lock 7R arms)
+   instead of copying helpers; see
+   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 5.
+   `ik_one` is `ArmModel::flange_one`, implemented by
+   `dexhal::math::single::{six_dof_one, seven_dof_one}`; the driver supplies only
+   its raw candidates (6-DOF) or its per-sample solve (7-DOF).
+   For 7-DOF joint-lock arms, `ik_one` must provide the `Fast` and `Near` kinds
+   (selected by an extra `kind: IkKind` argument, default `Fast`) described in
+   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 7. `Near`
+   holds the redundant joint at the seed value in all stages; `Fast` runs
+   full-joint DLS first, then the seed-lock polish, then the sampled-lock
+   stage. Every stage returns its first accepted solution. Leave the configurable
+   joint-step continuity check to the owning `Arm`; do not hard-code the default
+   π/2 bound in the generated solver. Do not generate a capped or FLOP-budgeted
+   `ik_one`. For 6-DOF closed-form arms, use the `kind` rules in
+   [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 item 8 (no lock).
 2. **`codegen/generate_code.py`** (categories 2–4): adapt the reference arm's
    script so it reads `codegen/<arm>_ik.py` and writes `../consts.rs` / `../pq.rs`;
    add `pub mod consts;` / `pub mod pq;` to `mod.rs` if the scaffold did not.

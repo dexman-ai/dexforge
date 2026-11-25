@@ -5,12 +5,12 @@ use core::fmt;
 use std::path::Path;
 
 use dexhal::math::{
-    Applied, ArmDriver, ArmError, ArmManifest, ArmMath, CalibrationData, DynamicsState,
+    Applied, ArmDriver, ArmError, ArmManifest, ArmMath, CalibrationData, DynamicsState, IkKind,
     ModelError, PoseResidual, WrenchFrame, CONTRACT_VERSION, MAX_DOF,
 };
 
 use crate::{
-    applied, wrench_frame_code, EntryFn, FfiResult, ManifestDesc, MathHandle, PluginVTable, Q,
+    applied, ik_kind_code, wrench_frame_code, EntryFn, FfiResult, ManifestDesc, MathHandle, PluginVTable, Q,
     ABI_VERSION, ENTRY_SYMBOL,
 };
 
@@ -383,20 +383,23 @@ impl ArmMath for LoadedMath {
         self.query(|h, out| unsafe { (self.vtable.math_jacobian_pseudo_inverse)(h, q, out) })
     }
 
-    fn inverse_kinematics(&self, target_pose: &[f64; 7], q_seed: &Q) -> Option<Q> {
+    fn ik_one(&self, target_pose: &[f64; 7], q_seed: &Q, kind: IkKind) -> Option<Q> {
         // SAFETY: live handle and valid pointers.
         self.query(|h, out| unsafe {
-            (self.vtable.math_inverse_kinematics)(h, target_pose, q_seed, out)
+            (self.vtable.math_ik_one)(h, target_pose, q_seed, ik_kind_code(kind), out)
         })
     }
 
-    fn inverse_kinematics_all(&self, target_pose: &[f64; 7], out: &mut [Q]) -> usize {
+    fn ik_all(&self, target_pose: &[f64; 7], q_seed: Option<&Q>, out: &mut [Q]) -> usize {
         let mut count = 0usize;
-        // SAFETY: live handle; `out` holds `out.len()` writable slots.
+        let seed = q_seed.map_or(core::ptr::null(), |q| q as *const Q);
+        // SAFETY: live handle; `seed` is null or valid for a read; `out` holds
+        // `out.len()` writable slots.
         let ok = unsafe {
-            (self.vtable.math_inverse_kinematics_all)(
+            (self.vtable.math_ik_all)(
                 self.handle,
                 target_pose,
+                seed,
                 out.as_mut_ptr(),
                 out.len(),
                 &mut count,

@@ -2,7 +2,7 @@
 
 use core::f64::consts::FRAC_PI_2;
 
-use dexhal::math::{ArmModel, DhConvention, DhRow, KinematicChain, Pose, TolerancePolicy};
+use dexhal::math::{ArmModel, DhConvention, DhRow, IkKind, KinematicChain, Pose, TolerancePolicy};
 
 const DH: [DhRow; 6] = [
     DhRow::new(0.0, FRAC_PI_2, 0.12, 0.0),
@@ -20,7 +20,7 @@ fn chain() -> KinematicChain<6> {
 /// Default model of [`MockDriver::default_arm`](crate::MockDriver::default_arm).
 ///
 /// Kinematics come from the nominal DH table. There is no closed-form inverse
-/// kinematics: `flange_solve` polishes the seed (zero without one) onto the
+/// kinematics: `flange_all` polishes the seed (zero without one) onto the
 /// target with the bounded damped-Newton [`KinematicChain::refine_ik`], so it
 /// returns at most the one solution on the seed's branch.
 pub struct MockArm;
@@ -36,21 +36,26 @@ impl ArmModel<6, 1> for MockArm {
         chain().jacobian(q)
     }
 
-    // `JOINT_LIMITS` is unconstrained, so `respect_limits` has nothing to drop.
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; 6]>,
         _respect_limits: bool,
         _allow_refinement: bool,
         policy: TolerancePolicy,
         _refinement_max_iters: usize,
     ) -> [Option<[f64; 6]>; 1] {
-        if max_solutions == Some(0) {
-            return [None];
-        }
         let mut q = q_seed.copied().unwrap_or([0.0; 6]);
         let closes = chain().refine_ik(target, &mut q) <= policy.subproblem_numerical;
         [closes.then_some(q)]
+    }
+
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; 6],
+        _kind: IkKind,
+        policy: TolerancePolicy,
+        _refinement_max_iters: usize,
+    ) -> Option<[f64; 6]> {
+        Self::flange_all(target, Some(q_seed), true, true, policy, 0)[0]
     }
 }

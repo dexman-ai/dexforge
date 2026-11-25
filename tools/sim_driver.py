@@ -355,7 +355,7 @@ class SimDriver:
         if np.linalg.norm(pose[3:7]) < 1e-9:  # not a rotation; scipy would raise inside the control thread
             return FAULT_IK_NO_SOLUTION
         seed = self._q_ref.tolist()
-        q = self._math.ik_nearest(pose.tolist(), seed, self._ik_step)
+        q = self._math.ik_one(pose.tolist(), seed, "fast", self._ik_step)
         if q is not None:
             return np.array(q)
         T = np.eye(4)

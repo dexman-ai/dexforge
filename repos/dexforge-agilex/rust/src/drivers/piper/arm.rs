@@ -4,6 +4,8 @@
 //! `piper.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
+use dexhal::math::model::IkKind;
+use dexhal::math::single::{six_dof_one, CANDIDATES};
 use dexhal::math::{ArmModel, ChainJoint, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{generated_dynamics, generated_kinematics, ik_solver};
@@ -63,6 +65,7 @@ pub struct Piper;
 
 impl ArmModel<DOF, MAX_SOLUTIONS> for Piper {
     const NAME: &'static str = "piper";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
         Some((-2.618, 2.618)),
         Some((0.0, 3.14)),
@@ -85,9 +88,8 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Piper {
     }
 
     #[inline]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -96,12 +98,34 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Piper {
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
         ik_solver::solve(
             target,
-            max_solutions,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
+        )
+    }
+
+    #[inline]
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]> {
+        six_dof_one::<Self, MAX_SOLUTIONS>(
+            target,
+            q_seed,
+            kind,
+            policy,
+            refinement_max_iters,
+            || {
+                let mut cands = [[0.0; DOF]; CANDIDATES];
+                let n = ik_solver::solve_candidates(target, policy, &mut cands);
+                (cands, n)
+            },
         )
     }
 
@@ -134,6 +158,7 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for Piper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexhal::math::single::within_max_joint_step;
     use dexhal::math::DEFAULT_TOLERANCE_POLICY;
 
     /// Deterministic joint vectors inside the joint limits.
@@ -166,25 +191,62 @@ mod tests {
     }
 
     #[test]
-    fn flange_solve_closes_on_fk_targets() {
+    fn flange_all_closes_on_fk_targets() {
         for k in 0..16 {
             let q = sample(k);
             let target = Piper::flange_fk(&q);
-            let sols = Piper::flange_solve(
-                &target,
-                None,
-                Some(&q),
-                true,
-                false,
-                DEFAULT_TOLERANCE_POLICY,
-                15,
-            );
+            let sols = Piper::flange_all(&target, Some(&q), true, false, DEFAULT_TOLERANCE_POLICY, 15);
             let first = sols[0].expect("a reachable in-limit target has a solution");
             assert!((Piper::flange_fk(&first) - target).norm() < 1e-5);
             for sol in sols.iter().flatten() {
                 assert!((Piper::flange_fk(sol) - target).norm() < 1e-5);
             }
         }
+    }
+
+    #[test]
+    fn flange_one_fast_closes_on_fk_targets() {
+        for k in 0..16 {
+            let q = sample(k);
+            let target = Piper::flange_fk(&q);
+            let sol = Piper::flange_one(&target, &q, IkKind::Fast, DEFAULT_TOLERANCE_POLICY, 15)
+                .expect("a reachable in-limit target has a solution");
+            assert!((Piper::flange_fk(&sol) - target).norm() < 1e-5);
+            assert!(within_limits(&sol));
+        }
+    }
+
+    #[test]
+    fn flange_one_near_matches_nearest_of_flange_all() {
+        let configs = [sample(3), sample(11)];
+        let offsets = [-0.4, -0.1, 0.05, 0.3];
+        for q_true in configs {
+            let target = Piper::flange_fk(&q_true);
+            for off in offsets {
+                let seed: [f64; DOF] = core::array::from_fn(|i| q_true[i] + off * if i % 2 == 0 { 1.0 } else { -1.0 });
+                let single = Piper::flange_one(&target, &seed, IkKind::Near, DEFAULT_TOLERANCE_POLICY, 15);
+                let full = Piper::flange_all(&target, Some(&seed), true, true, DEFAULT_TOLERANCE_POLICY, 15);
+                // Near returns the nearest solution that passes the per-joint step gate.
+                let full = full.iter().flatten().find(|b| within_max_joint_step(b, &seed)).copied();
+                match (single, full) {
+                    (Some(a), Some(b)) => {
+                        for i in 0..DOF {
+                            let d = libm::remainder(a[i] - b[i], 2.0 * core::f64::consts::PI);
+                            assert!(libm::fabs(d) < 1e-6, "single {a:?} != full {b:?}");
+                        }
+                    }
+                    (None, None) => {}
+                    _ => panic!("single/full disagree on existence: {single:?} vs {full:?}"),
+                }
+            }
+        }
+    }
+
+    fn within_limits(q: &[f64; DOF]) -> bool {
+        q.iter().zip(Piper::JOINT_LIMITS.iter()).all(|(v, lim)| {
+            let (lo, hi) = lim.expect("Piper joints are all limited");
+            *v >= lo && *v <= hi
+        })
     }
 
     #[test]
@@ -222,15 +284,8 @@ mod tests {
             }
             let target = Piper::flange_fk(&q);
 
-            let sols = Piper::flange_solve(
-                &target,
-                None,
-                None,
-                false,
-                false,
-                DEFAULT_TOLERANCE_POLICY,
-                15,
-            );
+            let sols = Piper::flange_all(&target, None, false, false, DEFAULT_TOLERANCE_POLICY, 15);
+
             assert!(
                 sols.iter().any(Option::is_some),
                 "non-singular reachable pose returned no IK at q={q:?}"
@@ -241,15 +296,8 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = Piper::flange_solve(
-                    &target,
-                    None,
-                    None,
-                    false,
-                    true,
-                    tight_policy,
-                    15,
-                );
+                let tight_sols = Piper::flange_all(&target, None, false, true, tight_policy, 15);
+
                 assert!(
                     tight_sols.iter().any(Option::is_some),
                     "tight-policy pose returned no IK at q={q:?}"

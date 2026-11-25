@@ -101,16 +101,21 @@ def test_fk_pose_matches_fk_matrix(arm, arm_name):
     assert np.allclose(R.from_quat(p[3:]).as_matrix(), T[:3, :3], atol=1e-9)  # x, y, z, w
 
 
-def test_ik_nearest_returns_seed_branch_and_enforces_the_bound(arm, arm_name):
+def test_ik_one_returns_seed_branch_and_enforces_the_bound(arm, arm_name):
     q = np.array(_q())
     pose = arm.fk_pose(q.tolist())
-    sol = arm.ik_nearest(pose, q.tolist())
+    sol = arm.ik_one(pose, q.tolist(), "near")
+    assert sol is not None and np.allclose(sol, q, atol=1e-6)
+    sol = arm.ik_one(pose, q.tolist(), "fast")
     assert sol is not None and np.allclose(sol, q, atol=1e-6)
     far = (q + 2.5).tolist()  # a seed far from every solution of this pose
-    assert arm.ik_nearest(pose, far, 0.01) is None
+    assert arm.ik_one(pose, far, "near", 0.01) is None
+    assert arm.ik_one(pose, far, "fast", 0.01) is None
     assert arm.ik_default_max_joint_step() == pytest.approx(np.pi / 2)
     with pytest.raises(ValueError):
-        arm.ik_nearest(pose[:6], q.tolist())
+        arm.ik_one(pose[:6], q.tolist(), "near")
+    with pytest.raises(ValueError):
+        arm.ik_one(pose, q.tolist(), "bogus")
 
 
 def test_control_modes_and_manifest_support(arm, arm_name):

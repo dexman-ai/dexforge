@@ -104,6 +104,14 @@ def rust_f64(x: float) -> str:
     return text if any(c in text for c in ".eE") else text + ".0"
 
 
+def _limit_f64(x: float) -> str:
+    """Joint-limit literal; exact ``±PI``/``±TAU`` use ``core::f64::consts`` (clippy ``approx_constant``)."""
+    for name, val in (("PI", math.pi), ("TAU", math.tau)):
+        if abs(float(x)) == val:
+            return ("-" if x < 0 else "") + f"core::f64::consts::{name}"
+    return rust_f64(x)
+
+
 def _row(values: Sequence[float]) -> str:
     return "[" + ", ".join(rust_f64(v) for v in values) + "]"
 
@@ -177,7 +185,7 @@ def generate_arm_rs(info: ArtifactInfo, artifact: Path, has_dynamics: bool) -> s
     limits = []
     for lim in info.joint_limits:
         limits.append(
-            "        None,\n" if lim is None else f"        Some(({rust_f64(lim[0])}, {rust_f64(lim[1])})),\n"
+            "        None,\n" if lim is None else f"        Some(({_limit_f64(lim[0])}, {_limit_f64(lim[1])})),\n"
         )
 
     dynamics_impl = ""

@@ -4,7 +4,8 @@
 //! `{{arm}}.urdf`. Do not edit by hand; regenerate with
 //! `python codegen/scaffold.py ... --only arm.rs`.
 
-use dexhal::math::{ArmModel, ChainJoint, JointLimit, KinematicChain, Pose, TolerancePolicy};
+use dexhal::math::single::{six_dof_one, CANDIDATES};
+use dexhal::math::{ArmModel, ChainJoint, IkKind, JointLimit, KinematicChain, Pose, TolerancePolicy};
 
 use super::{{module_uses}};
 
@@ -51,6 +52,7 @@ pub struct {{struct_name}};
 
 impl ArmModel<DOF, MAX_SOLUTIONS> for {{struct_name}} {
     const NAME: &'static str = "{{arm}}";
+    #[allow(clippy::approx_constant)] // URDF limits are rounded literals (3.14, 6.2832), not PI/TAU.
     const JOINT_LIMITS: [JointLimit; DOF] = [
 {{joint_limits}}    ];
     const HAS_DYNAMICS: bool = {{has_dynamics}};
@@ -67,9 +69,8 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for {{struct_name}} {
     }
 
     #[inline]
-    fn flange_solve(
+    fn flange_all(
         target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -78,13 +79,33 @@ impl ArmModel<DOF, MAX_SOLUTIONS> for {{struct_name}} {
     ) -> [Option<[f64; DOF]>; MAX_SOLUTIONS] {
         ik_solver::solve(
             target,
-            max_solutions,
+            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
         )
+    }
+
+    #[inline]
+    fn flange_one(
+        target: &Pose,
+        q_seed: &[f64; DOF],
+        kind: IkKind,
+        policy: TolerancePolicy,
+        refinement_max_iters: usize,
+    ) -> Option<[f64; DOF]> {
+        six_dof_one::<Self, MAX_SOLUTIONS>(target, q_seed, kind, policy, refinement_max_iters, || {
+            let mut cands = [[0.0f64; DOF]; CANDIDATES];
+            let mut n = 0usize;
+            let sols = ik_solver::solve(target, None, None, false, false, policy, refinement_max_iters);
+            for q in sols.into_iter().flatten() {
+                cands[n] = q;
+                n += 1;
+            }
+            (cands, n)
+        })
     }
 {{dynamics_impl}}}
 
@@ -123,13 +144,12 @@ mod tests {
     }
 
     #[test]
-    fn flange_solve_closes_on_fk_targets() {
+    fn flange_all_closes_on_fk_targets() {
         for k in 0..16 {
             let q = sample(k);
             let target = {{struct_name}}::flange_fk(&q);
-            let sols = {{struct_name}}::flange_solve(
+            let sols = {{struct_name}}::flange_all(
                 &target,
-                None,
                 Some(&q),
                 true,
                 false,
@@ -179,9 +199,8 @@ mod tests {
             }
             let target = {{struct_name}}::flange_fk(&q);
 
-            let sols = {{struct_name}}::flange_solve(
+            let sols = {{struct_name}}::flange_all(
                 &target,
-                None,
                 None,
                 false,
                 false,
@@ -198,9 +217,8 @@ mod tests {
             }
 
             if tested < 16 {
-                let tight_sols = {{struct_name}}::flange_solve(
+                let tight_sols = {{struct_name}}::flange_all(
                     &target,
-                    None,
                     None,
                     false,
                     true,

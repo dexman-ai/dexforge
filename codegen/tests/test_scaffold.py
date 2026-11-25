@@ -81,7 +81,7 @@ def test_scaffold_arm_rs_implements_arm_model(ur5_scaffold):
     assert "pub const DOF: usize = 6;" in arm
     assert "pub const MAX_SOLUTIONS: usize = 16;" in arm
     assert "const HAS_DYNAMICS: bool = true;" in arm
-    for hook in ("flange_fk", "flange_jacobian", "flange_solve", "flange_gravity",
+    for hook in ("flange_fk", "flange_jacobian", "flange_all", "flange_one", "flange_gravity",
                  "flange_mass_matrix", "flange_coriolis", "flange_inverse_dynamics"):
         assert f"fn {hook}(" in arm
     assert "use super::{generated_dynamics, generated_kinematics, ik_solver};" in arm

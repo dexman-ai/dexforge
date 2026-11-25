@@ -133,20 +133,8 @@ def _vec(a):
 def _mat(a):
     return "[\n" + "".join("    " + _vec(r) + ",\n" for r in a) + "]"
 
-_W_TRIG_TO_X = """[
-    [0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, -2.0, 0.0, 2.0, 0.0, 0.0, 0.0],
-    [0.0, -2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0],
-    [1.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0],
-    [0.0, 0.0, 0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0],
-    [-1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
-    [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0],
-    [-1.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0],
-    [1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
-]"""
-
-_limits = "[\n" + "".join(f"    ({_num(lo)}, {_num(hi)}),\n" for lo, hi in P._JOINT_LIMITS) + "]"
-
+# Joint limits live in arm.rs (`ArmModel::JOINT_LIMITS`) and `W_TRIG_TO_X` in
+# `dexhal::math::raghavan_roth`, so neither is emitted here.
 consts_dest = os.path.normpath(os.path.join(_HERE, "..", "consts.rs"))
 with open(consts_dest, "w") as f:
     f.write("//! Baked geometric constants for the AgileX Piper 6-DOF arm,\n")
@@ -160,7 +148,5 @@ with open(consts_dest, "w") as f:
     f.write(f"pub(crate) const DH_THETA_OFFSET: [f64; 6] = {_vec(P._DH_THETA_OFFSET)};\n\n")
     f.write(f"pub(crate) const T_PRE_INV: [[f64; 4]; 4] = {_mat(P._T_PRE_INV)};\n\n")
     f.write(f"pub(crate) const T_POST_INV: [[f64; 4]; 4] = {_mat(P._T_POST_INV)};\n\n")
-    f.write(f"pub(crate) const JOINT_LIMITS: [(f64, f64); 6] = {_limits};\n\n")
-    f.write(f"pub(crate) const W_TRIG_TO_X: [[f64; 9]; 9] = {_W_TRIG_TO_X};\n\n")
     f.write("#[cfg_attr(not(test), allow(dead_code))]\n")
     f.write(f"pub(crate) const T_HOME: [[f64; 4]; 4] = {_mat(P.T_HOME)};\n")

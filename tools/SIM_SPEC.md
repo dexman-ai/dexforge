@@ -184,7 +184,7 @@ Done:
    vs achieved pose, command rejection (unknown / unsupported mode, non-finite
    target), IK faults (no solution, step too large, out of limits), latching until
    `clear_faults()`, streamed trajectories, and the latency shift.
-4. Bindings `fk_pose` and `ik_nearest` (the contract's IK with its continuity
+4. Bindings `fk_pose` and `ik_one` (kind `"fast"` for the contract's servo IK with its continuity
    bound, default pi/2).
 
 5. `tools/sim.py`: viewer, headless and render modes, and the demo client.

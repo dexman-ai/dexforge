@@ -262,26 +262,44 @@ macro_rules! arm_module {
 	}
 
 	/// Joint vector reaching `pose` (`[x, y, z, qx, qy, qz, qw]`) on the branch of
-	/// `q_seed`, or `None` when there is no solution or the nearest one is further than
-	/// the continuity bound `max_joint_step` (rad per joint; the dexhal default when omitted).
+	/// `q_seed`, or `None` when there is no solution. `kind` is `"fast"` (default) or
+	/// `"near"`; see dexhal `IkKind`. The nearest result must lie within `max_joint_step`
+	/// (rad per joint; the dexhal default when omitted).
 	#[pyfunction]
-	#[pyo3(signature = (pose, q_seed, max_joint_step = None))]
-	fn ik_nearest(
+	#[pyo3(signature = (pose, q_seed, kind = "fast", max_joint_step = None))]
+	fn ik_one(
 		pose: Vec<f64>,
 		q_seed: Vec<f64>,
+		kind: &str,
 		max_joint_step: Option<f64>,
 	) -> PyResult<Option<Vec<f64>>> {
 		let pose: [f64; 7] = pose
 			.try_into()
 			.map_err(|_| PyValueError::new_err("pose must have 7 elements [x, y, z, qx, qy, qz, qw]"))?;
+		let kind = match kind {
+			"fast" => dexhal::math::model::IkKind::Fast,
+			"near" => dexhal::math::model::IkKind::Near,
+			other => {
+				return Err(PyValueError::new_err(format!(
+					"kind must be \"fast\" or \"near\", got {other:?}"
+				)))
+			}
+		};
 		let seed = joint_vec("q_seed", q_seed)?;
+		let target = dexhal::math::chain::pose_from_xyz_quat(&pose)
+			.map_err(|e| PyValueError::new_err(format!("pose: {e:?}")))?;
 		let mut arm = Arm::<$arm, DOF, MAX_SOLUTIONS>::new();
 		if let Some(step) = max_joint_step {
 			arm.set_ik_max_joint_step(step)
 				.map_err(|e| PyValueError::new_err(format!("max_joint_step: {e:?}")))?;
 		}
 		Ok(arm
-			.inverse_kinematics(&pose, &pad_q(&seed))
+			.ik_one(
+				&target,
+				&seed,
+				kind,
+				dexhal::math::tolerances::TolerancePolicy::DEFAULT,
+			)
 			.map(|q| q[..DOF].to_vec()))
 	}
 
@@ -291,7 +309,7 @@ macro_rules! arm_module {
 		STANDARD_GRAVITY
 	}
 
-	/// Default continuity bound (rad) of `ik_nearest`.
+	/// Default continuity bound (rad) of `ik_one`.
 	#[pyfunction]
 	fn ik_default_max_joint_step() -> f64 {
 		IK_DEFAULT_MAX_JOINT_STEP
@@ -359,7 +377,7 @@ macro_rules! arm_module {
 				m.add_function(wrap_pyfunction!(control_modes, &m)?)?;
 				m.add_function(wrap_pyfunction!(supports_mode, &m)?)?;
 				m.add_function(wrap_pyfunction!(standard_gravity, &m)?)?;
-				m.add_function(wrap_pyfunction!(ik_nearest, &m)?)?;
+				m.add_function(wrap_pyfunction!(ik_one, &m)?)?;
 				m.add_function(wrap_pyfunction!(ik_default_max_joint_step, &m)?)?;
 				parent.add_submodule(&m)
 			}

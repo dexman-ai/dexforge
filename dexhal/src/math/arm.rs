@@ -15,7 +15,6 @@
 //! so every query stays allocation-free and bounded, and an uncalibrated arm
 //! pays nothing.
 
-use core::f64::consts::FRAC_PI_2;
 use core::marker::PhantomData;
 
 use crate::math::chain::{
@@ -23,7 +22,7 @@ use crate::math::chain::{
 };
 use crate::math::kinematics::{residual_columns, se3_inv};
 // Re-exported: a driver's `arm.rs` names its model through this module.
-pub use crate::math::model::{ArmModel, Pose};
+pub use crate::math::model::{ArmModel, IkKind, Pose};
 use crate::math::payload::{
     payload_coriolis_torque, payload_gravity_torque, payload_inertia_matrix,
     payload_inverse_dynamics, Payload,
@@ -53,12 +52,16 @@ pub const CALIBRATION_MAX_DEVIATION: f64 = 0.05;
 /// Number of probe configurations checked by [`Arm::set_calibration`].
 pub const CALIBRATION_PROBES: usize = 6;
 
-/// Refinement ceiling handed to the driver's solver by [`Arm::ik_nearest`].
-pub const IK_NEAREST_REFINEMENT_ITERS: usize = 15;
+/// Refinement ceiling handed to the driver's solver by [`Arm::ik_one`].
+pub const IK_ONE_REFINEMENT_ITERS: usize = 15;
 
-/// Default largest per-joint distance (rad) between the seed and the solution
-/// returned by [`Arm::ik_nearest`]. See [`Arm::set_ik_max_joint_step`].
-pub const IK_DEFAULT_MAX_JOINT_STEP: f64 = FRAC_PI_2;
+/// Largest per-joint distance (rad) between the seed and any solution
+/// [`ArmModel::flange_one`] may propose: every candidate is checked after its
+/// polish and rejected beyond this, and it is also the default bound of
+/// [`Arm::ik_one`]. [`Arm::set_ik_max_joint_step`] can tighten the `Arm` check
+/// but cannot loosen the per-candidate check. The 7-DOF redundant (lock) joint
+/// is further limited to [`IK_LOCK_MAX_STEP`](crate::math::single::IK_LOCK_MAX_STEP).
+pub const IK_DEFAULT_MAX_JOINT_STEP: f64 = core::f64::consts::FRAC_PI_2;
 
 /// Joint-space rigid-body terms of an arm including its payload.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -89,15 +92,17 @@ pub struct PoseResidual {
 ///
 /// ```
 /// # use dexhal::math::arm::Arm;
-/// # use dexhal::math::model::{ArmModel, Pose};
+/// # use dexhal::math::model::{ArmModel, IkKind, Pose};
 /// # use dexhal::math::payload::Payload;
 /// # use dexhal::math::tolerances::TolerancePolicy;
 /// # struct Demo;
 /// # impl ArmModel<6, 1> for Demo {
 /// #     fn flange_fk(_q: &[f64; 6]) -> Pose { Pose::identity() }
 /// #     fn flange_jacobian(_q: &[f64; 6]) -> [[f64; 6]; 6] { [[0.0; 6]; 6] }
-/// #     fn flange_solve(_t: &Pose, _m: Option<usize>, _s: Option<&[f64; 6]>, _l: bool, _r: bool,
+/// #     fn flange_all(_t: &Pose, _s: Option<&[f64; 6]>, _l: bool, _r: bool,
 /// #         _p: TolerancePolicy, _i: usize) -> [Option<[f64; 6]>; 1] { [None] }
+/// #     fn flange_one(_t: &Pose, _s: &[f64; 6], _k: IkKind, _p: TolerancePolicy, _i: usize)
+/// #         -> Option<[f64; 6]> { None }
 /// # }
 /// let mut arm = Arm::<Demo, 6, 1>::new();
 /// let mut tcp = Pose::identity();
@@ -227,9 +232,11 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
         self.calibration.as_ref()
     }
 
-    /// Set the continuity bound of [`ik_nearest`](Self::ik_nearest): the
+    /// Set the continuity bound of [`ik_one`](Self::ik_one): the
     /// largest distance (rad) any joint may lie from the seed. `f64::INFINITY`
-    /// disables the check.
+    /// disables this check, but the solver still rejects every candidate
+    /// further than [`IK_DEFAULT_MAX_JOINT_STEP`] (π/2), so values above it do not
+    /// loosen the result.
     pub fn set_ik_max_joint_step(&mut self, step: f64) -> Result<(), ModelError> {
         if step.is_nan() {
             return Err(ModelError::NonFinite);
@@ -362,23 +369,21 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
         })
     }
 
-    /// All inverse-kinematics solutions placing the TCP at `tcp_target`.
+    /// Every inverse-kinematics solution placing the TCP at `tcp_target`,
+    /// sorted nearest-first to `q_seed` when one is given.
     ///
-    /// The arguments and the solve are the driver's
-    /// ([`ArmModel::flange_solve`]); this method retargets the TCP to the
-    /// flange. With a calibration installed the driver's full nominal set is
-    /// polished onto the calibrated chain ([`KinematicChain::refine_ik`]),
-    /// re-verified against `policy.subproblem_numerical`, re-checked against
-    /// [`ArmModel::JOINT_LIMITS`] if `respect_limits`, de-duplicated with
-    /// `policy.subproblem_dedup` and only then truncated to `max_solutions`.
-    /// The driver's ordering is kept. A target reachable only by the
-    /// calibrated geometry (within a millimetre of the workspace boundary)
-    /// has no nominal solution to start from and yields none.
-    #[allow(clippy::too_many_arguments)]
-    pub fn ik(
+    /// Never exits early: the driver's [`ArmModel::flange_all`] enumerates
+    /// the full set. This method retargets the TCP to the flange. With a
+    /// calibration installed each nominal solution is polished onto the
+    /// calibrated chain ([`KinematicChain::refine_ik`]), re-verified against
+    /// `policy.subproblem_numerical`, re-checked against
+    /// [`ArmModel::JOINT_LIMITS`] if `respect_limits`, and de-duplicated with
+    /// `policy.subproblem_dedup`; the nominal order is kept. A target reachable
+    /// only by the calibrated geometry (within a millimetre of the workspace
+    /// boundary) has no nominal solution to start from and yields none.
+    pub fn ik_all(
         &self,
         tcp_target: &Pose,
-        max_solutions: Option<usize>,
         q_seed: Option<&[f64; DOF]>,
         respect_limits: bool,
         allow_refinement: bool,
@@ -389,9 +394,8 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
         let chain = match &self.calibration {
             Some(chain) => chain,
             None => {
-                return A::flange_solve(
+                return A::flange_all(
                     &flange_target,
-                    max_solutions,
                     q_seed,
                     respect_limits,
                     allow_refinement,
@@ -400,22 +404,17 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
                 )
             }
         };
-        let nominal = A::flange_solve(
+        let nominal = A::flange_all(
             &flange_target,
-            None,
             q_seed,
             respect_limits,
             allow_refinement,
             policy,
             refinement_max_iters,
         );
-        let cap = max_solutions.map_or(MAX, |m| m.min(MAX));
         let mut out = [None; MAX];
         let mut n = 0;
         for seed in nominal.iter().flatten() {
-            if n == cap {
-                break;
-            }
             let mut q = *seed;
             if chain.refine_ik(&flange_target, &mut q) > policy.subproblem_numerical {
                 continue;
@@ -435,37 +434,36 @@ impl<A: ArmModel<DOF, MAX>, const DOF: usize, const MAX: usize> Arm<A, DOF, MAX>
         out
     }
 
-    /// The IK solution on the seed's branch, for servoing.
+    /// One inverse-kinematics solution for `tcp_target`, for servoing.
     ///
-    /// The driver picks the branch: its solve is asked for the single solution
-    /// nearest `q_seed` inside the joint limits. With a calibration installed
-    /// only that solution is polished onto the calibrated chain. Each joint is
-    /// then moved to the 2π turn nearest the seed when
+    /// Early-exits as soon as the driver's [`ArmModel::flange_one`] has a
+    /// solution. `kind` selects the trade-off ([`IkKind`]): [`IkKind::Near`]
+    /// returns the solution closest to `q_seed`, [`IkKind::Fast`] a
+    /// converged solution that may lie on another branch. With a calibration
+    /// installed the solution is polished onto the calibrated chain. Each
+    /// joint is then moved to the 2π turn nearest the seed when
     /// [`ArmModel::JOINT_LIMITS`] allow, so a continuous Cartesian path maps
     /// to a continuous joint path.
     ///
     /// Returns `None` if the target is unreachable, or if any joint of the
     /// result lies further than [`ik_max_joint_step`](Self::ik_max_joint_step)
-    /// from the seed: near a singularity or a joint limit the nearest
-    /// remaining solution is on another branch, and following it would
-    /// command a jump.
-    pub fn ik_nearest(
+    /// from the seed: following a solution on another branch would command a
+    /// jump.
+    pub fn ik_one(
         &self,
         tcp_target: &Pose,
         q_seed: &[f64; DOF],
+        kind: IkKind,
         policy: TolerancePolicy,
     ) -> Option<[f64; DOF]> {
         let flange_target = tcp_target * self.tcp_inv;
-        let nominal = A::flange_solve(
+        let mut q = A::flange_one(
             &flange_target,
-            Some(1),
-            Some(q_seed),
-            true,
-            true,
+            q_seed,
+            kind,
             policy,
-            IK_NEAREST_REFINEMENT_ITERS,
-        );
-        let mut q = nominal.into_iter().flatten().next()?;
+            IK_ONE_REFINEMENT_ITERS,
+        )?;
         if let Some(chain) = &self.calibration {
             if chain.refine_ik(&flange_target, &mut q) > policy.subproblem_numerical
                 || !within_limits(&q, &A::JOINT_LIMITS)
@@ -730,7 +728,7 @@ mod tests {
             let q_true = sample_q::<6>(seed, 2.5);
             let target = arm.fk(&q_true);
             let solve = |a: &Arm<SixR, 6, 1>| {
-                a.ik(&target, None, Some(&q_true), false, true, policy, 15)[0]
+                a.ik_all(&target, Some(&q_true), false, true, policy, 15)[0]
             };
             // Where the driver has no nominal solution there is nothing to polish.
             let Some(q_nominal) = solve(&uncalibrated) else {
@@ -768,9 +766,8 @@ mod tests {
             SixR::flange_jacobian(q)
         }
 
-        fn flange_solve(
+        fn flange_all(
             target: &Pose,
-            max_solutions: Option<usize>,
             q_seed: Option<&[f64; 6]>,
             respect_limits: bool,
             allow_refinement: bool,
@@ -779,9 +776,8 @@ mod tests {
         ) -> [Option<[f64; 6]>; 3] {
             // The nominal solve is scripted: it ignores the caller's tolerances.
             let _ = policy;
-            let q = SixR::flange_solve(
+            let q = SixR::flange_all(
                 target,
-                None,
                 q_seed,
                 respect_limits,
                 allow_refinement,
@@ -793,11 +789,17 @@ mod tests {
                 over[0] += TWO_PI;
                 twin[3] += 2e-4;
             }
-            let mut out = [over, q, twin];
-            for slot in out.iter_mut().skip(max_solutions.unwrap_or(3)) {
-                *slot = None;
-            }
-            out
+            [over, q, twin]
+        }
+
+        fn flange_one(
+            target: &Pose,
+            q_seed: &[f64; 6],
+            kind: IkKind,
+            policy: TolerancePolicy,
+            refinement_max_iters: usize,
+        ) -> Option<[f64; 6]> {
+            SixR::flange_one(target, q_seed, kind, policy, refinement_max_iters)
         }
     }
 
@@ -830,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn calibrated_ik_polishes_the_full_set_then_dedups_and_truncates() {
+    fn calibrated_ik_polishes_the_full_set_then_dedups() {
         let mut arm = Arm::<Scripted, 6, 3>::new();
         arm.set_calibration(calibrated_chain()).unwrap();
         let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];
@@ -838,35 +840,33 @@ mod tests {
         let policy = TolerancePolicy::DEFAULT;
 
         // Without limits all three polish onto the same solution modulo 2π.
-        let all = arm.ik(&target, None, Some(&q_true), false, true, policy, 15);
+        let all = arm.ik_all(&target, Some(&q_true), false, true, policy, 15);
         assert_eq!(all.iter().flatten().count(), 1);
         assert!((all[0].unwrap()[0] - q_true[0] - TWO_PI).abs() < 1e-6);
 
         // With limits the first nominal solution is dropped after the polish;
-        // asking for one solution must still find the second.
-        let one = arm.ik(&target, Some(1), Some(&q_true), true, true, policy, 15);
-        assert_eq!(one.iter().flatten().count(), 1);
-        let q = one[0].unwrap();
-        assert!((arm.fk(&q) - target).norm() < 1e-9);
-        assert!(q_close(&q, &q_true, 1e-6) && q[0].abs() < PI);
+        // `ik_one` must still find the in-limit one.
+        let one = arm.ik_one(&target, &q_true, IkKind::Fast, policy).unwrap();
+        assert!((arm.fk(&one) - target).norm() < 1e-9);
+        assert!(q_close(&one, &q_true, 1e-6) && one[0].abs() < PI);
 
         // A tighter caller tolerance than the polish can meet rejects everything.
         let strict = TolerancePolicy {
             subproblem_numerical: 0.0,
             ..policy
         };
-        let none = arm.ik(&target, None, Some(&q_true), false, true, strict, 15);
+        let none = arm.ik_all(&target, Some(&q_true), false, true, strict, 15);
         assert!(none.iter().all(|s| s.is_none()));
     }
 
     #[test]
-    fn ik_all_is_seedless_bounded_and_contains_the_seeded_answer() {
+    fn ik_all_is_bounded_and_contains_the_nearest_answer() {
         let arm = Arm::<Scripted, 6, 3>::new();
         let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];
         let target = arm.fk(&q_true);
         let policy = TolerancePolicy::DEFAULT;
 
-        let all = arm.ik(&target, Some(3), None, true, true, policy, IK_NEAREST_REFINEMENT_ITERS);
+        let all = arm.ik_all(&target, None, true, true, policy, IK_ONE_REFINEMENT_ITERS);
         let found = all.iter().flatten().count();
         assert!((1..=3).contains(&found));
         // `Scripted` includes a deliberately inexact twin (2e-4 off in joint 3).
@@ -874,23 +874,17 @@ mod tests {
             assert!((arm.fk(q) - target).norm() < 1e-3);
         }
 
-        let nearest = arm.ik_nearest(&target, &q_true, policy).unwrap();
+        let nearest = arm
+            .ik_one(&target, &q_true, IkKind::Near, policy)
+            .unwrap();
         assert!(all
             .iter()
             .flatten()
             .any(|q| (0..6).all(|i| (q[i] - nearest[i]).abs() < 1e-6)));
-
-        assert_eq!(
-            arm.ik(&target, Some(0), None, true, true, policy, IK_NEAREST_REFINEMENT_ITERS)
-                .iter()
-                .flatten()
-                .count(),
-            0
-        );
     }
 
     #[test]
-    fn ik_nearest_follows_the_seed_branch_within_limits() {
+    fn ik_one_follows_the_seed_branch_within_limits() {
         let arm = Arm::<SixR, 6, 1>::new();
         let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];
         let target = arm.fk(&q_true);
@@ -898,7 +892,7 @@ mod tests {
         seed[4] -= TWO_PI; // inside joint 4's (-2π, 2π) limit
         seed[5] += 3.0 * TWO_PI; // joint 5 is unlimited
         let q = arm
-            .ik_nearest(&target, &seed, TolerancePolicy::DEFAULT)
+            .ik_one(&target, &seed, IkKind::Fast, TolerancePolicy::DEFAULT)
             .unwrap();
         for i in 0..6 {
             assert!(
@@ -912,12 +906,12 @@ mod tests {
         let mut far = target;
         far[(0, 3)] += 5.0;
         assert!(arm
-            .ik_nearest(&far, &q_true, TolerancePolicy::DEFAULT)
+            .ik_one(&far, &q_true, IkKind::Fast, TolerancePolicy::DEFAULT)
             .is_none());
     }
 
     #[test]
-    fn ik_nearest_refuses_to_jump() {
+    fn ik_one_refuses_to_jump() {
         let mut arm = Arm::<SixR, 6, 1>::new();
         arm.set_calibration(calibrated_chain()).unwrap();
         let q_true = [0.5, -1.0, 1.2, -0.7, 0.9, -1.0];
@@ -928,20 +922,20 @@ mod tests {
         // followed, so the only solution is a full turn from the seed.
         let mut seed = q_true;
         seed[0] += TWO_PI;
-        assert!(arm.ik_nearest(&target, &seed, policy).is_none());
+        assert!(arm.ik_one(&target, &seed, IkKind::Fast, policy).is_none());
 
         // A small step is followed, onto the calibrated chain.
         let mut near = q_true;
         near[1] += 0.05;
         near[3] -= 0.04;
-        let q = arm.ik_nearest(&target, &near, policy).unwrap();
+        let q = arm.ik_one(&target, &near, IkKind::Fast, policy).unwrap();
         assert!((arm.fk(&q) - target).norm() < 1e-9);
 
         // The bound is configurable, and can be disabled.
         arm.set_ik_max_joint_step(0.01).unwrap();
-        assert!(arm.ik_nearest(&target, &near, policy).is_none());
+        assert!(arm.ik_one(&target, &near, IkKind::Fast, policy).is_none());
         arm.set_ik_max_joint_step(f64::INFINITY).unwrap();
-        let q = arm.ik_nearest(&target, &seed, policy).unwrap();
+        let q = arm.ik_one(&target, &seed, IkKind::Fast, policy).unwrap();
         assert!((q[0] - q_true[0]).abs() < 1e-6);
         assert_eq!(arm.set_ik_max_joint_step(0.0), Err(ModelError::NonPositive));
         assert_eq!(
@@ -950,6 +944,7 @@ mod tests {
         );
         assert_eq!(arm.ik_max_joint_step(), f64::INFINITY);
     }
+
 
     #[test]
     fn calibration_in_the_wrong_frame_is_rejected() {
@@ -1011,9 +1006,8 @@ mod tests {
             fn flange_jacobian(q: &[f64; 6]) -> [[f64; 6]; 6] {
                 SixR::flange_jacobian(q)
             }
-            fn flange_solve(
+            fn flange_all(
                 _: &Pose,
-                _: Option<usize>,
                 _: Option<&[f64; 6]>,
                 _: bool,
                 _: bool,
@@ -1021,6 +1015,15 @@ mod tests {
                 _: usize,
             ) -> [Option<[f64; 6]>; 1] {
                 [None]
+            }
+            fn flange_one(
+                _: &Pose,
+                _: &[f64; 6],
+                _: IkKind,
+                _: TolerancePolicy,
+                _: usize,
+            ) -> Option<[f64; 6]> {
+                None
             }
         }
         let q = sample_q::<6>(2, 2.0);

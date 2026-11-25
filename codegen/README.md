@@ -103,7 +103,7 @@ The master agent prompt guides the coding agent through four sequential phases t
 1. **Analytical IK (`ik_solver.rs`):**
    - Following [`translate_ssik_artifact.md`](translate_ssik_artifact.md) and the selected reference arm's `ik_solver.rs`, translate the Python solver's constants and straight-line algebraic blocks into `#![no_std]` Rust.
    - Import and call shared numerical kernels directly from `dexhal::math` (`ssik_core`, `kinematics`, `postprocess`, `tolerances`). Never reimplement subproblem solvers, root finders, LM refinement, joint wrapping, or seed sorting.
-   - Ensure `solve()` respects joint limits when `respect_limits == true`, orders solutions nearest-first when `q_seed` is provided, and guards all `acos`/`asin`/`sqrt` domain boundaries without panicking. Joint-lock 7-DOF solvers hold the locked joint at the seed's value when `q_seed` is provided (`seed_locked` in the reference arms).
+   - Ensure `solve()` respects joint limits when `respect_limits == true`, orders solutions nearest-first when `q_seed` is provided, and guards all `acos`/`asin`/`sqrt` domain boundaries without panicking. Joint-lock 7-DOF solvers run the full lock sweep in `solve()` (`ik_all`); the seed only orders the result. Expose the single-solution entry point as `ik_one(target, q_seed, kind, policy)` with `kind: IkKind` (`Fast` or `Near`, default `Fast`); see [`translate_ssik_artifact.md`](translate_ssik_artifact.md) §4 items 7–8.
 2. **Hardware Driver (`driver.rs` & `manifest.yaml`):**
    - Place and validate `manifest.yaml` so `ArmManifest::from_text::<Model, DOF, MAX>(MANIFEST)` succeeds.
    - Implement `dexhal::math::ArmDriver` (`manifest`, `connect`, `disconnect`, `read_state`, `write_command`, `arm`, `arm_mut`) against the OEM hardware API documentation using zero-copy `CoreStateViewMut` and `CoreCommandView` buffer views.
@@ -144,7 +144,7 @@ The coding agent executes the deterministic generators in order and runs the tes
    - `const NAME: &'static str = "<arm>";`
    - `const JOINT_LIMITS: [JointLimit; DOF]` sourced from the URDF / `ssik` artifact.
    - `const HAS_DYNAMICS: bool = true;` (when the URDF provides valid `<inertial>` data).
-   - `flange_fk`, `flange_jacobian`, `flange_solve`, `flange_gravity`, `flange_mass_matrix`, `flange_coriolis`, and `flange_inverse_dynamics`.
+   - `flange_fk`, `flange_jacobian`, `flange_all`, `flange_one`, `flange_gravity`, `flange_mass_matrix`, `flange_coriolis`, and `flange_inverse_dynamics`.
 
 4. **Generate `ssik` IK Ground-Truth Test Data:**
    ```sh
@@ -199,7 +199,7 @@ It writes `dynamics_test_data.bin`, `dynamics_test_data.rs`, and `dynamics_parit
 
 ### Deterministic Spatial Bypass for General 6R (`Raghavan-Roth`)
 
-In Python `ssik`, general 6R solvers (`ikgeo.general_6r`) fall back to a randomized Möbius reparameterization and generalized eigenvalue solve when the equilibrated leading matrix is ill-conditioned (`cond > 1e10`). Because real-time `#![no_std]` drivers forbid RNG and unbounded solvers, translated Rust drivers (e.g. `piper`) replace the Möbius fallback with a **deterministic spatial bypass**: when the unperturbed companion-matrix pass is ill-conditioned or yields no closing in-limit root, the target pose is nudged by 10 µm along fixed tool-frame axes (`PERTURBATIONS`), solved algebraically, and snapped back onto the exact unperturbed target via bounded Levenberg-Marquardt refinement (`lm_refine6`).
+In Python `ssik`, general 6R solvers (`ikgeo.general_6r`) fall back to a randomized Möbius reparameterization and generalized eigenvalue solve when the equilibrated leading matrix is ill-conditioned (`cond > 1e10`). Because real-time `#![no_std]` drivers forbid RNG and unbounded solvers, translated Rust drivers (e.g. `piper`) replace the Möbius fallback with a **deterministic spatial bypass**: when the unperturbed companion-matrix pass is ill-conditioned or yields no closing in-limit root, the target pose is nudged by 10 µm along fixed tool-frame axes (`PERTURBATIONS`), solved algebraically, and snapped back onto the exact unperturbed target via bounded analytic-Jacobian Levenberg-Marquardt refinement (`lm_refine6`).
 
 ### `ssik` Version Locking
 

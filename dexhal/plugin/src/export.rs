@@ -9,8 +9,8 @@ use dexhal::math::{
 };
 
 use crate::{
-    applied, wrench_frame_from_code, FfiResult, ManifestDesc, MathHandle, PluginVTable, Q,
-    ABI_VERSION,
+    applied, ik_kind_from_code, wrench_frame_from_code, FfiResult, ManifestDesc, MathHandle,
+    PluginVTable, Q, ABI_VERSION,
 };
 
 /// A driver that can be exported with [`export_plugin!`](crate::export_plugin).
@@ -336,14 +336,18 @@ unsafe extern "C" fn math_jacobian_pseudo_inverse<T: PluginDriver>(
     unsafe { query(out, || math_ref::<T>(h).jacobian_pseudo_inverse(&*q)) }
 }
 
-unsafe extern "C" fn math_inverse_kinematics<T: PluginDriver>(
+unsafe extern "C" fn math_ik_one<T: PluginDriver>(
     h: MathHandle,
     target: *const [f64; 7],
     seed: *const Q,
+    kind: u8,
     out: *mut Q,
 ) -> bool {
+    let Some(kind) = ik_kind_from_code(kind) else {
+        return false;
+    };
     // SAFETY: live handle and valid pointers.
-    unsafe { query(out, || math_ref::<T>(h).inverse_kinematics(&*target, &*seed)) }
+    unsafe { query(out, || math_ref::<T>(h).ik_one(&*target, &*seed, kind)) }
 }
 
 unsafe extern "C" fn math_dynamics<T: PluginDriver>(
@@ -356,9 +360,10 @@ unsafe extern "C" fn math_dynamics<T: PluginDriver>(
     unsafe { query(out, || math_ref::<T>(h).dynamics_padded(&*q, &*qd)) }
 }
 
-unsafe extern "C" fn math_inverse_kinematics_all<T: PluginDriver>(
+unsafe extern "C" fn math_ik_all<T: PluginDriver>(
     h: MathHandle,
     target: *const [f64; 7],
+    seed: *const Q,
     out: *mut Q,
     cap: usize,
     count: *mut usize,
@@ -369,9 +374,9 @@ unsafe extern "C" fn math_inverse_kinematics_all<T: PluginDriver>(
         }
         // SAFETY: the host passes `cap` writable slots starting at `out`.
         let slots = unsafe { core::slice::from_raw_parts_mut(out, cap) };
-        // SAFETY: live handle and valid pointers.
-        let (target, math) = unsafe { (&*target, math_ref::<T>(h)) };
-        let n = math.inverse_kinematics_all(target, slots);
+        // SAFETY: live handle; `seed` is null or valid for a read.
+        let (target, seed, math) = unsafe { (&*target, seed.as_ref(), math_ref::<T>(h)) };
+        let n = math.ik_all(target, seed, slots);
         // SAFETY: `count` is valid for a write.
         unsafe { count.write(n) };
         Some(())
@@ -544,8 +549,8 @@ pub const fn vtable<T: PluginDriver>() -> PluginVTable {
         math_jacobian: math_jacobian::<T>,
         math_tool_jacobian: math_tool_jacobian::<T>,
         math_jacobian_pseudo_inverse: math_jacobian_pseudo_inverse::<T>,
-        math_inverse_kinematics: math_inverse_kinematics::<T>,
-        math_inverse_kinematics_all: math_inverse_kinematics_all::<T>,
+        math_ik_one: math_ik_one::<T>,
+        math_ik_all: math_ik_all::<T>,
         math_dynamics: math_dynamics::<T>,
         math_inverse_dynamics: math_inverse_dynamics::<T>,
         math_pose_residual: math_pose_residual::<T>,

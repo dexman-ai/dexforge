@@ -6,13 +6,16 @@
 //!
 //! The closed form is: subproblem **SP6** for the coupled wrist/shoulder angle
 //! pair `(q1, q5)`, followed by the inlined `SP1 + SP3 + SP1` chain for the
-//! remaining joints.
+//! remaining joints. The raw candidates go through the shared 6-DOF
+//! post-process [`dexhal::math::closed_form::finish6`].
 
 use nalgebra::SMatrix;
 
-use dexhal::math::kinematics::{lm_refine6, mat4_frob_diff};
+use dexhal::math::closed_form::finish6;
 use dexhal::math::ssik_core::{sp6_solve, wrap_to_pi};
 pub use dexhal::math::tolerances::TolerancePolicy;
+
+use super::arm::Z1;
 
 use core::f64::consts::PI;
 
@@ -27,7 +30,7 @@ mod test_data;
 pub const DOF: usize = 6;
 
 /// Maximum number of IK solutions returned by [`solve`].
-pub const MAX_SOLUTIONS: usize = 16;
+pub use super::arm::MAX_SOLUTIONS;
 
 /// Solver identifier — mirrors `SOLVER_NAME` in the Python artifact.
 pub const SOLVER_NAME: &str = "ikgeo.three_parallel";
@@ -58,24 +61,17 @@ pub const T_HOME: [[f64; 4]; 4] = [
     [0.0, 0.0, 0.0, 1.0],
 ];
 
-const TWO_PI: f64 = 2.0 * PI;
-
-/// Joint angle limits `(lo, hi)` in radians — baked from `_JOINT_LIMITS` in
-/// the Python artifact. Used by [`solve`] when `respect_limits = true`.
-pub const JOINT_LIMITS: [(f64, f64); 6] = [
-    (-2.6179938779914944, 2.6179938779914944),
-    (0.0, 2.9670597283903604),
-    (-2.8797932657906435, 0.0),
-    (-1.5184364492350666, 1.5184364492350666),
-    (-1.3439035240356338, 1.3439035240356338),
-    (-2.792526803190927, 2.792526803190927),
-];
-
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
 
-/// Inverse kinematics — mirrors `z1_ik.solve`.
+/// Inverse kinematics — mirrors `z1_ik.solve`; every solution (`ik_all`).
+///
+/// Raw candidates from [`solve_algebraic`] go through
+/// [`finish6`] (FK closure / refinement, dedup, `Z1::JOINT_LIMITS` when
+/// `respect_limits`, nearest-to-seed sort, `max_solutions` cap). Always
+/// enumerates the full set; a single seeded solution is `Z1::flange_one`
+/// (`dexhal::math::single::six_dof_one`).
 ///
 /// Returns up to 16 candidate joint vectors `[q1, .., q6]` in radians;
 /// unused slots are [`None`].
@@ -88,174 +84,25 @@ pub fn solve(
     policy: TolerancePolicy,
     refinement_max_iters: usize,
 ) -> [Option<[f64; 6]>; MAX_SOLUTIONS] {
-    let fk_atol = policy.subproblem_numerical;
-    let dedup_atol = policy.subproblem_dedup;
-
-    let mut solutions: [Option<[f64; 6]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
-    let mut solution_count = 0usize;
-
     let mut cands = [[0.0f64; 6]; 8];
-    let cand_count = solve_algebraic(t, &mut cands, policy);
-
-    for ci in 0..cand_count {
-        let q = cands[ci];
-        if !q.iter().all(|v| v.is_finite()) {
-            continue;
-        }
-        let residual = fk_residual(&q, t);
-        let accepted_q: [f64; 6];
-        if residual <= fk_atol {
-            accepted_q = q;
-        } else if allow_refinement {
-            match refine6(&q, t, refinement_max_iters, fk_atol) {
-                Some(refined) => {
-                    accepted_q = refined;
-                }
-                None => continue,
-            }
-        } else {
-            continue;
-        }
-
-        let mut dup = false;
-        for s in solutions.iter().take(solution_count) {
-            if let Some(existing) = s {
-                if q_close_wrap(&accepted_q, existing, dedup_atol) {
-                    dup = true;
-                    break;
-                }
-            }
-        }
-        if dup {
-            continue;
-        }
-        if solution_count < MAX_SOLUTIONS {
-            solutions[solution_count] = Some(accepted_q);
-            solution_count += 1;
-        }
-    }
-
-    if respect_limits {
-        let mut filtered: [Option<[f64; 6]>; MAX_SOLUTIONS] = [None; MAX_SOLUTIONS];
-        let mut count = 0usize;
-        for sol in solutions.iter().take(solution_count).flatten() {
-            let q = wrap_to_limits(sol);
-            if in_limits(&q) && count < MAX_SOLUTIONS {
-                filtered[count] = Some(q);
-                count += 1;
-            }
-        }
-        solutions = filtered;
-        solution_count = count;
-    }
-
-    if let Some(seed) = q_seed {
-        for i in 1..solution_count {
-            let mut j = i;
-            while j > 0 {
-                let prev = solutions[j - 1].unwrap();
-                let curr = solutions[j].unwrap();
-                if seed_dist(&prev, seed) > seed_dist(&curr, seed) {
-                    solutions.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    if let Some(max) = max_solutions {
-        let cap = max.min(solution_count);
-        for i in cap..solution_count {
-            solutions[i] = None;
-        }
-    }
-
-    solutions
-}
-
-fn q_close_wrap(a: &[f64; 6], b: &[f64; 6], tol: f64) -> bool {
-    for i in 0..6 {
-        if libm::fabs(wrap_to_pi(a[i] - b[i])) > tol {
-            return false;
-        }
-    }
-    true
-}
-
-fn wrap_to_limits(q: &[f64; 6]) -> [f64; 6] {
-    let mut out = *q;
-    for i in 0..6 {
-        let (lo, hi) = JOINT_LIMITS[i];
-        if out[i] < lo {
-            let wrapped = out[i] + TWO_PI;
-            if wrapped <= hi {
-                out[i] = wrapped;
-            }
-        } else if out[i] > hi {
-            let wrapped = out[i] - TWO_PI;
-            if wrapped >= lo {
-                out[i] = wrapped;
-            }
-        }
-    }
-    out
-}
-
-fn in_limits(q: &[f64; 6]) -> bool {
-    for i in 0..6 {
-        let (lo, hi) = JOINT_LIMITS[i];
-        if q[i] < lo || q[i] > hi {
-            return false;
-        }
-    }
-    true
-}
-
-fn seed_dist(q: &[f64; 6], seed: &[f64; 6]) -> f64 {
-    let mut s = 0.0;
-    for i in 0..6 {
-        let d = wrap_to_pi(q[i] - seed[i]);
-        s += d * d;
-    }
-    s
-}
-
-// ---------------------------------------------------------------------------
-// Levenberg-Marquardt refinement (for `allow_refinement = true`)
-// ---------------------------------------------------------------------------
-
-fn pose_residual12(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> [f64; 12] {
-    let tf = fk(q);
-    let mut r = [0.0f64; 12];
-    let mut k = 0usize;
-    for i in 0..3 {
-        for j in 0..3 {
-            r[k] = tf[(i, j)] - target[(i, j)];
-            k += 1;
-        }
-    }
-    for i in 0..3 {
-        r[9 + i] = tf[(i, 3)] - target[(i, 3)];
-    }
-    r
-}
-
-fn refine6(
-    q_in: &[f64; 6],
-    target: &SMatrix<f64, 4, 4>,
-    max_iters: usize,
-    fk_atol: f64,
-) -> Option<[f64; 6]> {
-    lm_refine6(q_in, |q| pose_residual12(q, target), max_iters, fk_atol)
+    let n = solve_algebraic(t, &mut cands, policy);
+    finish6::<Z1, MAX_SOLUTIONS>(
+        &cands[..n],
+        t,
+        max_solutions,
+        q_seed,
+        respect_limits,
+        allow_refinement,
+        policy,
+        refinement_max_iters,
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Algebraic candidate generation (port of `_solve_algebraic`)
 // ---------------------------------------------------------------------------
 
-fn solve_algebraic(
+pub(super) fn solve_algebraic(
     t: &SMatrix<f64, 4, 4>,
     out: &mut [[f64; 6]; 8],
     policy: TolerancePolicy,
@@ -389,10 +236,6 @@ pub fn fk(q: &[f64; 6]) -> SMatrix<f64, 4, 4> {
     out
 }
 
-fn fk_residual(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> f64 {
-    mat4_frob_diff(&fk(q), target)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -400,6 +243,10 @@ fn fk_residual(q: &[f64; 6], target: &SMatrix<f64, 4, 4>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dexhal::math::closed_form::refine6;
+    use dexhal::math::kinematics::mat4_frob_diff;
+    use dexhal::math::postprocess::{within_limits, wrap_distance};
+    use dexhal::math::{ArmModel, IkKind};
     use nalgebra::SMatrix;
     use std::vec::Vec;
 
@@ -421,6 +268,44 @@ mod tests {
             }
         }
         true
+    }
+
+    #[test]
+    fn refine6_recovers_a_perturbed_configuration() {
+        let q_true = [0.4, -1.1, 0.9, -1.3, 0.7, 0.2];
+        let target = fk(&q_true);
+        let seed = [0.45, -1.05, 0.85, -1.35, 0.65, 0.25];
+        let policy = TolerancePolicy::DEFAULT;
+        let q = refine6::<Z1, MAX_SOLUTIONS>(&seed, &target, 30, policy.subproblem_numerical)
+            .expect("refine6 should converge from a nearby seed");
+        assert!(mat4_frob_diff(&fk(&q), &target) <= policy.subproblem_numerical);
+    }
+
+    #[test]
+    fn flange_one_near_matches_first_seeded_solution() {
+        let policy = TolerancePolicy::DEFAULT;
+        let configs = [[0.3, -1.0, 1.2, -0.5, 0.8, 0.2], [0.4, -1.1, 0.9, -1.3, 0.7, 0.2]];
+        let offsets = [-0.4, -0.1, 0.05, 0.3];
+        for q_true in configs {
+            let t = fk(&q_true);
+            for off in offsets {
+                let seed = [
+                    q_true[0] + off,
+                    q_true[1] - off,
+                    q_true[2] + off,
+                    q_true[3] - off,
+                    q_true[4] + off,
+                    q_true[5] - off,
+                ];
+                let single = Z1::flange_one(&t, &seed, IkKind::Near, policy, 15);
+                let full = solve(&t, None, Some(&seed), true, true, policy, 15)[0];
+                match (single, full) {
+                    (Some(a), Some(b)) => assert!(q_eq_mod(&a, &b, 1e-9), "single {a:?} != full {b:?}"),
+                    (None, None) => {}
+                    _ => panic!("single/full disagree on existence: {single:?} vs {full:?}"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -498,7 +383,7 @@ mod tests {
         let tf = tf_from_row_major(&t_home);
         let sols_lim = solve(&tf, None, None, true, false, TolerancePolicy::DEFAULT, 15);
         for q in sols_lim.iter().flatten() {
-            assert!(in_limits(q), "out-of-limits solution returned: {q:?}");
+            assert!(within_limits(q, &Z1::JOINT_LIMITS), "out-of-limits solution returned: {q:?}");
         }
     }
 
@@ -523,10 +408,10 @@ mod tests {
         let sols = solve(&tf, None, Some(&zero), false, false, TolerancePolicy::DEFAULT, 15);
         let solutions: Vec<[f64; 6]> = sols.iter().flatten().copied().collect();
         if solutions.len() > 1 {
-            let d0 = seed_dist(&solutions[0], &zero);
+            let d0 = wrap_distance(&solutions[0], &zero);
             for s in &solutions[1..] {
                 assert!(
-                    d0 <= seed_dist(s, &zero) + 1e-12,
+                    d0 <= wrap_distance(s, &zero) + 1e-12,
                     "q_seed sort: first solution is not the nearest to seed"
                 );
             }

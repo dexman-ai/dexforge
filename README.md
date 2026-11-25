@@ -29,20 +29,23 @@ Most robotics stacks force a choice between heavyweight C++ libraries with runti
 
 Each OEM lives in `repos/dexforge-<oem>/rust` and implements [`dexhal::math::ArmModel`](dexhal/README.md) and [`ArmDriver`](dexhal/README.md). Below is a representative sample across the [`ssik`](https://github.com/personalrobotics/ssik) kinematic solver families:
 
-| Arm | Crate | DOF | `ssik` Solver Family | `MAX_SOL` | IK All (µs) | `ik_nearest` (µs) | Dynamics (µs) | Inv. Dynamics (µs) | Nearest Hit % |
+IK cells are **mean (max) µs / coverage %**, where coverage is the share of targets for which the call returned an FK-verified solution.
+
+| Arm | Crate | DOF | `ssik` Solver Family | `MAX_SOL` | `ik_all` | `ik_one` (`Fast`) | `dls_ik` | Dynamics (µs) | Inv. Dynamics (µs) |
 | :--- | :--- | :---: | :--- | :---: | ---: | ---: | ---: | ---: | ---: |
-| **UR5** | `dexforge-ur-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 10.70 | 2.23 | 1.64 | 1.63 | 100.0% |
-| **Unitree Z1** | `dexforge-unitree-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 17.31 | 17.15 | 1.79 | 1.79 | 100.0% |
-| **AgileX Piper** | `dexforge-agilex-core` | 6 | General 6R (`ikgeo.general_6r`, Raghavan-Roth) | 16 | 46.66 | 47.91 | 5.21 | 5.37 | 100.0% |
-| **Franka Panda** | `dexforge-franka-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, SP6 inner) | 128 | 156.13 | 40.12 | 6.04 | 6.05 | 100.0% |
-| **UFactory xArm7** | `dexforge-ufactory-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, SP6 inner) | 128 | 145.88 | 45.92 | 8.27 | 8.08 | 100.0% |
-| **Flexiv Rizon 4** | `dexforge-flexiv-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, RR inner) | 256 | 617.52 | 86.79 | 4.97 | 4.94 | 100.0% |
-| **Flexiv Rizon 10** | `dexforge-flexiv-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, RR inner) | 256 | 617.49 | 89.45 | 4.94 | 4.86 | 100.0% |
+| **UR5** | `dexforge-ur-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 11.05 (53.10) / 100.0% | 1.87 (10.07) / 100.0% | 1.92 (14.14) / 100.0% | 1.62 | 1.62 |
+| **UR3e** | `dexforge-ur-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 13.40 (60.69) / 100.0% | 1.99 (6.85) / 100.0% | 2.03 (59.03) / 100.0% | 1.56 | 1.56 |
+| **Unitree Z1** | `dexforge-unitree-core` | 6 | Closed-form 6R (`ikgeo.three_parallel`, SP6) | 16 | 16.58 (42.37) / 100.0% | 1.69 (6.45) / 100.0% | 1.70 (28.92) / 100.0% | 1.85 | 1.86 |
+| **AgileX Piper** | `dexforge-agilex-core` | 6 | General 6R (`ikgeo.general_6r`, Raghavan-Roth) | 16 | 47.17 (156.26) / 100.0% | 2.42 (7.14) / 100.0% | 2.40 (10.12) / 100.0% | 3.80 | 3.85 |
+| **Franka Panda** | `dexforge-franka-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, SP6 inner) | 128 | 169.88 (231.09) / 99.4% | 2.50 (26.15) / 100.0% | 2.39 (17.12) / 99.3% | 6.27 | 6.27 |
+| **UFactory xArm7** | `dexforge-ufactory-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, SP6 inner) | 128 | 155.62 (215.21) / 99.5% | 2.49 (36.86) / 99.8% | 2.35 (48.71) / 99.5% | 8.32 | 8.34 |
+| **Flexiv Rizon 4** | `dexforge-flexiv-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, RR inner) | 256 | 622.18 (719.25) / 100.0% | 3.14 (84.93) / 99.8% | 2.75 (11.07) / 99.3% | 5.20 | 5.20 |
+| **Flexiv Rizon 10** | `dexforge-flexiv-core` | 7 | Joint-lock 7R (`jointlock.seven_r`, RR inner) | 256 | 624.10 (728.84) / 100.0% | 2.59 (80.23) / 99.8% | 2.27 (11.02) / 99.3% | 5.06 | 5.07 |
 
 * **Reference Mock Arm:** [`dexforge-mock-core`](dexhal/mock/rust) (`"mock-6r"`) provides a complete `MockArm`, `MockDriver` with configurable queue latency, and C-ABI plugin export for hardware-free integration testing.
-* **Reproduce Benchmarks:** Wall-clock timings are measured in `--release` via the shared harness in [`dexhal/perf/arm_timing.rs`](dexhal/perf/arm_timing.rs) across deterministic random in-limit configurations (with `fk(q)` as the IK target; global `IK All` hit rate is 99.4–100.0%):
+* **Reproduce Benchmarks:** Wall-clock timings are measured in `--release` via the shared harness in [`dexhal/perf/arm_timing.rs`](dexhal/perf/arm_timing.rs) over 2,000 deterministic random in-limit configurations, with `fk(q)` as the target and a seed jittered 0.05 rad from `q` (`ik_all` is seeded too). **Max** is robust rather than a single sample: the 10 slowest targets are re-timed 100× back to back and the largest of those 10 averages is reported. 7-DOF `ik_one` visits only the seed lock and the two nearest lock samples, so its coverage can differ from the full `ik_all` sweep in either direction. `ik_one` and `dls_ik` coverage counts only solutions within `ik_max_joint_step` (π/2 per joint) of the seed; 7-DOF `ik_one` also bounds the lock joint to π/8.
   ```powershell
-  cargo test --release --manifest-path repos\dexforge-<oem>\Cargo.toml --test perf -- --ignored --nocapture
+  cargo test --release --manifest-path repos\dexforge-<oem>\rust\Cargo.toml --test perf -- --ignored --nocapture --test-threads=1
   ```
 
 ---
@@ -83,8 +86,8 @@ Each OEM lives in `repos/dexforge-<oem>/rust` and implements [`dexhal::math::Arm
 
 ### 2. Analytical IK, Continuity Guards & Seed-Locked 7-DOF Redundancy
 - **Closed-Form & Companion-Matrix Solvers:** Translates [`ssik`](https://github.com/personalrobotics/ssik) subproblems (`SP1`–`SP6` and deterministic Raghavan-Roth companion-matrix eigensolvers) into straight-line Rust with FK verification, Levenberg-Marquardt refinement, de-duplication, joint-limit filtering, and nearest-to-seed sorting.
-- **Branch-Jump Rejection (`ik_nearest`):** For high-rate servoing, `ik_nearest` unwraps each joint to the $2\pi$ turn closest to `q_seed` (within joint limits) and returns `None` if any joint would step further than a configurable `ik_max_joint_step` (default $\pi/2$). Near singularities or workspace boundaries where the nearest valid branch flips posture, the continuity bound cleanly signals "no local solution" instead of commanding a violent branch jump.
-- **Posture-Preserving Seeded 7-DOF IK:** Unseeded 7-DOF solvers sweep 16 fixed samples of the redundant joint. When seeded (`q_seed: Some(seed)`), `dexforge` 7-DOF solvers hold the redundant joint at `seed[LOCKED_JOINT]` and run weighted 7-column Jacobian refinement first, preventing uncommanded null-space drift onto coarse grid points during continuous path tracking, and falling back to the 16-sample sweep only when the seed posture cannot close. The seeded sweep visits lock samples nearest-first and stops at the first one whose candidates close with the seed held, so tracking does not pay for the full sweep.
+- **Branch-Jump Rejection (`ik_one`):** For high-rate servoing (the contract uses `IkKind::Fast`), `ik_one` unwraps each joint to the $2\pi$ turn closest to `q_seed` (within joint limits) and discards every proposed solution (checked after polishing) in which any joint would step further than `ik_max_joint_step` (default and maximum $\pi/2$; on 7-DOF arms the redundant joint is further limited to $\pi/8$), returning `None` if none passes. Near singularities or workspace boundaries where the nearest valid branch flips posture, the continuity bound cleanly signals "no local solution" instead of commanding a violent branch jump.
+- **Posture-Preserving Seeded 7-DOF IK:** `ik_all` sweeps all 16 fixed samples of the redundant joint. `ik_one` never sweeps: `IkKind::Fast` tries an unlocked DLS from the seed, then a polish with the redundant joint held at the seed, then the two lock samples nearest the seed; `IkKind::Near` holds the redundant joint at the seed value throughout (seed polish, the two nearest samples, then a longer masked DLS from the seed). Each stage returns the first solution it finds, so tracking does not drift along the null space or pay for the sweep.
 
 ### 3. Branch-Free Symbolic Dynamics & Analytic Payload Compensation
 - **Flat `sympy.cse()` Rigid-Body Dynamics:** Compiles URDF link inertials into branch-free Rust functions for gravity torques $g(q)$, symmetric mass matrix $M(q)$, Coriolis/centrifugal vector $C(q,\dot{q})\dot{q}$, and RNEA-equivalent inverse dynamics $\tau = M(q)\ddot{q} + C(q,\dot{q})\dot{q} + g(q)$ in **1.2–8.3 µs**.
@@ -164,7 +167,7 @@ let qdd = [0.0; 6];
 let pose = arm.fk(&q);                                       // base -> TCP SE(3) pose
 let jac = arm.jacobian(&q);                                  // 6x6 geometric Jacobian (base axes)
 let jac_tool = arm.jacobian_tool(&q);                        // 6x6 geometric Jacobian (TCP axes)
-let q_next = arm.ik_nearest(&pose, &q, TolerancePolicy::DEFAULT); // continuity-guarded servo IK
+let q_next = arm.ik_one(&pose, &q, IkKind::Fast, TolerancePolicy::DEFAULT); // continuity-guarded servo IK
 let dyn_state = arm.dynamics(&q, &qd).unwrap();              // M(q), C(q,qd)*qd, G(q) incl. payload
 let tau = arm.inverse_dynamics(&q, &qd, &qdd).unwrap();      // M*qdd + C*qd + G incl. payload
 
